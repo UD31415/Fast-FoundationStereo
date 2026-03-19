@@ -11,13 +11,25 @@ matplotlib.use("Agg")  # headless — must be before pyplot import
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .metrics import (
-    CLOSE_RANGE_THRESHOLD_M,
-    BIN_CENTERS,
-    BIN_LABELS,
-    AggregateStats,
-    BenchmarkResults,
-)
+try:
+    from .metrics import (
+        CLOSE_RANGE_THRESHOLD_M,
+        BIN_CENTERS,
+        BIN_LABELS,
+        AggregateStats,
+        BenchmarkResults,
+    )
+except ImportError:
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).parent))
+    from metrics import (
+        CLOSE_RANGE_THRESHOLD_M,
+        BIN_CENTERS,
+        BIN_LABELS,
+        AggregateStats,
+        BenchmarkResults,
+    )
 
 
 class ReportGenerator:

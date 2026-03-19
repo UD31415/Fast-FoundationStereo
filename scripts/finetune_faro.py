@@ -106,7 +106,6 @@ def main():
     # load full model object (weights + architecture)
     logging.info(f"Loading model from {MODEL_PATH}")
     model = torch.load(MODEL_PATH, map_location='cpu', weights_only=False)
-    model.cuda().train()
 
     # freeze the ViT-L backbone — with only 24 samples it would overfit
     for param in model.feature.parameters():
@@ -117,13 +116,17 @@ def main():
     total     = sum(p.numel() for p in model.parameters())
     logging.info(f"Trainable: {trainable:,} / {total:,} parameters")
 
+    model = torch.nn.DataParallel(model, device_ids=[0, 1])
+    model.cuda().train()
+    logging.info("Using DataParallel on GPUs 0 and 1.")
+
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=LR, weight_decay=1e-4
+        [p for p in model.module.parameters() if p.requires_grad], lr=LR, weight_decay=1e-4
     )
     scaler = torch.amp.GradScaler('cuda')
 
     dataset    = FaroDataset(FARO_DIR)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=2)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=4)
 
     best_loss = float('inf')
 
@@ -149,7 +152,7 @@ def main():
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.module.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -160,7 +163,7 @@ def main():
 
         if avg < best_loss:
             best_loss = avg
-            torch.save(model, OUT_PATH)
+            torch.save(model.module, OUT_PATH)
             logging.info(f"  → saved best model (loss={best_loss:.4f})")
 
     logging.info(f"Training complete. Best loss: {best_loss:.4f}")
