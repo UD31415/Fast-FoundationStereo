@@ -76,8 +76,8 @@ if __name__=="__main__":
   img0_ori = img0.copy()
   img1_ori = img1.copy()
   logging.info(f"img0: {img0.shape}")
-  imageio.imwrite(f'{args.out_dir}/left.png', img0)
-  imageio.imwrite(f'{args.out_dir}/right.png', img1)
+  # imageio.imwrite(f'{args.out_dir}/left.png', img0)
+  # imageio.imwrite(f'{args.out_dir}/right.png', img1)
 
   img0 = torch.as_tensor(img0).cuda().float()[None].permute(0,3,1,2)
   img1 = torch.as_tensor(img1).cuda().float()[None].permute(0,3,1,2)
@@ -99,7 +99,7 @@ if __name__=="__main__":
   max_val = None
   vis = vis_disparity(disp, min_val=min_val, max_val=max_val, cmap=cmap, color_map=cv2.COLORMAP_TURBO)
   vis = np.concatenate([img0_ori, img1_ori, vis], axis=1)
-  imageio.imwrite(f'{args.out_dir}/disp_vis.png', vis)
+  #imageio.imwrite(f'{args.out_dir}/disp_vis.png', vis)
   s = 1280/vis.shape[1]
   resized_vis = cv2.resize(vis, (int(vis.shape[1]*s), int(vis.shape[0]*s)))
   cv2.imshow('disp', resized_vis[:,:,::-1])

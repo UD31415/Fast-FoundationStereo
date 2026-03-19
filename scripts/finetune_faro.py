@@ -19,6 +19,7 @@ Usage:
 import os, sys, logging
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../')
+sys.path.append(code_dir)
 
 import torch
 import torch.nn.functional as F
@@ -27,11 +28,12 @@ import cv2
 from torch.utils.data import Dataset, DataLoader
 from core.utils.utils import InputPadder
 import Utils as U
+from faro_data_manager import DataSource
 
 
 # ── constants ────────────────────────────────────────────────────────────────
 
-FARO_DIR   = '/home/administrato/dev/fast_foundationstereo_inference-master/data/faro'
+FARO_DIR   = r'/mnt/algonas/Local/Data/Stereo/Faro/FARO_DATA_BASE'  # local path to the dataset
 MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_faro.pth'
 
@@ -46,19 +48,18 @@ GAMMA      = 0.9        # sequence loss weight decay
 
 class FaroDataset(Dataset):
     def __init__(self, root):
-        self.dirs = sorted([
-            os.path.join(root, d)
-            for d in os.listdir(root) if d.startswith('index')
-        ])
+        self.source = DataSource()
+        n = self.source.init_directory(input_rectified=root)
+        logging.info(f"DataSource found {n} samples in {root}")
 
     def __len__(self):
-        return len(self.dirs)
+        return len(self.source.imgs)
 
     def __getitem__(self, idx):
-        base  = self.dirs[idx]
-        left  = cv2.imread(os.path.join(base, 'img_left.png'),      cv2.IMREAD_UNCHANGED)
-        right = cv2.imread(os.path.join(base, 'img_right.png'),     cv2.IMREAD_UNCHANGED)
-        depth = cv2.imread(os.path.join(base, 'img_depth_faro.png'), cv2.IMREAD_UNCHANGED)
+        data  = self.source.get_item(idx)
+        left  = data['left']
+        right = data['right']
+        depth = data['depth_faro']   # float32, mm
 
         # uint16 IR → float [0, 255], replicate to 3-channel pseudo-RGB
         left  = np.clip(left.astype(np.float32),  0, 255)
@@ -69,7 +70,7 @@ class FaroDataset(Dataset):
         # depth (mm) → disparity (pixels):  disp = focal * baseline / depth
         disp  = np.zeros_like(depth, dtype=np.float32)
         valid = depth > 0
-        disp[valid] = BF / depth[valid].astype(np.float32)
+        disp[valid] = BF / depth[valid]
 
         left_t  = torch.from_numpy(left).permute(2, 0, 1).float()   # (3, H, W)
         right_t = torch.from_numpy(right).permute(2, 0, 1).float()  # (3, H, W)
@@ -123,7 +124,6 @@ def main():
 
     dataset    = FaroDataset(FARO_DIR)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=2)
-    logging.info(f"Dataset: {len(dataset)} samples")
 
     best_loss = float('inf')
 

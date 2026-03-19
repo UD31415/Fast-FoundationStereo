@@ -6,6 +6,7 @@ cfg.yaml
 *.pyc
 *.so
 *.egg-info
+g.txt
 # Ignore weight files but keep the folder structure
 weights/*
 !weights/.gitkeep

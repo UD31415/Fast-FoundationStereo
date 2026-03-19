@@ -67,7 +67,7 @@ def process_arguments():
 # Original -------------------------------------------
 
 # Original Split -------------------------------------------
-from opencv_realsense_camera import RealSense
+#from opencv_realsense_camera import RealSense
 import time
 
 def foundation_stereo_algo_init(args):
@@ -323,7 +323,7 @@ def depth2xyz(depth:np.ndarray, K, us=None, vs=None, zmin=0.1):
   return pts,us,vs    
 
 # ----------------------------------------
-import open3d as o3d
+#import open3d as o3d
 import numpy as np
 import time
 
@@ -696,8 +696,8 @@ def test_faro_rs_fs_error():
 
     args        = process_arguments()
     args.scale  = 0.5
-    args.model_dir = '/home/administrato/dev/Fast-FoundationStereo/weights/20-30-48/model_finetuned_faro.pth'
-    args.model_dir = '/home/administrato/dev/Fast-FoundationStereo/weights/20-30-48/model_finetuned_faro.pth'
+    #args.model_dir = '/home/administrato/dev/Fast-FoundationStereo/weights/20-30-48/model_finetuned_faro.pth'
+    #args.model_dir = '../weights/20-30-48/model_finetuned_faro.pth'
 
     # init
     model       = foundation_stereo_algo_init(args)
