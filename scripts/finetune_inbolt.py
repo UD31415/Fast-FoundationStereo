@@ -1,19 +1,21 @@
 """
-Fine-tune FastFoundationStereo on the FARO dataset.
+Fine-tune FastFoundationStereo on the Inbolt dataset.
 
-The FARO dataset provides:
-  - img_left.png / img_right.png : uint16 IR stereo images
-  - img_depth_faro.png           : ground-truth depth in mm (FARO scanner)
+The Inbolt dataset provides:
+  - realsense/{idx}/mono0.png  : left IR image  (uint8, 480x640)
+  - realsense/{idx}/mono1.png  : right IR image (uint8, 480x640)
+  - zivid/{idx}/depthmap_mm.png: ground-truth depth in mm (Zivid scanner, 1024x1224)
 
 Strategy:
-  - Freeze the ViT-L backbone (model.feature) to prevent overfitting on 24 samples.
+  - Freeze the ViT-L backbone (model.feature) to prevent overfitting on small datasets.
   - Train everything else with RAFT-style sequence loss over GRU iterations.
-  - IR uint16 images are clipped to [0,255] and replicated to 3 channels.
-  - Depth is converted to disparity: disp = BF / depth_mm  (BF = 49470.45).
+  - IR uint8 images are replicated to 3 channels.
+  - Zivid depth is resized to RealSense image resolution before disparity conversion.
+  - Depth is converted to disparity: disp = BF / depth_mm.
 
 Usage:
-  cd /home/administrato/dev/Fast-FoundationStereo
-  python scripts/finetune_faro.py
+  cd /path/to/Fast-FoundationStereo
+  python scripts/finetune_inbolt.py
 """
 
 import os, sys, logging
@@ -28,16 +30,16 @@ import cv2
 from torch.utils.data import Dataset, DataLoader
 from core.utils.utils import InputPadder
 import Utils as U
-from faro_data_manager import DataSource
+from inbolt_data_manager import DataSource
 
 
 # ── constants ────────────────────────────────────────────────────────────────
 
-FARO_DIR   = r'/mnt/algonas/Local/Data/Stereo/Faro/FARO_DATA_BASE'  # local path to the dataset
+INBOLT_DIR   = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260322T091926Z-1-001/Data Collection'  # local path to the dataset
 MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
-OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_faro.pth'
+OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt.pth'
 
-BF         = 49470.45   # focal_px * baseline_mm (calibrated from camera)
+BF         = 50*385.73  # D435 - focal_px * baseline_mm (calibrated from camera)
 EPOCHS     = 30
 LR         = 2e-5
 ITERS      = 8          # GRU iterations (same as inference)
@@ -46,7 +48,7 @@ GAMMA      = 0.9        # sequence loss weight decay
 
 # ── dataset ──────────────────────────────────────────────────────────────────
 
-class FaroDataset(Dataset):
+class InboltDataset(Dataset):
     def __init__(self, root):
         self.source = DataSource()
         n = self.source.init_directory(input_rectified=root)
@@ -59,9 +61,14 @@ class FaroDataset(Dataset):
         data  = self.source.get_item(idx)
         left  = data['left']
         right = data['right']
-        depth = data['depth_faro']   # float32, mm
+        depth = data['depth_faro']   # float32, mm  (Zivid resolution)
 
-        # uint16 IR → float [0, 255], replicate to 3-channel pseudo-RGB
+        # Resize Zivid depth to match RealSense stereo image resolution
+        h, w  = left.shape[:2]
+        if depth.shape != (h, w):
+            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        # IR uint8 → float [0, 255], replicate to 3-channel pseudo-RGB
         left  = np.clip(left.astype(np.float32),  0, 255)
         right = np.clip(right.astype(np.float32), 0, 255)
         left  = np.stack([left,  left,  left],  axis=-1)  # H x W x 3
@@ -116,17 +123,16 @@ def main():
     total     = sum(p.numel() for p in model.parameters())
     logging.info(f"Trainable: {trainable:,} / {total:,} parameters")
 
-    model = torch.nn.DataParallel(model, device_ids=[0, 1])
-    model.cuda().train()
-    logging.info("Using DataParallel on GPUs 0 and 1.")
+    model = model.cuda().train()
+    logging.info("Model on single GPU.")
 
     optimizer = torch.optim.AdamW(
-        [p for p in model.module.parameters() if p.requires_grad], lr=LR, weight_decay=1e-4
+        [p for p in model.parameters() if p.requires_grad], lr=LR, weight_decay=1e-4
     )
     scaler = torch.amp.GradScaler('cuda')
 
-    dataset    = FaroDataset(FARO_DIR)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=4)
+    dataset    = InboltDataset(INBOLT_DIR)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0)
 
     best_loss = float('inf')
 
@@ -152,7 +158,7 @@ def main():
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.module.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -163,7 +169,7 @@ def main():
 
         if avg < best_loss:
             best_loss = avg
-            #torch.save(model.module, OUT_PATH)
+            torch.save(model, OUT_PATH)
             logging.info(f"  → saved best model (loss={best_loss:.4f})")
 
     logging.info(f"Training complete. Best loss: {best_loss:.4f}")

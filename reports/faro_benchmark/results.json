@@ -1,0 +1,64 @@
+{
+  "source": "FARO dataset (/mnt/algonas/Local/Data/Stereo/Faro/FARO_DATA_BASE)",
+  "n_frames": 6909,
+  "resolution": "1280x720",
+  "ground_truth": "faro_gt",
+  "distance_bins": [
+    "0\u20131 m",
+    "1\u20132 m",
+    "2\u20133 m",
+    "3\u20135 m"
+  ],
+  "model_configs": {
+    "original": {
+      "model_path": "/home/adiroha/repos/Fast-FoundationStereo/scripts/../weights/20-30-48/model_best_bp2_serialize.pth"
+    },
+    "finetuned": {
+      "model_path": "/home/adiroha/repos/Fast-FoundationStereo/scripts/../weights/20-30-48/model_finetuned_faro.pth"
+    }
+  },
+  "methods": {
+    "faro_gt": {
+      "label": "FARO GT",
+      "mae_mean": 0.0,
+      "mae_std": 0.0,
+      "rmse_mean": 0.0,
+      "mre_mean": 0.0,
+      "delta1_mean": 100.0,
+      "coverage_mean": 99.37260183790566,
+      "fps_mean": -1,
+      "time_ms_mean": 0.0,
+      "close_range_coverage": 14.517296280214213,
+      "gpu_load_mean": 0.0,
+      "is_ground_truth": true
+    },
+    "finetuned": {
+      "label": "Fine-tuned on FARO",
+      "mae_mean": 0.015545227095300868,
+      "mae_std": 0.007262834281846183,
+      "rmse_mean": 0.05239767338331092,
+      "mre_mean": 0.008909589328254088,
+      "delta1_mean": 99.5903134575077,
+      "coverage_mean": 99.37259923084926,
+      "fps_mean": 6.540681728108042,
+      "time_ms_mean": 152.88926163500392,
+      "close_range_coverage": 14.517296280214213,
+      "gpu_load_mean": 0.0,
+      "is_ground_truth": false
+    },
+    "original": {
+      "label": "Original model",
+      "mae_mean": 0.017814378164474603,
+      "mae_std": 0.00744310415240214,
+      "rmse_mean": 0.057319940730227344,
+      "mre_mean": 0.010052675523717408,
+      "delta1_mean": 99.51148928991516,
+      "coverage_mean": 99.37260105264771,
+      "fps_mean": 6.8084259053813785,
+      "time_ms_mean": 146.87682790373032,
+      "close_range_coverage": 14.517296280214213,
+      "gpu_load_mean": 0.0,
+      "is_ground_truth": false
+    }
+  }
+}
