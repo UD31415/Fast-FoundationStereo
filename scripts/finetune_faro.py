@@ -35,10 +35,10 @@ from faro_data_manager import DataSource
 
 FARO_DIR   = r'/mnt/algonas/Local/Data/Stereo/Faro/FARO_DATA_BASE'  # local path to the dataset
 MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
-OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_faro.pth'
+OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_faro_kitchen.pth'
 
 BF         = 49470.45   # focal_px * baseline_mm (calibrated from camera)
-EPOCHS     = 30
+EPOCHS     = 100
 LR         = 2e-5
 ITERS      = 8          # GRU iterations (same as inference)
 GAMMA      = 0.9        # sequence loss weight decay
@@ -49,7 +49,7 @@ GAMMA      = 0.9        # sequence loss weight decay
 class FaroDataset(Dataset):
     def __init__(self, root):
         self.source = DataSource()
-        n = self.source.init_directory(input_rectified=root)
+        n = self.source.init_directory(input_rectified=root, test_keywords=['KITCHEN'], split='train')
         logging.info(f"DataSource found {n} samples in {root}")
 
     def __len__(self):

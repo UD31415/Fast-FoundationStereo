@@ -8,6 +8,19 @@ Output :
 
 Usage:
 
+  Usage examples:
+  # Training set — excludes KITCHEN paths
+  ds = DataSource()
+  ds.init_directory(root, test_keywords=['KITCHEN'], split='train')
+
+  # Test set — only KITCHEN paths
+  ds = DataSource()
+  ds.init_directory(root, test_keywords=['KITCHEN'], split='test')
+
+  # Access counts directly
+  ds.train_imgs  # list of train paths
+  ds.test_imgs   # list of test paths
+
 Environment : 
     C:\\Users\\udubin\\Documents\\Envs\\barcode
 
@@ -46,16 +59,48 @@ class DataSource:
 
         log.info('Source is defined')
 
-    def init_directory(self, input_rectified = '', gray_scale_input = False, sub_indexes = None):
-        "load entire directory"
+    def init_directory(self, input_rectified = '', gray_scale_input = False, sub_indexes = None,
+                       test_keywords = None, split = 'all'):
+        """Load directory and optionally split into train/test by path keywords.
+
+        Args:
+            test_keywords: list of strings (case-insensitive); paths containing any
+                           of these keywords are assigned to the test split.
+                           E.g. ['KITCHEN', 'BATHROOM']
+            split: 'all'   – return all images (default, backward-compatible)
+                   'train' – return only images whose path matches no keyword
+                   'test'  – return only images whose path matches at least one keyword
+        """
         if len(input_rectified) < 3:
             input_rectified = r'/mnt/algonas/Local'
 
-        self.imgs            = glob.glob(os.path.join(input_rectified,  f"**/L_images/L_Img_**.mat"),  recursive=True)
+        all_imgs = glob.glob(os.path.join(input_rectified, "**/L_images/L_Img_**.mat"), recursive=True)
         self.gray_scale_input = gray_scale_input
+
+        if test_keywords:
+            keywords_upper = [kw.upper() for kw in test_keywords]
+            def is_test(path):
+                p = path.upper()
+                return any(kw in p for kw in keywords_upper)
+
+            self.train_imgs = [p for p in all_imgs if not is_test(p)]
+            self.test_imgs  = [p for p in all_imgs if     is_test(p)]
+        else:
+            self.train_imgs = all_imgs
+            self.test_imgs  = []
+
+        if split == 'train':
+            self.imgs = self.train_imgs
+        elif split == 'test':
+            self.imgs = self.test_imgs
+        else:  # 'all'
+            self.imgs = all_imgs
+
         if sub_indexes is not None:
             self.imgs = [self.imgs[idx] for idx in sub_indexes]
 
+        log.info(f"Split='{split}': {len(self.imgs)} images "
+                 f"(train={len(self.train_imgs)}, test={len(self.test_imgs)})")
         return len(self.imgs)
 
 
