@@ -1,11 +1,14 @@
-"""Benchmark original vs fine-tuned FastFoundationStereo on the FARO dataset.
+"""Benchmark original vs fine-tuned FastFoundationStereo on the Inbolt dataset.
 
-Loads both models, runs inference on all FARO samples, computes depth quality
-metrics against FARO scanner ground truth, and produces an HTML report.
+Loads both models, runs inference on all Inbolt samples, computes depth quality
+metrics against Zivid scanner ground truth, and produces an HTML report.
+
+Also generates depth accuracy and noise plots comparing RealSense stereo predictions
+(model output) against Zivid ground-truth depth across distance bins.
 
 Usage:
   cd /home/adiroha/repos/Fast-FoundationStereo
-  python scripts/benchmark_faro.py [--out_dir reports/faro_benchmark]
+  python scripts/benchmark_inbolt.py [--out_dir reports/inbolt_benchmark]
 """
 
 import argparse
@@ -21,12 +24,14 @@ sys.path.append(code_dir)
 
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 from core.utils.utils import InputPadder
 import Utils as U
 
-#from inbolt_data_manager import DataSource
-from finetune_inbolt import InboltDataset as DataSource
+from inbolt_data_manager import DataSource
 
 from metrics import (
     BenchmarkResults,
@@ -54,12 +59,120 @@ BF              = 49470.45   # focal_px * baseline_mm  (calibrated from camera)
 ITERS           = 8          # GRU iterations
 N_VIZ           = 5         # number of frames saved for visual comparison in report
 
+DEPTH_BIN_SIZE_M = 0.1       # width of each distance bin for accuracy/noise plots
+MAX_DEPTH_M      = 6.0       # maximum depth considered in plots
+
 METHODS = {
     "original":  {"label": "Original model",    "color": "#2980b9"},
     "finetuned": {"label": "Fine-tuned on INBOLT", "color": "#e74c3c"},
     "inbolt_gt":   {"label": "INBOLT GT",            "color": "#27ae60"},
 }
 GT_NAME = "inbolt_gt"
+
+
+# ── depth-vs-distance analysis ────────────────────────────────────────────────
+
+class DepthBinAccumulator:
+    """Accumulates mean and std-dev of depth values per GT-distance bin.
+
+    Bins are defined by Zivid GT depth, so *every* pixel whose GT depth falls in
+    [k * bin_size, (k+1) * bin_size) contributes to bin k.  Works for any sensor
+    (model predictions OR Zivid GT values themselves — the latter gives an
+    estimate of within-bin spatial variation / measurement noise).
+    """
+
+    def __init__(self, bin_size_m: float = DEPTH_BIN_SIZE_M, max_depth_m: float = MAX_DEPTH_M):
+        self.bin_size   = bin_size_m
+        self.n_bins     = int(np.ceil(max_depth_m / bin_size_m))
+        self.count      = np.zeros(self.n_bins, dtype=np.float64)
+        self.sum_       = np.zeros(self.n_bins, dtype=np.float64)
+        self.sum_sq     = np.zeros(self.n_bins, dtype=np.float64)
+
+    def update(self, values_m: np.ndarray, gt_m: np.ndarray):
+        """Add one frame of data.
+
+        Parameters
+        ----------
+        values_m : (H, W) array of the depth values to accumulate (model or GT).
+        gt_m     : (H, W) array of Zivid GT depths that define which bin each pixel falls in.
+        """
+        valid = (gt_m > 0) & (values_m > 0)
+        if not valid.any():
+            return
+        v_vals = values_m[valid].ravel().astype(np.float64)
+        v_gt   = gt_m[valid].ravel().astype(np.float64)
+
+        bins = np.floor(v_gt / self.bin_size).astype(np.int32)
+        bins = np.clip(bins, 0, self.n_bins - 1)
+
+        np.add.at(self.count,  bins, 1.0)
+        np.add.at(self.sum_,   bins, v_vals)
+        np.add.at(self.sum_sq, bins, v_vals ** 2)
+
+    @property
+    def bin_centers(self) -> np.ndarray:
+        return (np.arange(self.n_bins) + 0.5) * self.bin_size
+
+    def mean(self) -> np.ndarray:
+        c = np.maximum(self.count, 1)
+        return np.where(self.count > 0, self.sum_ / c, np.nan)
+
+    def std(self) -> np.ndarray:
+        c = np.maximum(self.count, 1)
+        m = np.where(self.count > 0, self.sum_ / c, np.nan)
+        v = np.where(self.count > 0, self.sum_sq / c - m ** 2, np.nan)
+        return np.sqrt(np.maximum(v, 0.0))
+
+
+def plot_depth_vs_distance(
+    accumulators: dict,          # {label: DepthBinAccumulator}
+    colors: dict,                # {label: color_str}
+    out_path: Path,
+    min_count: int = 100,        # bins with fewer samples are hidden
+):
+    """Produce a two-panel figure:
+      left  – actual depth (Zivid GT) vs measured/predicted depth
+      right – noise (std-dev of measured depth) vs actual depth
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    for label, acc in accumulators.items():
+        x     = acc.bin_centers
+        mu    = acc.mean()
+        sigma = acc.std()
+        color = colors.get(label, None)
+
+        valid = acc.count >= min_count
+        xv, muv, sv = x[valid], mu[valid], sigma[valid]
+
+        ax0 = axes[0]
+        ax0.plot(xv, muv, label=label, color=color, linewidth=1.5)
+        ax0.fill_between(xv, muv - sv, muv + sv, alpha=0.15, color=color)
+
+        axes[1].plot(xv, sv * 1000, label=label, color=color, linewidth=1.5)
+
+    # ideal line
+    lim = MAX_DEPTH_M
+    axes[0].plot([0, lim], [0, lim], 'k--', linewidth=1, label='ideal (y = x)')
+    axes[0].set_xlim(0, lim)
+    axes[0].set_ylim(0, lim)
+    axes[0].set_xlabel('Actual depth — Zivid GT (m)')
+    axes[0].set_ylabel('Measured depth (m)')
+    axes[0].set_title('Depth Accuracy: Actual vs Measured\n(shaded band = ±1 std dev)')
+    axes[0].legend(fontsize=9)
+    axes[0].grid(True, alpha=0.4)
+
+    axes[1].set_xlim(0, lim)
+    axes[1].set_xlabel('Actual depth — Zivid GT (m)')
+    axes[1].set_ylabel('Noise / Std Dev (mm)')
+    axes[1].set_title('Depth Noise per Distance Bin')
+    axes[1].legend(fontsize=9)
+    axes[1].grid(True, alpha=0.4)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    logging.info(f"Saved depth-vs-distance plot → {out_path}")
 
 
 # ── inference helpers ─────────────────────────────────────────────────────────
@@ -144,14 +257,27 @@ def main():
     timing_ms_raw     = {m: [] for m in models}
     H = W = None
 
+    # depth-vs-distance accumulators:
+    #   "zivid_gt" – Zivid depth values binned by Zivid GT (shows intra-bin spatial spread)
+    #   one entry per stereo model – model predictions binned by Zivid GT
+    depth_acc_keys = ["zivid_gt"] + list(models.keys())
+    depth_accs = {k: DepthBinAccumulator() for k in depth_acc_keys}
+
+    import cv2 as _cv2   # local import to avoid top-level dependency if already imported
+
     for idx in range(n):
         data  = source.get_item(idx)
         left  = data['left']
         right = data['right']
-        gt_mm = data['depth_inbolt'].astype(np.float32)
+        gt_mm = data['depth_faro'].astype(np.float32)   # Zivid GT in mm
+
+        # Resize Zivid depth to match RealSense IR image resolution for pixel-level comparison
+        rs_h, rs_w = left.shape[:2]
+        if gt_mm.shape != (rs_h, rs_w):
+            gt_mm = _cv2.resize(gt_mm, (rs_w, rs_h), interpolation=_cv2.INTER_NEAREST)
 
         if H is None:
-            H, W = gt_mm.shape[:2]
+            H, W = rs_h, rs_w
             for m in active_methods:
                 valid_acc[m] = np.zeros((H, W), np.float32)
 
@@ -184,6 +310,11 @@ def main():
 
             close_cov = float((pred[gt_close_mask] > 0).mean()) * 100.0 if n_close > 0 else 0.0
             close_range_valid[mname].append(close_cov)
+
+        # depth-vs-distance: accumulate per-bin stats
+        depth_accs["zivid_gt"].update(gt_m, gt_m)   # GT vs itself → intra-bin spread
+        for mname in models:
+            depth_accs[mname].update(frame_depths[mname], gt_m)
 
         if idx < args.n_viz:
             viz_frames.append({k: v.copy() for k, v in frame_depths.items()})
@@ -225,6 +356,30 @@ def main():
     # ── generate report ───────────────────────────────────────────────────────
     reporter = ReportGenerator(results, stats, out_dir)
     reporter.generate()
+
+    # ── depth-vs-distance comparison plot ────────────────────────────────────
+    plot_colors = {
+        "zivid_gt": METHODS[GT_NAME]["color"],
+        **{m: METHODS[m]["color"] for m in models if m in METHODS},
+    }
+    plot_labels = {
+        "zivid_gt":  "Zivid GT (spatial spread)",
+        "original":  METHODS["original"]["label"],
+        "finetuned": METHODS["finetuned"]["label"],
+    }
+    # rename keys to human-readable labels for the plot
+    labeled_accs = {plot_labels.get(k, k): v
+                    for k, v in depth_accs.items()
+                    if depth_accs[k].count.sum() > 0}
+    labeled_colors = {plot_labels.get(k, k): plot_colors.get(k)
+                      for k in depth_accs if depth_accs[k].count.sum() > 0}
+
+    plot_depth_vs_distance(
+        accumulators=labeled_accs,
+        colors=labeled_colors,
+        out_path=out_dir / "depth_vs_distance.png",
+    )
+    logging.info(f"All outputs written to {out_dir}")
 
 
 if __name__ == '__main__':
