@@ -38,7 +38,7 @@ MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_faro_kitchen.pth'
 
 BF         = 49470.45   # focal_px * baseline_mm (calibrated from camera)
-EPOCHS     = 100
+EPOCHS     = 10
 LR         = 2e-5
 ITERS      = 8          # GRU iterations (same as inference)
 GAMMA      = 0.9        # sequence loss weight decay
@@ -77,7 +77,7 @@ class FaroDataset(Dataset):
         disp_t  = torch.from_numpy(disp).unsqueeze(0).float()       # (1, H, W)
         valid_t = torch.from_numpy(valid).unsqueeze(0)               # (1, H, W) bool
 
-        return left_t, right_t, disp_t, valid_t
+        return left_t, right_t, disp_t, valid_t, idx
 
 
 # ── loss ─────────────────────────────────────────────────────────────────────
@@ -133,7 +133,7 @@ def main():
     for epoch in range(EPOCHS):
         epoch_loss = 0.0
 
-        for left, right, disp_gt, valid in dataloader:
+        for left, right, disp_gt, valid, idx in dataloader:
             left, right = left.cuda(), right.cuda()
             disp_gt, valid = disp_gt.cuda(), valid.cuda()
 
@@ -157,13 +157,15 @@ def main():
             scaler.update()
 
             epoch_loss += loss.item()
+            if idx[0] % 10 == 0:
+                logging.info(f"Epoch {epoch+1:3d}/{EPOCHS}  sample {idx[0]:3d}  loss={loss.item():.4f}")
 
         avg = epoch_loss / len(dataloader)
         logging.info(f"Epoch {epoch+1:3d}/{EPOCHS}  loss={avg:.4f}")
 
         if avg < best_loss:
             best_loss = avg
-            #torch.save(model.module, OUT_PATH)
+            torch.save(model.module, OUT_PATH)
             logging.info(f"  → saved best model (loss={best_loss:.4f})")
 
     logging.info(f"Training complete. Best loss: {best_loss:.4f}")

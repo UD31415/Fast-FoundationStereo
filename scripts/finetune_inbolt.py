@@ -112,7 +112,7 @@ def main():
 
     # load full model object (weights + architecture)
     logging.info(f"Loading model from {MODEL_PATH}")
-    model = torch.load(MODEL_PATH, map_location='cpu', weights_only=False)
+    model = torch.load(MODEL_PATH, map_location='cuda', weights_only=False)
 
     # freeze the ViT-L backbone — with only 24 samples it would overfit
     for param in model.feature.parameters():

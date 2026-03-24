@@ -83,8 +83,8 @@ class DataSource:
                 p = path.upper()
                 return any(kw in p for kw in keywords_upper)
 
-            self.train_imgs = [p for p in all_imgs if not is_test(p)]
-            self.test_imgs  = [p for p in all_imgs if     is_test(p)]
+            self.train_imgs = [p for p in all_imgs if     is_test(p)]
+            self.test_imgs  = [p for p in all_imgs if not is_test(p)]
         else:
             self.train_imgs = all_imgs
             self.test_imgs  = []
