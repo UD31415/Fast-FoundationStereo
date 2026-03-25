@@ -123,7 +123,6 @@ class DepthBinAccumulator:
         v = np.where(self.count > 0, self.sum_sq / c - m ** 2, np.nan)
         return np.sqrt(np.maximum(v, 0.0))
 
-
 def plot_depth_vs_distance(
     accumulators: dict,          # {label: DepthBinAccumulator}
     colors: dict,                # {label: color_str}
@@ -174,6 +173,223 @@ def plot_depth_vs_distance(
     plt.close(fig)
     logging.info(f"Saved depth-vs-distance plot → {out_path}")
 
+def _to_1d_float_array(values, name: str) -> np.ndarray:
+    """Convert *values* to a finite 1D float array."""
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        raise ValueError(f"{name} must contain at least one value")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} contains NaN or infinite values")
+    return arr
+
+def fit_depth_scale_regression(
+    gt_delta_mm,
+    measured_delta_mm,
+    fit_intercept: bool = False,
+) -> dict:
+    """Fit a linear depth-scale regression and compute residual statistics.
+
+    Parameters
+    ----------
+    gt_delta_mm : array-like
+        Ground-truth floor/depth deltas in millimetres.
+    measured_delta_mm : array-like
+        Measured deltas from one sensor/model in millimetres.
+    fit_intercept : bool, default=False
+        If False, uses a through-origin fit `y = slope * x`, which matches the
+        style of the attached plot.  If True, fits `y = slope * x + intercept`.
+
+    Returns
+    -------
+    dict
+        Contains slope, intercept, fitted values, residuals, RMSE, and masks.
+    """
+    x = _to_1d_float_array(gt_delta_mm, "gt_delta_mm")
+    y = _to_1d_float_array(measured_delta_mm, "measured_delta_mm")
+
+    if x.shape != y.shape:
+        raise ValueError("gt_delta_mm and measured_delta_mm must have the same shape")
+    if x.size < 2:
+        raise ValueError("At least two samples are required for regression")
+
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = x[valid]
+    y = y[valid]
+
+    if x.size < 2:
+        raise ValueError("Need at least two finite samples after filtering")
+
+    if fit_intercept:
+        slope, intercept = np.polyfit(x, y, deg=1)
+    else:
+        denom = float(np.dot(x, x))
+        if denom <= 0:
+            raise ValueError("Cannot fit a through-origin regression when gt deltas are all zero")
+        slope = float(np.dot(x, y) / denom)
+        intercept = 0.0
+
+    fitted = slope * x + intercept
+    residuals = y - fitted
+    rmse = float(np.sqrt(np.mean(residuals ** 2)))
+
+    return {
+        "gt_delta_mm": x,
+        "measured_delta_mm": y,
+        "slope": float(slope),
+        "intercept": float(intercept),
+        "fitted_mm": fitted,
+        "residuals_mm": residuals,
+        "rmse_mm": rmse,
+        "fit_intercept": fit_intercept,
+    }
+
+def build_example_depth_scale_regression_series(gt_delta_mm, rs_delta_mm, zv_delta_mm) -> dict:
+    """Return example depth-delta series that reproduces the attached figure.
+
+    The values approximate the plot shown in the screenshot:
+      - RealSense has a noticeable scale bias.
+      - Zivid stays close to the ideal slope of 1.
+    """
+    gt_delta_mm = np.array([0, 100, 200, 300, 400, 500, 600, 700], dtype=np.float64) if gt_delta_mm is None else gt_delta_mm
+    rs_delta_mm = np.array([0.0, 104.0, 218.0, 323.0, 433.0, 542.0, 664.0, 754.0], dtype=np.float64) if rs_delta_mm is None else rs_delta_mm
+    zv_delta_mm = np.array([0.0, 101.0, 201.0, 301.0, 401.0, 502.0, 602.0, 707.0], dtype=np.float64) if zv_delta_mm is None else zv_delta_mm
+
+    return {
+        "realsense": {
+            "gt_delta_mm": gt_delta_mm,
+            "measured_delta_mm": rs_delta_mm,
+            "color": "#e74c3c",
+            "marker": "s",
+            "label": "realsense",
+        },
+        "zivid": {
+            "gt_delta_mm": gt_delta_mm,
+            "measured_delta_mm": zv_delta_mm,
+            "color": "#2980b9",
+            "marker": "o",
+            "label": "zivid",
+        },
+    }
+
+def plot_depth_scale_regression(
+    series_map: dict,
+    out_path: Path,
+    title: str = "Depth Scale Regression — dataset_depth_bias",
+    fit_intercept: bool = False,
+    ideal_slope: float = 1.0,
+):
+    """Create the two-panel regression + residuals figure from paired series.
+
+    Parameters
+    ----------
+    series_map : dict
+        Mapping of series name to configuration dict. Each entry should provide:
+          - gt_delta_mm
+          - measured_delta_mm
+        and may optionally include:
+          - label
+          - color
+          - marker
+    out_path : Path
+        Destination PNG path.
+    title : str
+        Figure title.
+    fit_intercept : bool
+        Whether to fit a free intercept. Defaults to a through-origin fit.
+    ideal_slope : float
+        Slope of the ideal reference line shown on the left panel.
+    """
+    if not series_map:
+        raise ValueError("series_map must contain at least one series")
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fit_results = []
+    max_x = 0.0
+    max_y = 0.0
+
+    for default_name, cfg in series_map.items():
+        result = fit_depth_scale_regression(
+            gt_delta_mm=cfg["gt_delta_mm"],
+            measured_delta_mm=cfg["measured_delta_mm"],
+            fit_intercept=fit_intercept,
+        )
+        result["label"] = cfg.get("label", default_name)
+        result["color"] = cfg.get("color", None)
+        result["marker"] = cfg.get("marker", "o")
+        fit_results.append(result)
+        max_x = max(max_x, float(np.max(result["gt_delta_mm"])))
+        max_y = max(max_y, float(np.max(result["measured_delta_mm"])))
+
+    lim = max(max_x, max_y)
+    fit_x = np.linspace(0.0, lim, 200)
+
+    for result in fit_results:
+        label = result["label"]
+        color = result["color"]
+        marker = result["marker"]
+        x = result["gt_delta_mm"]
+        y = result["measured_delta_mm"]
+        slope = result["slope"]
+        intercept = result["intercept"]
+        rmse = result["rmse_mm"]
+
+        axes[0].scatter(x, y, color=color, marker=marker, s=70, label=f"{label} (raw)", zorder=3)
+        axes[0].plot(
+            fit_x,
+            slope * fit_x + intercept,
+            color=color,
+            linewidth=2.0,
+            label=(
+                f"{label} fit: slope={slope:.3f}, intercept={intercept:.1f}mm, RMSE={rmse:.1f}mm"
+                if fit_intercept else
+                f"{label} fit: slope={slope:.3f}, RMSE={rmse:.1f}mm"
+            ),
+        )
+
+        axes[1].scatter(
+            x,
+            result["residuals_mm"],
+            color=color,
+            marker=marker,
+            s=70,
+            label=f"{label} (RMSE={rmse:.1f}mm)",
+            zorder=3,
+        )
+
+    axes[0].plot(
+        fit_x,
+        ideal_slope * fit_x,
+        linestyle="--",
+        color="gray",
+        linewidth=1.5,
+        label=f"ideal (slope={ideal_slope:.1f})",
+    )
+    axes[0].set_xlabel("Ground Truth Delta (mm)")
+    axes[0].set_ylabel("Measured Depth Delta (mm)")
+    axes[0].set_title("Floor Depth Delta: Measured vs Ground Truth")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(fontsize=9, loc="upper left")
+
+    axes[1].axhline(0.0, linestyle="--", color="gray", linewidth=1.2)
+    axes[1].set_xlabel("Ground Truth Delta (mm)")
+    axes[1].set_ylabel("Residual (mm)")
+    axes[1].set_title("Residuals (Measured − Fit)")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(fontsize=9, loc="upper left")
+
+    axes[0].set_xlim(-0.05 * max(lim, 1.0), lim * 1.05)
+    axes[1].set_xlim(-0.05 * max(lim, 1.0), lim * 1.05)
+
+    residual_values = np.concatenate([r["residuals_mm"] for r in fit_results])
+    residual_abs_max = max(1.0, float(np.max(np.abs(residual_values))))
+    axes[1].set_ylim(-residual_abs_max * 1.15, residual_abs_max * 1.15)
+
+    fig.suptitle(title, fontsize=18, fontweight="bold")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logging.info(f"Saved depth-scale regression plot → {out_path}")
+
 
 # ── inference helpers ─────────────────────────────────────────────────────────
 
@@ -186,7 +402,6 @@ def _preprocess_ir(left: np.ndarray, right: np.ndarray):
     left_t  = torch.as_tensor(left).float()[None].permute(0, 3, 1, 2).cuda()
     right_t = torch.as_tensor(right).float()[None].permute(0, 3, 1, 2).cuda()
     return left_t, right_t
-
 
 @torch.no_grad()
 def infer_depth_m(model, left: np.ndarray, right: np.ndarray) -> np.ndarray:
@@ -206,13 +421,69 @@ def infer_depth_m(model, left: np.ndarray, right: np.ndarray) -> np.ndarray:
     depth_m[valid] = (BF / disp_np[valid]) / 1000.0   # disparity → mm → m
     return depth_m
 
-
 def load_model(path: str):
     logging.info(f"Loading model from {path}")
     model = torch.load(path, map_location='cpu', weights_only=False)
     model.cuda().eval()
     return model
 
+
+# ── inbolt graphs ─────────────────────────────────────────────────────────────────────
+
+def main_inbolt_graphs():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--out_dir', default=DEFAULT_OUT, help='Output directory for the report')
+    parser.add_argument('--data_dir', default=DATA_DIR, help='Path to dataset root')
+    parser.add_argument('--original', default=MODEL_PATH, help='Path to original model weights')
+    parser.add_argument('--finetuned', default=FINETUNED_PATH, help='Path to fine-tuned model weights')
+    parser.add_argument('--n_viz', type=int, default=N_VIZ, help='Frames saved for visual comparison')
+    args = parser.parse_args()
+
+    U.set_logging_format()
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── dataset ───────────────────────────────────────────────────────────────
+    source = DataSource()
+    n = source.init_directory(input_rectified=args.data_dir)
+    logging.info(f"Found {n} samples in {args.data_dir}")
+    if n == 0:
+        logging.error("No samples found — check DATA_DIR path")
+        return
+
+
+    #import cv2 as _cv2   # local import to avoid top-level dependency if already imported
+    gt_depth_diff = np.arange(n)*100 # mm
+    rs_depth_diff = np.arange(n)*0 # mm
+    zv_depth_diff = np.arange(n)*0 # zivid mm
+    rs_ref = None
+    zv_ref = None
+    for idx in range(n):
+        data  = source.get_item(idx)
+        left  = data['left']
+        right = data['right']
+        zv_mm = data['depth_zivid'].astype(np.float32)   # Zivid GT in mm
+        rs_mm = data['depth_rs'].astype(np.float32)   # RealSense depth in mm
+
+        # # Resize Zivid depth to match RealSense IR image resolution for pixel-level comparison
+        # rs_h, rs_w = left.shape[:2]
+        # if gt_mm.shape != (rs_h, rs_w):
+        #     #gt_mm = _cv2.resize(gt_mm, (rs_w, rs_h), interpolation=_cv2.INTER_NEAREST)
+        #     print(f"Shape mismatch: gt_mm {gt_mm.shape} vs rs {rs_h, rs_w}")
+        rs_valid           = (rs_mm > rs_mm.max()*0.8) 
+        zv_valid           = (zv_mm > zv_mm.max()*0.8) 
+        if idx == 0:
+            rs_ref = np.nanmean(rs_mm[rs_valid])
+            zv_ref = np.nanmean(zv_mm[zv_valid])
+        else:
+            rs_depth_diff[idx] = np.nanmean(rs_mm[rs_valid]) - rs_ref
+            zv_depth_diff[idx] = np.nanmean(zv_mm[zv_valid]) - zv_ref
+
+
+    sm = build_example_depth_scale_regression_series(gt_depth_diff, rs_depth_diff, zv_depth_diff)
+    plot_depth_scale_regression(sm, out_path=Path(DEFAULT_OUT) / "depth_scale_comparison.png", title="Depth Scale Comparison")
+
+    logging.info(f"All outputs written to {out_dir}")
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
@@ -263,18 +534,20 @@ def main():
     depth_acc_keys = ["zivid_gt"] + list(models.keys())
     depth_accs = {k: DepthBinAccumulator() for k in depth_acc_keys}
 
-    import cv2 as _cv2   # local import to avoid top-level dependency if already imported
+    #import cv2 as _cv2   # local import to avoid top-level dependency if already imported
 
     for idx in range(n):
         data  = source.get_item(idx)
         left  = data['left']
         right = data['right']
-        gt_mm = data['depth_faro'].astype(np.float32)   # Zivid GT in mm
+        gt_mm = data['depth_zivid'].astype(np.float32)   # Zivid GT in mm
+        rs_mm = data['depth_rs'].astype(np.float32)   # RealSense depth in mm
 
         # Resize Zivid depth to match RealSense IR image resolution for pixel-level comparison
         rs_h, rs_w = left.shape[:2]
         if gt_mm.shape != (rs_h, rs_w):
-            gt_mm = _cv2.resize(gt_mm, (rs_w, rs_h), interpolation=_cv2.INTER_NEAREST)
+            #gt_mm = _cv2.resize(gt_mm, (rs_w, rs_h), interpolation=_cv2.INTER_NEAREST)
+            print(f"Shape mismatch: gt_mm {gt_mm.shape} vs rs {rs_h, rs_w}")
 
         if H is None:
             H, W = rs_h, rs_w
@@ -282,6 +555,7 @@ def main():
                 valid_acc[m] = np.zeros((H, W), np.float32)
 
         gt_m = gt_mm / 1000.0   # mm → m
+        rs_m = rs_mm / 1000.0   # mm → m
 
         # run inference for each model
         frame_depths = {GT_NAME: gt_m}
@@ -304,6 +578,7 @@ def main():
                                   mae_pen=0.0, mre_pen=0.0)
             else:
                 fm = compute_metrics(pred, gt_m, timing_ms_raw[mname][-1], mname)
+
             all_metrics.append(fm)
 
             dist_bin_mae[mname].append(compute_bin_mae(pred, gt_m))
@@ -383,4 +658,12 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    # 1. works
+    #sm = build_example_depth_scale_regression_series()
+    #plot_depth_scale_regression(sm, out_path=Path(DEFAULT_OUT) / "depth_scale_regression_example.png", title="Example Depth Scale Regression")
+
+    # 2. inbolt data
+    main_inbolt_graphs()
+
+    # 3. full benchmark + report
+    #main()
