@@ -17,6 +17,7 @@ import os
 import sys
 import time
 from pathlib import Path
+import cv2
 
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../')
@@ -70,6 +71,100 @@ METHODS = {
 }
 GT_NAME = "inbolt_gt"
 
+CAMERA_MATRIX_RS = np.array([
+    [385.7338562011719, 0, 320.17578125],
+    [0, 385.7338562011719, 245.1015167236328],
+    [0, 0, 1]
+])
+
+DIST_COEFFS_RS = np.array([
+    0.0,
+    -0.0,
+    -0.0,
+    0.0,
+    -0.0
+])
+
+CAMERA_MATRIX_ZIVID = np.array([
+    [1240.27099609375, 0, 604.5339927697801],
+    [0, 1240.2381591796875, 505.60805553154046],
+    [0, 0, 1]
+])
+DIST_COEFFS_ZIVID = np.array([
+    0.045981280505657196,
+    -0.0316404290497303,
+    -0.00012756904470734298,
+    0.0001183780113933608,
+    -0.17966397106647491
+])
+
+# ── projection helpers ─────────────────────────────────────────────────────────
+
+def save_to_ply(points: np.ndarray, filename: str):
+    """Save a point cloud to a PLY file for visualization."""
+    with open(filename, 'w') as f:
+        f.write('ply\n')
+        f.write('format ascii 1.0\n')
+        f.write(f'element vertex {len(points)}\n')
+        f.write('property float x\n')
+        f.write('property float y\n')
+        f.write('property float z\n')
+        f.write('end_header\n')
+        for x, y, z in points:
+            f.write(f'{x} {y} {z}\n')
+
+# project from zivid depth patrix to point cloud and back to depth matrix with rs intrinsics and distortion to get "zivid GT as seen by RealSense" for pixel-level comparison
+def project_depth_zivid_to_rs(depth_zivid_mm: np.ndarray, depth_rs_mm: np.ndarray, finx = 0) -> np.ndarray:
+    h, w = depth_zivid_mm.shape
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32), indexing='xy')
+
+    # OpenCV expects Nx1x2 contiguous float32/float64 image points in (x, y) order.
+    distorted_points = np.stack([xs, ys], axis=-1).reshape(-1, 1, 2).astype(np.float32)
+    undistorted_points = cv2.undistortPoints(distorted_points,  CAMERA_MATRIX_ZIVID.astype(np.float32),  DIST_COEFFS_ZIVID.astype(np.float32) )
+
+    uv = undistorted_points.reshape(-1, 2)
+    Z = depth_zivid_mm.reshape(-1).astype(np.float32)
+    valid = np.isfinite(Z) & (Z > 0)
+    if not np.any(valid):
+        return np.zeros_like(depth_rs_mm, dtype=np.float32)
+
+    uv = uv[valid]
+    Z = Z[valid]
+    X = uv[:, 0] * Z
+    Y = uv[:, 1] * Z
+
+    # save to ply point cloud for visualization
+    XYZ = np.stack([X, Y, Z], axis=1).astype(np.float32)
+    #save_to_ply(XYZ, f'zivid_points_{finx:03d}.ply')
+
+    projected_pts, _ = cv2.projectPoints(
+        XYZ.reshape(-1, 1, 3),
+        np.zeros(3, dtype=np.float32),
+        np.zeros(3, dtype=np.float32),
+        CAMERA_MATRIX_RS.astype(np.float32),
+        DIST_COEFFS_RS.astype(np.float32),
+    )
+
+    uv_rs = projected_pts.reshape(-1, 2)
+    u_idx = np.rint(uv_rs[:, 0]).astype(np.int32)
+    v_idx = np.rint(uv_rs[:, 1]).astype(np.int32)
+
+    h_rs, w_rs = depth_rs_mm.shape
+    in_bounds = (u_idx >= 0) & (u_idx < w_rs) & (v_idx >= 0) & (v_idx < h_rs)
+    if not np.any(in_bounds):
+        return np.zeros((h_rs, w_rs), dtype=np.float32)
+
+    u_idx = u_idx[in_bounds]
+    v_idx = v_idx[in_bounds]
+    z_vals = Z[in_bounds]
+
+    # Rasterize by nearest pixel; if multiple points hit a pixel, keep the closest depth.
+    lin = v_idx * w_rs + u_idx
+    depth_buffer = np.full(h_rs * w_rs, np.inf, dtype=np.float32)
+    np.minimum.at(depth_buffer, lin, z_vals)
+    depth_zivid_projected = depth_buffer.reshape(h_rs, w_rs)
+    depth_zivid_projected[~np.isfinite(depth_zivid_projected)] = 0.0
+    return depth_zivid_projected
 
 # ── depth-vs-distance analysis ────────────────────────────────────────────────
 
@@ -244,7 +339,13 @@ def fit_depth_scale_regression(
         "fit_intercept": fit_intercept,
     }
 
-def build_example_depth_scale_regression_series(gt_delta_mm, rs_delta_mm, zv_delta_mm, fs_delta_mm, ftn_delta_mm) -> dict:
+def build_example_depth_scale_regression_series(
+    gt_delta_mm,
+    rs_delta_mm,
+    zv_delta_mm,
+    fs_delta_mm=None,
+    ftn_delta_mm=None,
+) -> dict:
     """Return example depth-delta series that reproduces the attached figure.
 
     The values approximate the plot shown in the screenshot:
@@ -256,7 +357,7 @@ def build_example_depth_scale_regression_series(gt_delta_mm, rs_delta_mm, zv_del
     # zv_delta_mm = np.array([0.0, 101.0, 201.0, 301.0, 401.0, 502.0, 602.0, 707.0], dtype=np.float64) if zv_delta_mm is None else zv_delta_mm
     # fs_delta_mm = np.array([0.0, 102.0, 204.0, 306.0, 408.0, 510.0, 612.0, 714.0], dtype=np.float64) if fs_delta_mm is None else fs_delta_mm
     # ftn_delta_mm = np.array([0.0, 103.0, 207.0, 311.0, 415.0, 519.0, 623.0, 727.0], dtype=np.float64) if ftn_delta_mm is None else ftn_delta_mm
-    return {
+    series_map = {
         "realsense": {
             "gt_delta_mm": gt_delta_mm,
             "measured_delta_mm": rs_delta_mm,
@@ -271,21 +372,24 @@ def build_example_depth_scale_regression_series(gt_delta_mm, rs_delta_mm, zv_del
             "marker": "o",
             "label": "zivid",
         },
-        "ffs": {
+    }
+    if fs_delta_mm is not None:
+        series_map["ffs"] = {
             "gt_delta_mm": gt_delta_mm,
             "measured_delta_mm": fs_delta_mm,
             "color": "#27ae60",
             "marker": "d",
             "label": "ffs",
-        },
-        "ftn": {
+        }
+    if ftn_delta_mm is not None:
+        series_map["ftn"] = {
             "gt_delta_mm": gt_delta_mm,
             "measured_delta_mm": ftn_delta_mm,
             "color": "#f39c12",
             "marker": "^",
             "label": "ftn",
-        },
-    }
+        }
+    return series_map
 
 def plot_depth_scale_regression(
     series_map: dict,
@@ -498,7 +602,6 @@ def main_inbolt_graphs():
         zv_mm = data['depth_zivid'].astype(np.float32)   # Zivid GT in mm
         rs_mm = data['depth_rs'].astype(np.float32)   # RealSense depth in mm
 
-    
 
         # # Resize Zivid depth to match RealSense IR image resolution for pixel-level comparison
         # rs_h, rs_w = left.shape[:2]
@@ -519,6 +622,62 @@ def main_inbolt_graphs():
     plot_depth_scale_regression(sm, out_path=Path(DEFAULT_OUT) / "depth_scale_comparison.png", title="Depth Scale Comparison")
 
     logging.info(f"All outputs written to {out_dir}")
+
+# ── inbolt graphs with Zivid projection ─────────────────────────────────────────────────────────────────────
+
+def main_inbolt_graphs_with_projection():
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--out_dir', default=DEFAULT_OUT, help='Output directory for the report')
+    parser.add_argument('--data_dir', default=DATA_DIR, help='Path to dataset root')
+    parser.add_argument('--original', default=MODEL_PATH, help='Path to original model weights')
+    parser.add_argument('--finetuned', default=FINETUNED_PATH, help='Path to fine-tuned model weights')
+    parser.add_argument('--n_viz', type=int, default=N_VIZ, help='Frames saved for visual comparison')
+    args = parser.parse_args()
+
+    U.set_logging_format()
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── dataset ───────────────────────────────────────────────────────────────
+    source = DataSource()
+    n = source.init_directory(input_rectified=args.data_dir)
+    logging.info(f"Found {n} samples in {args.data_dir}")
+    if n == 0:
+        logging.error("No samples found — check DATA_DIR path")
+        return
+
+    #import cv2 as _cv2   # local import to avoid top-level dependency if already imported
+    gt_depth_diff = np.arange(n)*100 # mm
+    rs_depth_diff = np.arange(n)*0 # mm
+    zv_depth_diff = np.arange(n)*0 # zivid mm
+    rs_ref = None
+    zv_ref = None
+    for idx in range(n):
+        data  = source.get_item(idx)
+        left  = data['left']
+        right = data['right']
+        zv_mm = data['depth_zivid'].astype(np.float32)   # Zivid GT in mm
+        rs_mm = data['depth_rs'].astype(np.float32)   # RealSense depth in mm
+
+        # project zivid on rs
+        zv_mm = project_depth_zivid_to_rs(zv_mm, rs_mm, finx = idx)
+
+        #rs_valid           = (rs_mm > rs_mm.max()*0.8) 
+        zv_valid           = (zv_mm > zv_mm.max()*0.1) 
+        if idx == 0:
+            rs_ref = rs_mm
+            zv_ref = zv_mm
+        else:
+            rs_depth_diff[idx] = np.nanmean(rs_mm[zv_valid] - rs_ref[zv_valid])
+            zv_depth_diff[idx] = np.nanmean(zv_mm[zv_valid] - zv_ref[zv_valid])
+
+
+    sm = build_example_depth_scale_regression_series(gt_depth_diff, rs_depth_diff, zv_depth_diff)
+    plot_depth_scale_regression(sm, out_path=Path(DEFAULT_OUT) / "depth_scale_comparison.png", title="Depth Scale Comparison")
+
+    logging.info(f"All outputs written to {out_dir}")
+
 
 # ── inbolt and FFS graphs ─────────────────────────────────────────────────────────────────────
 
@@ -782,4 +941,7 @@ if __name__ == '__main__':
     #main()
 
     # 4. inbolt with ffs
-    main_inbolt_ffs_graphs()
+    #main_inbolt_ffs_graphs()
+
+    # 5. inbolt with zivid projection
+    main_inbolt_graphs_with_projection()
