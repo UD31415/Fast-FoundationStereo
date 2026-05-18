@@ -27,13 +27,14 @@ sys.path.append(f'{code_dir}/../')
 sys.path.append(code_dir)
 
 import numpy as np
-
+import torch
+from core.utils.utils import InputPadder
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-
+from scripts.finetune_inbolt_planes_bf import FastFoundationStereoWithDepth, DepthHead
 import Utils as U
-from benchmark_inbolt import DepthBinAccumulator, infer_depth_m, load_model, plot_depth_vs_distance
+from benchmark_inbolt import DepthBinAccumulator, infer_depth_m, load_model, plot_depth_vs_distance #, infer_depth_nobf_m
 from scripts.data_manager_inbolt import DataSource, CAMERA_MATRIX_RS, DIST_COEFFS_RS
 from metrics import (
     BenchmarkResults,
@@ -44,6 +45,7 @@ from metrics import (
     CLOSE_RANGE_THRESHOLD_M,
 )
 from report import ReportGenerator
+from finetune_inbolt_planes import find_flat_regions
 
 
 # ── custom report generator ──────────────────────────────────────────────────
@@ -166,8 +168,8 @@ ORIGINAL_PATH  = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 # MODEL_PATH      = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 #FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
 #DEFAULT_OUT     = f'{code_dir}/../reports/inbolt_ffs_benchmark-model37-111-set-20260414_142239'
-FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_planes_epoch_120.pth'
-DEFAULT_OUT     = f'{code_dir}/../reports/inbolt_ffs_benchmark-planes_epoch_120'
+FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_planes_bf_epoch_093.pth'
+DEFAULT_OUT     = f'{code_dir}/../reports/inbolt_ffs_benchmark_planes_bf'
 N_VIZ = 5
 
 METHODS: Dict[str, Dict[str, str]] = {
@@ -179,7 +181,17 @@ METHODS: Dict[str, Dict[str, str]] = {
 GT_NAME = 'zivid_gt'
 RS_NAME = 'depth_rs'
 RS_FPS = 30.0
+ITERS  = 8
 
+# ── inference helpers ─────────────────────────────────────────────────────────
+
+def _preprocess_ir(left: np.ndarray, right: np.ndarray):
+    """Convert IR uint8 pair to float RGB tensors on CUDA."""
+    def _to_t(img):
+        img = np.clip(img.astype(np.float32), 0, 255)
+        img = np.stack([img, img, img], axis=-1)
+        return torch.as_tensor(img).float()[None].permute(0, 3, 1, 2).cuda()
+    return _to_t(left), _to_t(right)
 
 def resolve_finetuned_model_path(preferred_path: str) -> Optional[str]:
     """Return an existing fine-tuned Inbolt checkpoint path, or None if not found."""
@@ -213,6 +225,23 @@ def resolve_finetuned_model_path(preferred_path: str) -> Optional[str]:
 
     return None
 
+@torch.no_grad()
+def infer_depth_nobf_m(model:FastFoundationStereoWithDepth, left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Run stereo inference on an IR pair that returns depth; return depth map in metres (H×W float32)."""
+    left_t, right_t = _preprocess_ir(left, right)
+    padder = InputPadder(left_t.shape, divis_by=32, force_square=False)
+    left_t, right_t = padder.pad(left_t, right_t)
+
+    with torch.amp.autocast('cuda', enabled=True, dtype=U.AMP_DTYPE):
+        depth, disp = model.forward(left_t, right_t, iters=ITERS, test_mode=True)
+
+    depth = padder.unpad(depth.float())
+    depth_np = depth.cpu().numpy().reshape(left.shape[:2]).clip(0, None)
+
+    depth_m = np.zeros_like(depth_np)
+    valid = depth_np > 0
+    depth_m[valid] = depth_np[valid] / 1000.0   # mm → m
+    return depth_m
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
@@ -281,10 +310,18 @@ def main():
         gt_m = gt_mm / 1000.0
         rs_m = rs_mm / 1000.0
 
+        # valid only for flat regions
+        valid = (gt_m > 0) 
+        valid = find_flat_regions(gt_mm, valid)
+        gt_m[valid == False] = 0.0
+
         frame_depths = {GT_NAME: gt_m, RS_NAME: rs_m}
         for mname, model in models.items():
             t0 = time.monotonic()
-            frame_depths[mname] = infer_depth_m(model, left, right)
+            if mname == 'finetuned':
+                frame_depths[mname] = infer_depth_nobf_m(model, left, right)
+            else:
+                frame_depths[mname] = infer_depth_m(model, left, right)
             # save raw data to p.g images 16 bit PNGs for later analysis if needed
             #cv2.imwrite(str(out_dir / f'{mname}_{idx:03d}.png'), (frame_depths[mname] * 1000.0).astype(np.uint16))
             timing_ms_raw[mname].append((time.monotonic() - t0) * 1000.0)
@@ -304,6 +341,7 @@ def main():
 
         for mname in active_methods:
             pred = frame_depths[mname]
+
             valid_acc[mname] += (pred > 0).astype(np.float32)
 
             if mname == GT_NAME:

@@ -38,7 +38,7 @@ from Utils import (
 )
 import cv2
 #from faro_data_manager import DataSource
-from faro_data_manager_laptop import DataSource
+from scripts.data_manager_faro_laptop import DataSource
 
 
 def process_arguments():
@@ -750,8 +750,8 @@ if __name__ == '__main__':
     # test_point_cloud_rt() # ok
     #test_point_cloud_rs_versus_foundation()
     #test_video_stream_rs_versus_foundation_x2() # ok
-    #test_video_stream_rs_fs_merge()
-    test_faro_rs_fs_error()
+    test_video_stream_rs_fs_merge()
+    #test_faro_rs_fs_error()
 
 
 
