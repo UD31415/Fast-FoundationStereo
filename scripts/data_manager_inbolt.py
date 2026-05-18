@@ -261,11 +261,11 @@ class DataSource:
             #XYZ = self.project_camera_to_3d(depth_zivid_projected, CAMERA_MATRIX_ZIVID, DIST_COEFFS_ZIVID)
             XYZ = self.project_camera_to_3d(depth_zivid_projected, CAMERA_MATRIX_RS, DIST_COEFFS_RS)  # (N, 3) array of 3D points in Zivid camera space
             zivid_path = entry['depth_zivid'].replace('.png', f'.ply')
-            self.save_to_ply(XYZ/1000, zivid_path) # save in meters for visualization
+            #self.save_to_ply(XYZ/1000, zivid_path) # save in meters for visualization
 
             XYZ = self.project_camera_to_3d(depth_rs, CAMERA_MATRIX_RS, DIST_COEFFS_RS)  # (N, 3) array of 3D points in RS camera space
             rs_path = entry['depth_rs'].replace('.png', f'.ply')
-            self.save_to_ply(XYZ/1000, rs_path) 
+            #self.save_to_ply(XYZ/1000, rs_path) 
 
         return output_str    
 
@@ -292,7 +292,7 @@ class DataSource:
             axes[ri, ci].imshow(img_list[k], vmin=vmin, vmax=vmax)
             axes[ri, ci].set_title(ttl_list[k])
         for k in range(img_num, row_num * col_num):
-            axes[k // col_num, k % col_num].axis('off')
+            axes[k // col_num, k % col_num].axis('on')
         if save_path and os.path.exists(save_path):
             fig.savefig(os.path.join(save_path, fig_name + ".png"))
         plt.show(block=False)
@@ -397,7 +397,7 @@ class DataSource:
         # create 3D point cloud from zivid depth
         XYZ = self.project_camera_to_3d(depth_zivid_mm, CAMERA_MATRIX_ZIVID, DIST_COEFFS_ZIVID)  # (N, 3) array of 3D points in Zivid camera space
         # save to ply point cloud for visualization
-        self.save_to_ply(XYZ/1000, f'zivid_original_points_{finx:03d}.ply') # save in meters for visualization
+        #self.save_to_ply(XYZ/1000, f'zivid_original_points_{finx:03d}.ply') # save in meters for visualization
 
         # project back on imaage RS
         depth_zivid_projected_mm = self.project_3d_to_camera(XYZ, CAMERA_MATRIX_RS, DIST_COEFFS_RS, frame_size = depth_rs_mm.shape)  # (H, W) depth map of Zivid points projected into RealSense pixel space
@@ -452,8 +452,8 @@ class TestDataSource(unittest.TestCase):
         p       = DataSource()
         img_num = p.init_directory(r'C:\Work\Data\Depth\Data Collection-02')
         self.assertTrue(img_num > 0)
-        #for k in np.random.randint(0, img_num, size=min(12, img_num)):
-        for k in range(0, img_num):
+        for k in np.random.randint(0, img_num, size=min(12, img_num)):
+        #for k in range(0, img_num):
             out = p.get_item_projected(int(k), debug=False)
             err = p.compute_depth_error(out["depth_rs"], out["depth_zivid"])
             self.assertTrue(len(out["left"]) > 0)
