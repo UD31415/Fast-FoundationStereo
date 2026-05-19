@@ -123,8 +123,8 @@ class DataSource:
 
         #IGNORED_SESSIONS = {'dataset_y16_freedrive', 'dataset_y8_freedrive'}
         #IGNORED_SESSIONS = {'dataset_y16_freedrive','dataset_depth_bias'}
-        IGNORED_SESSIONS = {'20260414_142239'}  # set 2 include all sessions by default; manually exclude any bad ones here
-        IGNORED_SESSIONS = {}  # set 3
+        #IGNORED_SESSIONS = {'20260414_142239'}  # set 2 include all sessions by default; manually exclude any bad ones here
+        IGNORED_SESSIONS = {'20260513_074626'}  # set 3
         
         # Each immediate sub-directory is a session
         try:
@@ -474,7 +474,7 @@ class DataSource:
             tranform_zivid = self.get_camera_to_base_transformation(metadata_zv)
             tranform_rs    = self.get_camera_to_base_transformation(metadata_rs)
             depth_zivid_projected  = self.transform_project_depth_zivid_to_rs(tranform_zivid, depth_zivid, tranform_rs, depth_rs, finx = index)
-            #cv2.imwrite(zivid_projected_path, depth_zivid_projected.astype(np.uint16), [cv2.IMWRITE_PNG_COMPRESSION, 0])  # save projected depth for visualization  
+            cv2.imwrite(zivid_projected_path, depth_zivid_projected.astype(np.uint16), [cv2.IMWRITE_PNG_COMPRESSION, 0])  # save projected depth for visualization  
 
         output_str["left"]        = left_img
         output_str["right"]       = right_img
