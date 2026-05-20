@@ -30,6 +30,8 @@ Output dict keys (same as faro_data_manager for compatibility):
 
 '''
 
+from typing import Optional, Tuple
+
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
@@ -309,7 +311,7 @@ class DataSource:
             HFC = np.array(metadata['base_T_camera']).reshape(4, 4).astype(np.float32) 
             H   = HFC #HBF @ HFC
             # transform meters to mm
-            H[:,3] = H[:,3] * 1000.0
+            #H[:,3] = H[:,3] * 1000.0
             # rotate the matrix
             #H[:3,:3] = H[:3,:3].T  # transpose rotation to convert from camera-to-base to base-to-camera
             #H = np.linalg.inv(H)  # invert to get camera-to-base if needed
@@ -362,8 +364,168 @@ class DataSource:
         
         # save to ply point cloud for visualization
         self.save_to_ply(XYZ1B_RS[:,:3]/1000, f'zivid_projected_points_{finx:03d}.ply') # save in meters for visualization
-        return depth_zivid_projected_mm           
+        return depth_zivid_projected_mm    
+
+    def reproject_depth(self,
+        zivid_depth_mm: np.ndarray,
+        zivid_K: np.ndarray,  # 3x3 Zivid intrinsics
+        base_T_zivid: np.ndarray,  # 4x4 Zivid camera pose in base frame
+        rs_K: np.ndarray,  # 3x3 RealSense intrinsics
+        base_T_rs: np.ndarray,  # 4x4 RS camera pose in base frame
+        rs_shape: Tuple[int, int],  # (H, W) of output RS image
+        zivid_dist: Optional[np.ndarray] = None,  # Zivid distortion coeffs
+        rs_dist: Optional[np.ndarray] = None,  # RS distortion coeffs
+    ) -> np.ndarray:
+        """Reproject Zivid depth map into the RealSense camera frame.
     
+        Uses OpenCV undistortPoints / projectPoints for full distortion handling
+        when distortion coefficients are provided.
+    
+        Returns uint16 depth in mm at RS resolution, 0 = invalid.
+        """
+        H_rs, W_rs = rs_shape
+    
+        valid = zivid_depth_mm > 0
+        ys, xs = np.where(valid)
+        Z = zivid_depth_mm[valid].astype(np.float64) / 1000.0  # → metres
+    
+        if len(Z) == 0:
+            return np.zeros((H_rs, W_rs), dtype=np.uint16)
+    
+        # --- Unproject Zivid pixels → 3D (with distortion correction) ---
+        zv_dist = zivid_dist if zivid_dist is not None else np.zeros(5)
+        pts_2d = np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=-1).reshape(-1, 1, 2)
+        # undistortPoints returns normalized camera coords (x/z, y/z)
+        norm = cv2.undistortPoints(pts_2d, zivid_K, zv_dist).reshape(-1, 2)
+        X = norm[:, 0] * Z
+        Y = norm[:, 1] * Z
+    
+        # --- Zivid frame → base frame → RS frame ---
+        pts_zivid = np.vstack([X, Y, Z, np.ones_like(Z)])  # 4 x N
+        pts_base = base_T_zivid @ pts_zivid
+        rs_T_base = np.linalg.inv(base_T_rs)
+        pts_rs = rs_T_base @ pts_base
+    
+        Xr, Yr, Zr = pts_rs[0], pts_rs[1], pts_rs[2]
+        in_front = Zr > 0.01
+    
+        # --- Project onto RS image plane (with distortion) ---
+        rs_d = rs_dist if rs_dist is not None else np.zeros(5)
+        pts_3d = np.stack([Xr[in_front], Yr[in_front], Zr[in_front]], axis=-1).reshape(-1, 1, 3)
+        proj, _ = cv2.projectPoints(
+            pts_3d,
+            np.zeros(3),
+            np.zeros(3),
+            rs_K.astype(np.float64),
+            rs_d,
+        )
+        uv = proj.reshape(-1, 2)
+        u = np.rint(uv[:, 0]).astype(np.int32)
+        v = np.rint(uv[:, 1]).astype(np.int32)
+        z_vals = Zr[in_front]
+    
+        # Filter to in-bounds
+        in_bounds = (u >= 0) & (u < W_rs) & (v >= 0) & (v < H_rs)
+        u, v, z_vals = u[in_bounds], v[in_bounds], z_vals[in_bounds]
+    
+        # Vectorized z-buffer: for duplicate pixels, keep the closest depth
+        depth_mm_vals = z_vals * 1000.0
+        flat_idx = v * W_rs + u
+        out_flat = np.full(H_rs * W_rs, np.inf)
+        np.minimum.at(out_flat, flat_idx, depth_mm_vals)
+        out_flat[out_flat == np.inf] = 0.0
+    
+        return out_flat.reshape(H_rs, W_rs).astype(np.uint16)
+ 
+    def reproject_depth_with_icp(self,
+        zivid_depth_mm: np.ndarray,
+        zivid_K: np.ndarray,  # 3x3 Zivid intrinsics
+        base_T_zivid: np.ndarray,  # 4x4 Zivid camera pose in base frame
+        rs_depth_mm: np.ndarray,
+        rs_K: np.ndarray,  # 3x3 RealSense intrinsics
+        base_T_rs: np.ndarray,  # 4x4 RS camera pose in base frame
+        zivid_dist: Optional[np.ndarray] = None,  # Zivid distortion coeffs
+        rs_dist: Optional[np.ndarray] = None,  # RS distortion coeffs
+    ) -> np.ndarray:
+        """Reproject Zivid depth map into the RealSense camera frame.
+    
+        Uses OpenCV undistortPoints / projectPoints for full distortion handling
+        when distortion coefficients are provided.
+    
+        Returns uint16 depth in mm at RS resolution, 0 = invalid.
+        """
+        H_rs, W_rs = rs_depth_mm.shape
+    
+        # --- Unproject Zivid pixels → 3D (with distortion correction) ---
+        valid = zivid_depth_mm > 0
+        ys, xs = np.where(valid)
+        Z = zivid_depth_mm[valid].astype(np.float64) / 1000.0  # → metres
+    
+        if len(Z) == 0:
+            return np.zeros((H_rs, W_rs), dtype=np.uint16)
+    
+        zv_dist = zivid_dist if zivid_dist is not None else np.zeros(5)
+        pts_2d = np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=-1).reshape(-1, 1, 2)
+        # undistortPoints returns normalized camera coords (x/z, y/z)
+        norm = cv2.undistortPoints(pts_2d, zivid_K, zv_dist).reshape(-1, 2)
+        X = norm[:, 0] * Z
+        Y = norm[:, 1] * Z
+        pts_zivid = np.vstack([X, Y, Z, np.ones_like(Z)])  # 4 x N
+        pts_zivid_base = base_T_zivid @ pts_zivid
+
+        # --- Unproject RS pixels → 3D (with distortion correction) ---
+        valid = rs_depth_mm > 0
+        ys, xs = np.where(valid)
+        Z = rs_depth_mm[valid].astype(np.float64) / 1000.0  # → metres
+    
+        if len(Z) == 0:
+            return np.zeros((H_rs, W_rs), dtype=np.uint16)
+    
+        rs_dist = rs_dist if rs_dist is not None else np.zeros(5)
+        pts_2d = np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=-1).reshape(-1, 1, 2)
+        # undistortPoints returns normalized camera coords (x/z, y/z)
+        norm = cv2.undistortPoints(pts_2d, rs_K, rs_dist).reshape(-1, 2)
+        X = norm[:, 0] * Z
+        Y = norm[:, 1] * Z        
+        pts_rs = np.vstack([X, Y, Z, np.ones_like(Z)])  # 4 x N
+        pts_rs_base = base_T_rs @ pts_rs
+
+
+        # ---- ICP on the data
+        # improving matching
+        T_zivid_rs, info = self.point_cloud_matching(pts_zivid_base[:3,:], pts_rs_base[:3,:], voxel_size_m=0.005, max_correspondence_distance_m=0.01,   debug=True)        
+
+        # --- Zivid frame → base frame → RS frame ---
+        rs_T_base = np.linalg.inv(base_T_rs)
+        pts_rs = rs_T_base @ T_zivid_rs @ pts_zivid_base  # transform zivid points to rs frame using icp result before projecting
+    
+        
+        Xr, Yr, Zr = pts_rs[0], pts_rs[1], pts_rs[2]
+        in_front = Zr > 0.01
+    
+        # --- Project onto RS image plane (with distortion) ---
+        rs_d = rs_dist if rs_dist is not None else np.zeros(5)
+        pts_3d = np.stack([Xr[in_front], Yr[in_front], Zr[in_front]], axis=-1).reshape(-1, 1, 3)
+        proj, _ = cv2.projectPoints(pts_3d, np.zeros(3),  np.zeros(3),  rs_K.astype(np.float64),  rs_d)
+        uv = proj.reshape(-1, 2)
+        u = np.rint(uv[:, 0]).astype(np.int32)
+        v = np.rint(uv[:, 1]).astype(np.int32)
+        z_vals = Zr[in_front]
+    
+        # Filter to in-bounds
+        in_bounds = (u >= 0) & (u < W_rs) & (v >= 0) & (v < H_rs)
+        u, v, z_vals = u[in_bounds], v[in_bounds], z_vals[in_bounds]
+    
+        # Vectorized z-buffer: for duplicate pixels, keep the closest depth
+        depth_mm_vals = z_vals * 1000.0
+        flat_idx = v * W_rs + u
+        out_flat = np.full(H_rs * W_rs, np.inf)
+        np.minimum.at(out_flat, flat_idx, depth_mm_vals)
+        out_flat[out_flat == np.inf] = 0.0
+    
+        return out_flat.reshape(H_rs, W_rs).astype(np.uint16)
+ 
+
     def get_item_projected(self, index: int, debug: bool = False):
         """Return one sample as a dict with left, right, depth_faro, depth_rs, rgb."""
         output_str = {"left": [], "right": [], "depth_zivid": [], "depth_rs": [], "rgb": [], "metadata_rs": None, "metadata_zv": None}
@@ -435,7 +597,7 @@ class DataSource:
 
     def get_item_transformed_and_projected(self, index: int, debug: bool = False):
         """Return one sample as a dict with left, right, depth_faro, depth_rs, rgb."""
-        output_str = {"left": [], "right": [], "depth_zivid": [], "depth_rs": [], "rgb": [], "metadata_rs": None, "metadata_zv": None}
+        output_str = {"left": [], "right": [], "depth_zivid": [], "depth_rs": [], "rgb": [], "depth_zivid_original": [],"metadata_rs": None, "metadata_zv": None}
 
         entry           = self.imgs[index]
 
@@ -461,24 +623,68 @@ class DataSource:
             with open(entry['metadata_rs'], 'r') as f:
                 metadata_rs = yaml.safe_load(f)
 
+            CAMERA_MATRIX_RS = np.array(metadata_rs["intrinsics"]["depthmap_mm"]["camera_matrix"], dtype=np.float32)  
+            DIST_COEFFS_RS   = np.array(metadata_rs["intrinsics"]["depthmap_mm"]["dist_coeffs"], dtype=np.float32)  
+
         metadata_zv = None
         if entry.get('metadata_zv') is not None:
             with open(entry['metadata_zv'], 'r') as f:
-                metadata_zv = yaml.safe_load(f)        
+                metadata_zv = yaml.safe_load(f)   
+            
+            CAMERA_MATRIX_ZIVID = np.array(metadata_zv["intrinsics"]["depthmap_mm"]["camera_matrix"], dtype=np.float32)  
+            DIST_COEFFS_ZIVID   = np.array(metadata_zv["intrinsics"]["depthmap_mm"]["dist_coeffs"], dtype=np.float32)   
 
 
         zivid_projected_path = entry['depth_zivid'].replace('.png', '_projected.png')  # for debug visualization of projected depth maps
         if os.path.exists(zivid_projected_path):
             depth_zivid_projected = cv2.imread(zivid_projected_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
         else:
-            tranform_zivid = self.get_camera_to_base_transformation(metadata_zv)
-            tranform_rs    = self.get_camera_to_base_transformation(metadata_rs)
-            depth_zivid_projected  = self.transform_project_depth_zivid_to_rs(tranform_zivid, depth_zivid, tranform_rs, depth_rs, finx = index)
-            cv2.imwrite(zivid_projected_path, depth_zivid_projected.astype(np.uint16), [cv2.IMWRITE_PNG_COMPRESSION, 0])  # save projected depth for visualization  
+
+            # depth_zivid_projected = self.reproject_depth(
+            #                             zivid_depth_mm = depth_zivid,
+            #                             zivid_K = CAMERA_MATRIX_ZIVID,  # 3x3 Zivid intrinsics
+            #                             base_T_zivid = self.get_camera_to_base_transformation(metadata_zv),  # 4x4 Zivid camera pose in base frame
+            #                             rs_K = CAMERA_MATRIX_RS,  # 3x3 RealSense intrinsics
+            #                             base_T_rs = self.get_camera_to_base_transformation(metadata_rs),  # 4x4 RS camera pose in base frame
+            #                             rs_shape = depth_rs.shape,  # (H, W) of output RS image
+            #                             zivid_dist = DIST_COEFFS_ZIVID,  # Zivid distortion coeffs
+            #                             rs_dist = DIST_COEFFS_RS,  # RS distortion coeffs
+            #                         )
+            depth_zivid_projected = self.reproject_depth_with_icp(
+                                        zivid_depth_mm = depth_zivid,
+                                        zivid_K = CAMERA_MATRIX_ZIVID,  # 3x3 Zivid intrinsics
+                                        base_T_zivid = self.get_camera_to_base_transformation(metadata_zv),  # 4x4 Zivid camera pose in base frame
+                                        rs_depth_mm = depth_rs,
+                                        rs_K = CAMERA_MATRIX_RS,  # 3x3 RealSense intrinsics
+                                        base_T_rs = self.get_camera_to_base_transformation(metadata_rs),  # 4x4 RS camera pose in base frame
+                                        zivid_dist = DIST_COEFFS_ZIVID,  # Zivid distortion coeffs
+                                        rs_dist = DIST_COEFFS_RS,  # RS distortion coeffs
+                                    )                
+
+            #cv2.imwrite(zivid_projected_path, depth_zivid_projected.astype(np.uint16), [cv2.IMWRITE_PNG_COMPRESSION, 0])  # save projected depth for visualization  
+
+        # # improving matching
+        # pcd_zivid = self.depth_to_pointcloud_base(
+        #     depth_mm=depth_zivid,
+        #     cam_matrix=CAMERA_MATRIX_ZIVID,
+        #     base_T_camera=self.get_camera_to_base_transformation(metadata_zv),
+        #     rgb=None
+        # )
+        # pcd_rs = self.depth_to_pointcloud_base(
+        #     depth_mm=depth_rs,
+        #     cam_matrix=CAMERA_MATRIX_RS,
+        #     base_T_camera=self.get_camera_to_base_transformation(metadata_rs),
+        #     rgb=None
+        # )
+        # T_zivid_rs, info = self.point_cloud_matching(pcd_zivid, pcd_rs, voxel_size_m=0.005, max_correspondence_distance_m=0.02,   debug=True)
+        
+        # print("Estimated transform from Zivid to RS:\n", T_zivid_rs)
+
 
         output_str["left"]        = left_img
         output_str["right"]       = right_img
         output_str["depth_zivid"] = depth_zivid_projected   # Zivid GT
+        output_str["depth_zivid_original"] = depth_zivid   # Original Zivid depth
         output_str["depth_rs"]    = depth_rs
         output_str["rgb"]         = rgb_img
         output_str["metadata_rs"] = metadata_rs
@@ -602,8 +808,6 @@ class DataSource:
 
         return output_str    
 
-
-
     def compute_depth_error(self, depth_pred, depth_gt, depth_mask=None):
         """Compute absolute depth error between prediction and GT."""
         depth_pred = depth_pred.astype(np.float32)
@@ -726,6 +930,189 @@ class DataSource:
         log.info(f"Built point cloud with {len(pcd.points)} points in base frame")
         return pcd
 
+    def point_cloud_matching(self,
+                              pcd_zivid,
+                              pcd_rs,
+                              voxel_size_m: float = 0.005,
+                              max_correspondence_distance_m: float = 0.02,
+                              init_transform: Optional[np.ndarray] = None,
+                              use_global_registration: bool = True,
+                              use_point_to_plane: bool = True,
+                              max_iter: int = 100,
+                              debug: bool = False):
+        """Estimate the 4x4 rigid transform that aligns the Zivid cloud onto
+        the RealSense cloud using Open3D ICP (with optional FPFH-based global
+        pre-alignment for robustness when no initial guess is provided).
+
+        Both inputs may be ``open3d.geometry.PointCloud`` instances or ``(N, 3)``
+        numpy arrays of points expressed in metres. The returned transform
+        ``T_rs_zivid`` is such that::
+
+            pcd_zivid_aligned = T_rs_zivid @ pcd_zivid
+
+        Parameters
+        ----------
+        pcd_zivid : open3d.geometry.PointCloud | np.ndarray
+            Source cloud to align (Zivid).
+        pcd_rs : open3d.geometry.PointCloud | np.ndarray
+            Target / reference cloud (RealSense).
+        voxel_size_m : float
+            Downsampling voxel size in metres. Also drives the FPFH feature
+            radii and the global RANSAC distance threshold.
+        max_correspondence_distance_m : float
+            ICP inlier threshold in metres.
+        init_transform : (4, 4) np.ndarray, optional
+            Initial guess for the source→target transform. If provided,
+            global registration is skipped.
+        use_global_registration : bool
+            When ``init_transform`` is None, run a fast FPFH/RANSAC step to
+            produce an initial alignment before ICP.
+        use_point_to_plane : bool
+            If True, use point-to-plane ICP (estimates normals on the target).
+            Otherwise use point-to-point ICP.
+        max_iter : int
+            Maximum ICP iterations.
+        debug : bool
+            If True, visualize the result and log fitness/RMSE.
+
+        Returns
+        -------
+        T : (4, 4) np.ndarray
+            Estimated transform aligning ``pcd_zivid`` onto ``pcd_rs``.
+        info : dict
+            ``{'fitness': float, 'inlier_rmse': float, 'num_points_src': int,
+            'num_points_tgt': int, 'init_transform': np.ndarray}``.
+        """
+        import open3d as o3d
+
+        def _as_pcd(p):
+            if isinstance(p, o3d.geometry.PointCloud):
+                return p
+            arr = np.asarray(p, dtype=np.float64)
+            if arr.ndim != 2 or arr.shape[1] != 3:
+                if arr.shape[0] == 3:
+                    arr = arr.T
+                else:
+                    raise ValueError("point cloud array must have shape (N, 3)")
+            out = o3d.geometry.PointCloud()
+            out.points = o3d.utility.Vector3dVector(arr)
+            return out
+
+        target = _as_pcd(pcd_rs)
+        source = _as_pcd(pcd_zivid)
+
+        if len(target.points) == 0 or len(source.points) == 0:
+            log.warning("point_cloud_matching: empty input cloud(s); returning identity")
+            return np.eye(4, dtype=np.float64), {
+                'fitness': 0.0, 'inlier_rmse': float('inf'),
+                'num_points_src': len(source.points),
+                'num_points_tgt': len(target.points),
+                'init_transform': np.eye(4, dtype=np.float64),
+            }
+        # pcd_zivid defines the working voume and is typically smaller, 
+        # cut all the points in pcd_rs that far more than 0.2m from any nearest point in pcd_zivid to speed up matching and avoid spurious matches on faraway points
+        dists = target.compute_point_cloud_distance(source)
+        mask = np.array(dists) < 0.2
+        target = target.select_by_index(np.where(mask)[0])
+
+        # # --- Downsample + estimate normals ------------------------------------
+        # src_down = source.voxel_down_sample(voxel_size_m)
+        # tgt_down = target.voxel_down_sample(voxel_size_m)
+
+        # normal_radius = voxel_size_m * 2.0
+        # src_down.estimate_normals(
+        #     o3d.geometry.KDTreeSearchParamHybrid(radius=normal_radius, max_nn=30))
+        # tgt_down.estimate_normals(
+        #     o3d.geometry.KDTreeSearchParamHybrid(radius=normal_radius, max_nn=30))
+
+        # # --- Initial transform: user-supplied or FPFH/RANSAC global reg --------
+        # if init_transform is not None:
+        #     init = np.asarray(init_transform, dtype=np.float64).reshape(4, 4)
+        # elif use_global_registration:
+        #     feature_radius = voxel_size_m * 5.0
+        #     src_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        #         src_down,
+        #         o3d.geometry.KDTreeSearchParamHybrid(radius=feature_radius, max_nn=100))
+        #     tgt_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        #         tgt_down,
+        #         o3d.geometry.KDTreeSearchParamHybrid(radius=feature_radius, max_nn=100))
+
+        #     distance_threshold = voxel_size_m * 1.5
+        #     ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        #         src_down, tgt_down, src_fpfh, tgt_fpfh,
+        #         mutual_filter=True,
+        #         max_correspondence_distance=distance_threshold,
+        #         estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+        #         ransac_n=4,
+        #         checkers=[
+        #             o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+        #             o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold),
+        #         ],
+        #         criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999),
+        #     )
+        #     init = ransac.transformation
+        #     log.info(f"point_cloud_matching: global RANSAC fitness={ransac.fitness:.3f} "
+        #              f"rmse={ransac.inlier_rmse:.4f}")
+        # else:
+        #     init = np.eye(4, dtype=np.float64)
+
+        # --- ICP refinement ---------------------------------------------------
+        if use_point_to_plane:
+            estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+        else:
+            estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint()
+
+        # 2. CRITICAL STEP: Estimate normals for the target point cloud
+        # (We search within a 10cm radius, constraining max NN to 30 for speed)
+        target.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=50)
+        )
+
+        # 3. Define the maximum distance threshold for matching points
+        threshold = 0.02  # 2 centimeters
+
+        # 4. Set an initial rough alignment guess (Identity matrix means they are already close)
+        trans_init = np.identity(4)
+
+        # 5. Instantiate the Point-to-Plane estimation object
+        #estimation_method = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+
+        # 6. Run the ICP registration
+        icp = o3d.pipelines.registration.registration_icp(
+            source, 
+            target, 
+            threshold, 
+            trans_init,
+            estimation,
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter),
+        )
+
+        print("Transformation Matrix:")
+        print(icp.transformation)            
+
+
+        T = np.asarray(icp.transformation, dtype=np.float64)
+        info = {
+            'fitness': float(icp.fitness),
+            'inlier_rmse': float(icp.inlier_rmse),
+            'num_points_src': len(source.points),
+            'num_points_tgt': len(target.points),
+            'init_transform': trans_init,
+        }
+        log.info(f"point_cloud_matching: ICP fitness={info['fitness']:.3f} "
+                 f"rmse={info['inlier_rmse']:.4f}")
+
+        if debug:
+            import copy
+            src_aligned = copy.deepcopy(source).transform(T)
+            self.show_pointclouds_open3d(
+                [target, source, src_aligned],
+                colors=[(0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+                window_name="ICP: RS (blue) vs Zivid (red) vs Aligned (green)",
+            )
+
+        return T, info
+
     def show_pointclouds_open3d(self, pcds, colors=None, window_name: str = "PointClouds", show_frame: bool = True):
         """Show one or more Open3D point clouds in the same viewer window.
 
@@ -788,7 +1175,6 @@ class DataSource:
                 f.write(f'{x} {y} {z}\n')
         log.info(f"Saved point cloud to {filename}")
 
-
     def show_projection(self, rs_map, zv_map, zv_valid, idx):
         fig, axes = plt.subplots(1, 3, sharey=True, sharex=True, figsize=(8,4))
         axes[0].imshow(rs_map, vmin=-10, vmax=1000),axes[0].set_title(f"RealSense Depth Diff (mm)"),
@@ -839,8 +1225,8 @@ class TestDataSource(unittest.TestCase):
             out = p.get_item_projected(int(k), debug=False)
             err = p.compute_depth_error(out["depth_rs"], out["depth_zivid"])
             self.assertTrue(len(out["left"]) > 0)
-            p.show_subset([out["left"], out["right"], out["depth_zivid"], out["depth_rs"], err],
-                          ['left (RS)', 'right (RS)', 'depth Zivid (mm)', 'depth RS (mm)', 'error (mm)'])
+            p.show_subset([out["left"], out["right"], out["depth_zivid"], out["depth_rs"], err, out["rgb"]],
+                          ['left (RS)', 'right (RS)', 'depth Zivid (mm)', 'depth RS (mm)', 'error (mm)', 'rgb (Zivid)'])
         plt.show()
 
 
@@ -850,13 +1236,13 @@ class TestDataSource(unittest.TestCase):
         #img_num = p.init_directory(r'C:\Work\Data\Depth\Data Collection-02')
         img_num = p.init_directory(r'C:\Work\Data\Depth\Data Collection-03')
         self.assertTrue(img_num > 0)
-        for k in np.random.randint(0, img_num, size=min(6, img_num)):
+        for k in np.random.randint(0, img_num, size=min(4, img_num)):
         #for k in range(0, img_num):
             out = p.get_item_transformed_and_projected(int(k), debug=False)
             err = p.compute_depth_error(out["depth_rs"], out["depth_zivid"])
             self.assertTrue(len(out["left"]) > 0)
-            p.show_subset([out["left"], out["right"], out["depth_zivid"], out["depth_rs"], err],
-                          ['left (RS)', 'right (RS)', 'depth Zivid (mm)', 'depth RS (mm)', 'error (mm)'])
+            p.show_subset([out["left"], out["right"], out["depth_zivid"], out["depth_rs"], err, out["depth_zivid_original"]],
+                          ['left (RS)', 'right (RS)', 'depth Zivid (mm)', 'depth RS (mm)', 'error (mm)', 'Original Zivid (mm)'])
         plt.show()
 
     def test_get_item_transformed_and_projected_using_open3d(self):
@@ -875,7 +1261,7 @@ class TestDataSource(unittest.TestCase):
 
     def test_display_png_files(self):
         p          = DataSource()
-        indexes    = [3,13,23]
+        indexes    = [12]
         dir_path = r"C:\Users\udubin\Downloads\20260512_134607"
         #dir_path = r"C:\Work\Code\Fast-FoundationStereo"
         for index in indexes:
@@ -911,10 +1297,9 @@ def RunTest():
     #tst.test_get_item()
     #tst.test_show_images()
     #tst.test_get_item_projected()
-    #tst.test_get_item_transformed_and_projected()
+    tst.test_get_item_transformed_and_projected()
     #tst.test_get_item_transformed_and_projected_using_open3d()
-
-    tst.test_display_png_files()
+    #tst.test_display_png_files()
 
 
 if __name__ == '__main__':
