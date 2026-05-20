@@ -873,6 +873,37 @@ class TestDataSource(unittest.TestCase):
                           ['left (RS)', 'right (RS)', 'depth Zivid (mm)', 'depth RS (mm)', 'error (mm)'])
         plt.show()        
 
+    def test_display_png_files(self):
+        p          = DataSource()
+        indexes    = [3,13,23]
+        dir_path = r"C:\Users\udubin\Downloads\20260512_134607"
+        #dir_path = r"C:\Work\Code\Fast-FoundationStereo"
+        for index in indexes:
+
+            files = [
+                os.path.join(dir_path, f"{index:03d}\ir_left.png"),
+                os.path.join(dir_path, f"{index:03d}\zivid_depth_mm.png"),
+                os.path.join(dir_path, f"{index:03d}\depth_rs_mm.png"),
+                os.path.join(dir_path, f"{index:03d}\FS_depth_mm.png"),   
+                os.path.join(dir_path, f"{index:03d}\FFS_original_depth_mm.png"),
+                os.path.join(dir_path, f"{index:03d}\FFS_inbolt_new_depth_mm.png")     
+
+            ]
+            out = []; names = []
+            for f in files:
+                if os.path.exists(f):
+                    fname, ext = os.path.splitext(f)
+                    img = cv2.imread(f, cv2.IMREAD_UNCHANGED)
+                    out.append(img)
+                    names.append(fname.split('\\')[-1])
+                else:
+                    log.warning(f"File not found: {f}")
+                    out.append(np.array([]))  # placeholder for missing file
+
+            p.show_subset(out, names)
+
+        plt.show()
+
 # --------------------------------
 #%% Run Test
 def RunTest():
@@ -880,8 +911,10 @@ def RunTest():
     #tst.test_get_item()
     #tst.test_show_images()
     #tst.test_get_item_projected()
-    tst.test_get_item_transformed_and_projected()
+    #tst.test_get_item_transformed_and_projected()
     #tst.test_get_item_transformed_and_projected_using_open3d()
+
+    tst.test_display_png_files()
 
 
 if __name__ == '__main__':
