@@ -163,13 +163,15 @@ class ReportGeneratorInbolt(ReportGenerator):
 # ── constants ────────────────────────────────────────────────────────────────
 
 DATA_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260415T084601Z-3-001/Data Collection'
+DATA_DIR       =  r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260518-03' 
+
 ORIGINAL_PATH  = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 # FINETUNED_PATH  = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415_epoch_030.pth'
 # MODEL_PATH      = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 #FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
 #DEFAULT_OUT     = f'{code_dir}/../reports/inbolt_ffs_benchmark-model37-111-set-20260414_142239'
-FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_planes_bf_epoch_093.pth'
-DEFAULT_OUT     = f'{code_dir}/../reports/inbolt_ffs_benchmark_data_0518_bf'
+FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_data_0518_bf_epoch_071.pth'
+DEFAULT_OUT     = f'{code_dir}/../reports/benchmark_inbolt_ffs_data_0518_bf'
 N_VIZ = 5
 
 METHODS: Dict[str, Dict[str, str]] = {
@@ -277,6 +279,7 @@ def main():
 
     # ── dataset ──────────────────────────────────────────────────────────────
     source = DataSource(train_mode = False)
+    source.save_point_cloud = True
     n = source.init_directory(input_rectified=args.data_dir)
     logging.info(f'Found {n} samples in {args.data_dir}')
     if n == 0:
@@ -296,7 +299,8 @@ def main():
     depth_accs = {k: DepthBinAccumulator() for k in depth_acc_keys}
 
     for idx in range(n):
-        data = source.get_item_projected(idx)
+        #data = source.get_item_projected(idx)
+        data  = source.get_item_transformed_and_projected(idx)  # 2026-05-18 with plane fitting
         left = data['left']
         right = data['right']
         gt_mm = data['depth_zivid'].astype(np.float32)
@@ -312,7 +316,7 @@ def main():
 
         # valid only for flat regions
         valid = (gt_m > 0) 
-        valid = find_flat_regions(gt_mm, valid)
+        #valid = find_flat_regions(gt_mm, valid)
         gt_m[valid == False] = 0.0
 
         frame_depths = {GT_NAME: gt_m, RS_NAME: rs_m}
@@ -329,14 +333,14 @@ def main():
         gt_close_mask = (gt_m > 0) & (gt_m < CLOSE_RANGE_THRESHOLD_M)
         n_close = int(gt_close_mask.sum())
 
-        # # create point clouds for visualization
-        # if idx % 10 == 0:
-        #     for mname in active_methods:
-        #         pred = frame_depths[mname]
+        # create point clouds for visualization
+        if idx % 5 == 0:
+            for mname in active_methods:
+                pred = frame_depths[mname]
 
-        #         XYZ = source.project_camera_to_3d(pred, CAMERA_MATRIX_RS, DIST_COEFFS_RS)  # (N, 3) array of 3D points in Zivid camera space
-        #         mname_path = os.path.join(out_dir, f'{mname}_{idx:03d}.ply')
-        #         source.save_to_ply(XYZ/1000, mname_path) # save in meters for visualization
+                XYZ = source.project_camera_to_3d(pred, CAMERA_MATRIX_RS, DIST_COEFFS_RS)  # (N, 3) array of 3D points in Zivid camera space
+                mname_path = os.path.join(out_dir, f'{mname}_{idx:03d}.ply')
+                source.save_to_ply(XYZ/1000, mname_path) # save in meters for visualization
 
 
         for mname in active_methods:
