@@ -161,19 +161,21 @@ class ReportGeneratorInbolt(ReportGenerator):
 
 # ── constants ────────────────────────────────────────────────────────────────
 
-DATA_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260415T084601Z-3-001/Data Collection'
+#DATA_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260415T084601Z-3-001/Data Collection'
+DATA_DIR       =  r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260518-03' 
+
 ORIGINAL_PATH  = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 # FINETUNED_PATH  = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415_epoch_030.pth'
 # MODEL_PATH      = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 #FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
 #DEFAULT_OUT     = f'{code_dir}/../reports/inbolt_ffs_benchmark-model37-111-set-20260414_142239'
-FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_planes_25_epoch_012.pth'
-DEFAULT_OUT     = f'{code_dir}/../reports/inbolt_ffs_benchmark-planes_25'
+FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_planes_50_epoch_090.pth'
+DEFAULT_OUT     = f'{code_dir}/../reports/inbolt_ffs_benchmark_planes_50'
 N_VIZ = 5
 
 METHODS: Dict[str, Dict[str, str]] = {
     'original': {'label': 'FFS Original', 'color': '#2980b9'},
-    'finetuned': {'label': 'FFS Fine-tuned (INBOLT)', 'color': '#e74c3c'},
+    'finetuned': {'label': 'FFS Fine-tuned on planes (INBOLT)', 'color': '#e74c3c'},
     'depth_rs': {'label': 'RealSense Hardware Depth', 'color': '#f39c12'},
     'zivid_gt': {'label': 'Zivid GT (projected to RS)', 'color': '#27ae60'},
 }
@@ -191,7 +193,7 @@ def resolve_finetuned_model_path(preferred_path: str) -> Optional[str]:
     weights_dir = Path(code_dir) / '..' / 'weights'
     candidate_names = [
         'model_finetuned_inbolt.pth',
-        'model_finetuned_inbolt-20260415_epoch_030.pth',
+        'model_finetuned_mo.pth',
     ]
 
     # 1) Try known candidate file names anywhere under weights/
@@ -268,7 +270,8 @@ def main():
     depth_accs = {k: DepthBinAccumulator() for k in depth_acc_keys}
 
     for idx in range(n):
-        data = source.get_item_projected(idx)
+        #data = source.get_item_projected(idx)
+        data  = source.get_item_transformed_and_projected(idx)  # 2026-05-18 with plane fitting
         left = data['left']
         right = data['right']
         gt_mm = data['depth_zivid'].astype(np.float32)
@@ -284,7 +287,7 @@ def main():
 
         # valid only for flat regions
         valid = (gt_m > 0) 
-        valid = find_flat_regions(gt_mm, valid)
+        #valid = find_flat_regions(gt_mm, valid)
         gt_m[valid == False] = 0.0
 
         frame_depths = {GT_NAME: gt_m, RS_NAME: rs_m}

@@ -42,13 +42,13 @@ INBOLT_DIR   = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datase
 # MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 # OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415.pth'
 MODEL_PATH = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
-OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_planes_50.pth'
+OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_0518.pth'
 
 
 # BF         = 49.8624*385.73  # D435 - focal_px * baseline_mm (calibrated from camera)  # D435 - focal_px * baseline_mm (calibrated from camera)
 #BF         = 50.102706998586 * 385.509887695312 # new data 2
 BF         = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18
-EPOCHS     = 120
+EPOCHS     = 200
 LR         = 2e-5
 ITERS      = 4          # GRU iterations (same as inference)
 GAMMA      = 0.9        # sequence loss weight decay
@@ -149,7 +149,7 @@ class InboltDataset(Dataset):
         disp[valid] = BF / depth[valid]
 
         #valid = find_flat_regions(disp, valid)
-        valid = find_flat_regions(depth, valid)
+        #valid = find_flat_regions(depth, valid)
 
         left_t  = torch.from_numpy(left).permute(2, 0, 1).float()   # (3, H, W)
         right_t = torch.from_numpy(right).permute(2, 0, 1).float()  # (3, H, W)

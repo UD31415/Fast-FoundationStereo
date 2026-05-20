@@ -1,5 +1,6 @@
 """
 Fine-tune FastFoundationStereo on the Inbolt dataset.
+Make loss on depth and not disparity, since depth is more directly related to the Zivid ground-truth and less sensitive to focal length / baseline calibration errors.
 
 The Inbolt dataset provides:
   - realsense/{idx}/mono0.png  : left IR image  (uint8, 480x640)
@@ -19,12 +20,12 @@ Usage:
 """
 
 import os, sys, logging
-os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../')
 sys.path.append(code_dir)
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import cv2
@@ -42,15 +43,15 @@ INBOLT_DIR   = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datase
 # MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 # OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415.pth'
 MODEL_PATH = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
-OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_planes_50.pth'
+OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_data_0518_bf.pth'
 
 
 # BF         = 49.8624*385.73  # D435 - focal_px * baseline_mm (calibrated from camera)  # D435 - focal_px * baseline_mm (calibrated from camera)
-#BF         = 50.102706998586 * 385.509887695312 # new data 2
+#BF         = 50.102706998586 * 385.509887695312 # new data
 BF         = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18
 EPOCHS     = 120
 LR         = 2e-5
-ITERS      = 4          # GRU iterations (same as inference)
+ITERS      = 8          # GRU iterations (same as inference)
 GAMMA      = 0.9        # sequence loss weight decay
 TRAIN_RATIO = 0.75
 SPLIT_SEED  = 0
@@ -114,6 +115,46 @@ def find_flat_regions(disp_gt, valid):
     return valid_variability
 
 
+def extract_patches(left, right, depth, valid, patch_size=512, min_valid_ratio=0.30, max_tries=50):
+    """Randomly crop a `patch_size`x`patch_size` patch from the image.
+
+    Resamples a new random location if the fraction of valid pixels inside the
+    crop is below `min_valid_ratio`. After `max_tries` attempts, returns the
+    best (highest-valid-ratio) patch found.
+
+    Args:
+        left, right: (H, W, ...) numpy arrays (image channels last or 2D).
+        depth:       (H, W) numpy array.
+        valid:       (H, W) bool numpy array.
+        patch_size:  side length of the square patch.
+        min_valid_ratio: minimum fraction of valid pixels required to accept.
+        max_tries:   maximum number of random crops to try.
+
+    Returns:
+        Tuple (left_p, right_p, depth_p, valid_p) cropped to patch_size x patch_size.
+    """
+    H, W = valid.shape[:2]
+    if H < patch_size or W < patch_size:
+        raise ValueError(f"Image ({H}x{W}) smaller than patch_size ({patch_size}).")
+
+    total = patch_size * patch_size
+    best_ratio = -1.0
+    best_yx = (0, 0)
+
+    for _ in range(max_tries):
+        y = np.random.randint(0, H - patch_size + 1)
+        x = np.random.randint(0, W - patch_size + 1)
+        valid_num = float(valid[y:y + patch_size, x:x + patch_size].sum()) 
+        ratio = valid_num / total
+        best_yx = (y, x)
+        if ratio >= min_valid_ratio:
+            break
+
+    y, x = best_yx
+    sl = (slice(y, y + patch_size), slice(x, x + patch_size))
+    return left[sl], right[sl], depth[sl], valid[sl]
+
+
 # ── dataset ──────────────────────────────────────────────────────────────────
 
 class InboltDataset(Dataset):
@@ -126,16 +167,17 @@ class InboltDataset(Dataset):
         return len(self.source.imgs)
 
     def __getitem__(self, idx):
-        #data  = self.source.get_item_projected(idx)  # 2026-04
+
+        #data  = self.source.get_item_projected(idx)
         data  = self.source.get_item_transformed_and_projected(idx)  # 2026-05-18 with plane fitting
         left  = data['left']
         right = data['right']
         depth = data['depth_zivid']   # float32, mm  (Zivid resolution)
 
-        # Resize Zivid depth to match RealSense stereo image resolution
-        h, w  = left.shape[:2]
-        if depth.shape != (h, w):
-            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+        # # Resize Zivid depth to match RealSense stereo image resolution
+        # h, w  = left.shape[:2]
+        # if depth.shape != (h, w):
+        #     depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
 
         # IR uint8 → float [0, 255], replicate to 3-channel pseudo-RGB
         left  = np.clip(left.astype(np.float32),  0, 255)
@@ -144,31 +186,35 @@ class InboltDataset(Dataset):
         right = np.stack([right, right, right], axis=-1)
 
         # depth (mm) → disparity (pixels):  disp = focal * baseline / depth
-        disp  = np.zeros_like(depth, dtype=np.float32)
+        #disp  = np.zeros_like(depth, dtype=np.float32)
         valid = depth > 0
-        disp[valid] = BF / depth[valid]
+        #disp[valid] = BF / depth[valid]
 
         #valid = find_flat_regions(disp, valid)
-        valid = find_flat_regions(depth, valid)
+        #valid = find_flat_regions(depth, valid)
+
+        # cut the original 720x1280 images on chanks of 512x512. \make sure that at least
+        # 30% of the pixels in each chunk are valid, otherwise skip that chunk for training
+        left, right, depth, valid = extract_patches(left, right, depth, valid)        
 
         left_t  = torch.from_numpy(left).permute(2, 0, 1).float()   # (3, H, W)
         right_t = torch.from_numpy(right).permute(2, 0, 1).float()  # (3, H, W)
-        disp_t  = torch.from_numpy(disp).unsqueeze(0).float()       # (1, H, W)
+        depth_t  = torch.from_numpy(depth).unsqueeze(0).float()       # (1, H, W)
         valid_t = torch.from_numpy(valid).unsqueeze(0)               # (1, H, W) bool
 
-        return left_t, right_t, disp_t, valid_t
+        return left_t, right_t, depth_t, valid_t
 
 
 # ── loss ─────────────────────────────────────────────────────────────────────
 
 
-def sequence_loss(disp_preds, disp_gt, valid, gamma=GAMMA):
+def sequence_loss(depth_preds, depth_gt, valid, gamma=GAMMA):
     """RAFT-style weighted sum of smooth-L1 losses over GRU iterations."""
-    n    = len(disp_preds)
+    n    = len(depth_preds)
     loss = 0.0
-    for i, pred in enumerate(disp_preds):
+    for i, pred in enumerate(depth_preds):
         w  = gamma ** (n - 1 - i)
-        gt = disp_gt
+        gt = depth_gt
         v  = valid
         if pred.shape[-2:] != gt.shape[-2:]:
             gt = F.interpolate(gt, size=pred.shape[-2:], mode='nearest')
@@ -186,24 +232,85 @@ def evaluate_split_loss(model, dataloader):
     total_loss = 0.0
 
     with torch.no_grad():
-        for left, right, disp_gt, valid in dataloader:
+        for left, right, depth_gt, valid in dataloader:
             left, right = left.cuda(), right.cuda()
-            disp_gt, valid = disp_gt.cuda(), valid.cuda()
+            depth_gt, valid = depth_gt.cuda(), valid.cuda()
 
             padder = InputPadder(left.shape, divis_by=32, force_square=False)
             left_p, right_p = padder.pad(left, right)
 
             with torch.amp.autocast('cuda', enabled=True, dtype=U.AMP_DTYPE):
-                _init_disp, disp_preds = model.forward(
+                _init_disp, disp_preds, depth_preds = model.forward(
                     left_p, right_p, iters=ITERS, test_mode=False
                 )
-                disp_preds = [padder.unpad(p) for p in disp_preds]
-                loss = sequence_loss(disp_preds, disp_gt, valid)
+                depth_preds = [padder.unpad(p) for p in depth_preds]
+                loss = sequence_loss(depth_preds, depth_gt, valid)
 
             total_loss += loss.item()
 
     model.train()
     return total_loss / len(dataloader)
+
+# ── depth head ───────────────────────────────────────────────────────────────
+
+class DepthHead(nn.Module):
+    """Convert predicted disparity to depth via depth = (BF + weight) / disparity.
+
+    `weight` is a single learnable scalar (in the same units as BF, i.e. focal*baseline)
+    that compensates for small focal-length / baseline calibration errors.
+    """
+
+    def __init__(self, bf: float, eps: float = 1e-6):
+        super().__init__()
+        self.register_buffer('bf', torch.tensor(float(bf)))
+        self.weight = nn.Parameter(torch.zeros(1))
+        self.eps = 1
+
+    def forward(self, disparity: torch.Tensor) -> torch.Tensor:
+        #return (self.bf + self.weight) / disparity.clamp(min=self.eps)
+        return (self.bf) / disparity.clamp(min=self.eps)
+
+
+# ── model wrapper ─────────────────────────────────────────────────────────────
+
+class FastFoundationStereoWithDepth(nn.Module):
+    """
+    Wraps a pretrained FastFoundationStereo and adds a DepthHead that inverts
+    the predicted disparity to depth using (BF + trainable_weight) / disparity.
+
+    forward(..., test_mode=False) → (init_disp, disp_preds, depth_preds)
+    forward(..., test_mode=True)  → (disp_up, depth)
+    """
+
+    def __init__(self, base_model: nn.Module, bf: float = BF):
+        super().__init__()
+        self.base = base_model
+        self.depth_head = DepthHead(bf=bf)
+
+    # expose base.feature so the freeze loop in main() still works
+    @property
+    def feature(self):
+        return self.base.feature
+
+    def forward(
+        self,
+        image1: torch.Tensor,
+        image2: torch.Tensor,
+        iters: int = 12,
+        test_mode: bool = False,
+        **kwargs,
+    ):
+        result = self.base.forward(image1, image2, iters=iters, test_mode=test_mode, **kwargs)
+
+        if test_mode:
+            disp_up = result
+            depth = self.depth_head(disp_up.float())
+            return depth, disp_up
+        else:
+            init_disp, disp_preds = result
+            depth_preds = [self.depth_head(p.float()) for p in disp_preds]
+            return init_disp, disp_preds, depth_preds
+
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -214,7 +321,9 @@ def main():
 
     # load full model object (weights + architecture)
     logging.info(f"Loading model from {MODEL_PATH}")
-    model = torch.load(MODEL_PATH, map_location='cuda', weights_only=False)
+    base_model = torch.load(MODEL_PATH, map_location='cuda', weights_only=False)
+
+    model = FastFoundationStereoWithDepth(base_model)
 
     # freeze the ViT-L backbone — with only 24 samples it would overfit
     for param in model.feature.parameters():
@@ -259,23 +368,24 @@ def main():
     for epoch in range(EPOCHS):
         epoch_loss = 0.0
 
-        for left, right, disp_gt, valid in train_loader:
-            #valid = find_flat_regions(disp_gt, valid)
+        for left, right, depth_gt, valid in train_loader:
+
             left, right = left.cuda(), right.cuda()
-            disp_gt, valid = disp_gt.cuda(), valid.cuda()
+            depth_gt, valid = depth_gt.cuda(), valid.cuda()
 
             # pad so H and W are divisible by 32
             padder = InputPadder(left.shape, divis_by=32, force_square=False)
             left_p, right_p = padder.pad(left, right)
 
+
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast('cuda', enabled=True, dtype=U.AMP_DTYPE):
-                _init_disp, disp_preds = model.forward(
+                _init_disp, disp_preds, depth_preds = model.forward(
                     left_p, right_p, iters=ITERS, test_mode=False
                 )
-                disp_preds = [padder.unpad(p) for p in disp_preds]
-                loss = sequence_loss(disp_preds, disp_gt, valid)
+                depth_preds = [padder.unpad(p) for p in depth_preds]
+                loss = sequence_loss(depth_preds, depth_gt, valid)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -287,9 +397,7 @@ def main():
 
         train_loss = epoch_loss / len(train_loader)
         train_eval_error = evaluate_split_loss(model, train_loader)
-        torch.cuda.empty_cache()
         test_eval_error = evaluate_split_loss(model, test_loader)
-        torch.cuda.empty_cache()
 
         logging.info(
             f"Epoch {epoch+1:3d}/{EPOCHS}  train_loss={train_loss:.4f}  "
