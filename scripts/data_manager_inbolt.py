@@ -496,10 +496,11 @@ class DataSource:
         T_zivid_rs, info = self.point_cloud_matching(pts_zivid_base[:3,:], pts_rs_base[:3,:], voxel_size_m=0.005, max_correspondence_distance_m=0.01,   debug=True)        
 
         # --- Zivid frame → base frame → RS frame ---
-        rs_T_base = np.linalg.inv(base_T_rs)
+        #T_rs_zivid = np.linalg.inv(T_zivid_rs)
+        rs_T_base  = np.linalg.inv(base_T_rs)
         pts_rs = rs_T_base @ T_zivid_rs @ pts_zivid_base  # transform zivid points to rs frame using icp result before projecting
     
-        
+
         Xr, Yr, Zr = pts_rs[0], pts_rs[1], pts_rs[2]
         in_front = Zr > 0.01
     
