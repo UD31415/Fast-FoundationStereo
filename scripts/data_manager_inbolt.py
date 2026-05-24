@@ -40,6 +40,7 @@ import glob
 import unittest
 import logging as log
 import yaml
+import open3d as o3d
 
 # format logger
 log.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=log.INFO)
@@ -493,7 +494,7 @@ class DataSource:
 
         # ---- ICP on the data
         # improving matching
-        T_zivid_rs, info = self.point_cloud_matching(pts_zivid_base[:3,:], pts_rs_base[:3,:], voxel_size_m=0.005, max_correspondence_distance_m=0.01,   debug=True)        
+        T_zivid_rs, info = self.point_cloud_matching(pts_zivid_base[:3,:], pts_rs_base[:3,:], voxel_size_m=0.005, max_correspondence_distance_m=0.01,   debug=False)        
 
         # --- Zivid frame → base frame → RS frame ---
         #T_rs_zivid = np.linalg.inv(T_zivid_rs)
@@ -662,7 +663,7 @@ class DataSource:
                                         rs_dist = DIST_COEFFS_RS,  # RS distortion coeffs
                                     )                
 
-            #cv2.imwrite(zivid_projected_path, depth_zivid_projected.astype(np.uint16), [cv2.IMWRITE_PNG_COMPRESSION, 0])  # save projected depth for visualization  
+            cv2.imwrite(zivid_projected_path, depth_zivid_projected.astype(np.uint16), [cv2.IMWRITE_PNG_COMPRESSION, 0])  # save projected depth for visualization  
 
         # # improving matching
         # pcd_zivid = self.depth_to_pointcloud_base(
@@ -984,7 +985,7 @@ class DataSource:
             ``{'fitness': float, 'inlier_rmse': float, 'num_points_src': int,
             'num_points_tgt': int, 'init_transform': np.ndarray}``.
         """
-        import open3d as o3d
+
 
         def _as_pcd(p):
             if isinstance(p, o3d.geometry.PointCloud):

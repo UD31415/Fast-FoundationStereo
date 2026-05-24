@@ -48,9 +48,9 @@ OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_0518.pth'
 # BF         = 49.8624*385.73  # D435 - focal_px * baseline_mm (calibrated from camera)  # D435 - focal_px * baseline_mm (calibrated from camera)
 #BF         = 50.102706998586 * 385.509887695312 # new data 2
 BF         = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18
-EPOCHS     = 200
+EPOCHS     = 120
 LR         = 2e-5
-ITERS      = 4          # GRU iterations (same as inference)
+ITERS      = 8          # GRU iterations (same as inference)
 GAMMA      = 0.9        # sequence loss weight decay
 TRAIN_RATIO = 0.75
 SPLIT_SEED  = 0
@@ -113,6 +113,46 @@ def find_flat_regions(disp_gt, valid):
 
     return valid_variability
 
+def extract_patches(left, right, depth, valid, patch_size=512, min_valid_ratio=0.30, max_tries=50):
+    """Randomly crop a `patch_size`x`patch_size` patch from the image.
+
+    Resamples a new random location if the fraction of valid pixels inside the
+    crop is below `min_valid_ratio`. After `max_tries` attempts, returns the
+    best (highest-valid-ratio) patch found.
+
+    Args:
+        left, right: (H, W, ...) numpy arrays (image channels last or 2D).
+        depth:       (H, W) numpy array.
+        valid:       (H, W) bool numpy array.
+        patch_size:  side length of the square patch.
+        min_valid_ratio: minimum fraction of valid pixels required to accept.
+        max_tries:   maximum number of random crops to try.
+
+    Returns:
+        Tuple (left_p, right_p, depth_p, valid_p) cropped to patch_size x patch_size.
+    """
+    H, W = valid.shape[:2]
+    if H < patch_size or W < patch_size:
+        raise ValueError(f"Image ({H}x{W}) smaller than patch_size ({patch_size}).")
+
+    total = patch_size * patch_size
+    best_ratio = -1.0
+    best_yx = (0, 0)
+
+    for _ in range(max_tries):
+        y = np.random.randint(0, H - patch_size + 1)
+        x = np.random.randint(0, W - patch_size + 1)
+        valid_num = float(valid[y:y + patch_size, x:x + patch_size].sum()) 
+        ratio = valid_num / total
+        best_yx = (y, x)
+        if ratio >= min_valid_ratio:
+            break
+
+    y, x = best_yx
+    sl = (slice(y, y + patch_size), slice(x, x + patch_size))
+    return left[sl], right[sl], depth[sl], valid[sl]
+
+
 
 # ── dataset ──────────────────────────────────────────────────────────────────
 
@@ -142,14 +182,17 @@ class InboltDataset(Dataset):
         right = np.clip(right.astype(np.float32), 0, 255)
         left  = np.stack([left,  left,  left],  axis=-1)  # H x W x 3
         right = np.stack([right, right, right], axis=-1)
+        valid = depth > 0
 
+        left, right, depth, valid = extract_patches(left, right, depth, valid)        
         # depth (mm) → disparity (pixels):  disp = focal * baseline / depth
         disp  = np.zeros_like(depth, dtype=np.float32)
-        valid = depth > 0
+        
         disp[valid] = BF / depth[valid]
 
         #valid = find_flat_regions(disp, valid)
         #valid = find_flat_regions(depth, valid)
+       
 
         left_t  = torch.from_numpy(left).permute(2, 0, 1).float()   # (3, H, W)
         right_t = torch.from_numpy(right).permute(2, 0, 1).float()  # (3, H, W)

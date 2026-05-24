@@ -114,7 +114,6 @@ def find_flat_regions(disp_gt, valid):
 
     return valid_variability
 
-
 def extract_patches(left, right, depth, valid, patch_size=512, min_valid_ratio=0.30, max_tries=50):
     """Randomly crop a `patch_size`x`patch_size` patch from the image.
 
