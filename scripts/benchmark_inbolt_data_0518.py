@@ -169,8 +169,8 @@ ORIGINAL_PATH  = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 # MODEL_PATH      = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 #FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
 #DEFAULT_OUT     = f'{code_dir}/../reports/inbolt_ffs_benchmark-model37-111-set-20260414_142239'
-FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_0518_epoch_116.pth'
-DEFAULT_OUT     = f'{code_dir}/../reports/inbolt_ffs_benchmark_data_0518'
+FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_0518_epoch_067.pth'
+DEFAULT_OUT     = f'{code_dir}/../reports/benchmark_inbolt_data_0518'
 N_VIZ = 5
 
 METHODS: Dict[str, Dict[str, str]] = {

@@ -136,7 +136,7 @@ def extract_patches(left, right, depth, valid, patch_size=512, min_valid_ratio=0
         raise ValueError(f"Image ({H}x{W}) smaller than patch_size ({patch_size}).")
 
     total = patch_size * patch_size
-    best_ratio = -1.0
+    #best_ratio = -1.0
     best_yx = (0, 0)
 
     for _ in range(max_tries):
@@ -192,7 +192,7 @@ class InboltDataset(Dataset):
 
         #valid = find_flat_regions(disp, valid)
         #valid = find_flat_regions(depth, valid)
-       
+        left, right, disp, valid = extract_patches(left, right, disp, valid) 
 
         left_t  = torch.from_numpy(left).permute(2, 0, 1).float()   # (3, H, W)
         right_t = torch.from_numpy(right).permute(2, 0, 1).float()  # (3, H, W)
@@ -216,7 +216,8 @@ def sequence_loss(disp_preds, disp_gt, valid, gamma=GAMMA):
         if pred.shape[-2:] != gt.shape[-2:]:
             gt = F.interpolate(gt, size=pred.shape[-2:], mode='nearest')
             v  = F.interpolate(valid.float(), size=pred.shape[-2:], mode='nearest').bool()
-        loss = loss + w * F.smooth_l1_loss(pred[v], gt[v])
+        #loss = loss + w * F.smooth_l1_loss(pred[v], gt[v])
+        loss = loss + w * F.huber_loss(pred[v], gt[v], reduction='mean', delta=3.0)
     return loss
 
 
