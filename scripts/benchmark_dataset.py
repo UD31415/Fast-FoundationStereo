@@ -189,7 +189,7 @@ def _write_html_report(out_dir: Path, frame_indices: List[str],
         )
 
     body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>D405 FFS Benchmark</title>
+<html><head><meta charset="utf-8"><title>D435 FFS Benchmark</title>
 <style>
 body {{ font-family: Arial, sans-serif; max-width: 1400px; margin: 24px auto; padding: 0 16px; }}
 h1 {{ color: #2c3e50; }}
