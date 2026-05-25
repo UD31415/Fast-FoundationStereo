@@ -1,428 +1,308 @@
-"""Benchmark FastFoundationStereo models + RealSense hardware depth on the General dataset.
+"""Benchmark FastFoundationStereo (original + fine-tuned) on the RealSense D405
+captures stored in ``data/d405``.
 
-This benchmark mirrors the structure of ``benchmark_faro_rs.py`` but uses the
-Inbolt dataset and the meter-based reporting pipeline already used by
-``benchmark_inbolt.py``.
+The dataset is laid out as three PNG files per frame::
 
-For fair pixel-wise comparison against the RealSense stereo pair and hardware
-RealSense depth map, Zivid ground-truth depth is projected into RealSense image
-space via ``DataSource.get_item_projected()``.
+    data/d405/imageL_d16_<idx>.png   # left  IR image  (uint8, HxW)
+    data/d405/imageR_d16_<idx>.png   # right IR image  (uint8, HxW)
+    data/d405/imageD_d16_<idx>.png   # hardware depth  (uint16, mm)
 
-Usage:
-  cd /home/adiroha/repos/Fast-FoundationStereo
-  python scripts/benchmark_inbolt_fs.py [--out_dir reports/inbolt_ffs_benchmark]
+For each frame we run both stereo models on the left/right IR pair and produce
+depth maps in metres. The hardware RealSense depth (``imageD_*``) is loaded for
+reference. Depth maps for both models are stored on disk as 16-bit PNGs in mm.
+Finally, a self-contained HTML report is written that visually compares, frame
+by frame, the RealSense depth against the two FFS predictions.
+
+Usage::
+
+    cd /home/adiroha/repos/Fast-FoundationStereo
+    python scripts/benchmark_dataset.py \\
+        [--data_dir data/d405] \\
+        [--out_dir reports/d405_benchmark]
 """
 
 import argparse
 import logging
 import os
+import re
 import sys
 import time
-import cv2
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List
 
-code_dir = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(f'{code_dir}/../')
-sys.path.append(code_dir)
-
+import cv2
 import numpy as np
+import torch
 
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+code_dir = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(f'{code_dir}/../')
+sys.path.append(code_dir)
+
 import Utils as U
-from benchmark_inbolt import DepthBinAccumulator, infer_depth_m, load_model, plot_depth_vs_distance
-from scripts.data_manager_inbolt import DataSource, CAMERA_MATRIX_RS, DIST_COEFFS_RS
-from metrics import (
-    BenchmarkResults,
-    FrameMetrics,
-    compute_bin_mae,
-    compute_metrics,
-    aggregate,
-    CLOSE_RANGE_THRESHOLD_M,
-)
-from report import ReportGenerator
-from finetune_inbolt_planes import find_flat_regions
-
-
-# ── custom report generator ──────────────────────────────────────────────────
-
-class ReportGeneratorInbolt(ReportGenerator):
-    """Custom report generator that shows 4 frames in depth comparison and error maps."""
-
-    def __init__(self, results, stats, output_dir) -> None:
-        super().__init__(results, stats, output_dir)
-        self._selected_viz_indices = []
-
-    def _get_selected_viz_indices(self, n_pick: int = 4):
-        """Return cached random frame indices used consistently across report sections."""
-        if self._selected_viz_indices:
-            return self._selected_viz_indices
-
-        n_total = len(self._r.viz_frames)
-        if n_total == 0:
-            self._selected_viz_indices = []
-            return self._selected_viz_indices
-
-        n = min(n_pick, n_total)
-        rng = np.random.default_rng(42)
-        self._selected_viz_indices = sorted(rng.choice(n_total, size=n, replace=False).tolist())
-        return self._selected_viz_indices
-
-    def _fig_depth_comparison(self) -> str:
-        if not self._r.viz_frames:
-            return self._empty_fig("depth_comparison.png", "No viz frames")
-
-        sel = self._get_selected_viz_indices(n_pick=4)
-        if not sel:
-            return self._empty_fig("depth_comparison.png", "No viz frames")
-
-        vf0 = self._r.viz_frames[sel[0]]
-        method_names = [n for n in self._r.method_names if n in vf0]
-        nrows = len(sel)
-        ncols = len(method_names)
-        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.8 * nrows))
-        axes = np.atleast_2d(axes)
-        cmap = self._depth_cmap()
-
-        for r, frame_idx in enumerate(sel):
-            vf = self._r.viz_frames[frame_idx]
-            for c, name in enumerate(method_names):
-                ax = axes[r, c]
-                if name not in vf:
-                    ax.axis("off")
-                    continue
-                im = ax.imshow(vf[name], cmap=cmap, vmin=0.1, vmax=2.0)
-                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="m")
-                title = self._r.method_labels.get(name, name)
-                if c == 0:
-                    title = f"Frame {frame_idx + 1} • {title}"
-                ax.set_title(title, fontsize=9, wrap=True)
-                ax.axis("off")
-
-        fig.suptitle("Depth Map Comparison (4 random frames) — values in meters",
-                     fontsize=11, y=1.01)
-        fig.tight_layout()
-        return self._save(fig, "depth_comparison.png")
-
-    def _fig_error_maps(self) -> str:
-        if not self._r.viz_frames or not self._non_gt:
-            return self._empty_fig("error_maps.png", "No comparison methods")
-
-        sel = self._get_selected_viz_indices(n_pick=4)
-        if not sel:
-            return self._empty_fig("error_maps.png", "No viz frames")
-
-        vf0 = self._r.viz_frames[sel[0]]
-        names = ([self._gt] if self._gt in vf0 else []) + [n for n in self._non_gt if n in vf0]
-        if not names:
-            return self._empty_fig("error_maps.png", "Ground truth not available in viz frame")
-
-        nrows = len(sel)
-        ncols = len(names)
-        cmap = plt.get_cmap("hot").copy()
-        cmap.set_under("#222222")
-        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.8 * nrows))
-        axes = np.atleast_2d(axes)
-
-        for r, frame_idx in enumerate(sel):
-            vf = self._r.viz_frames[frame_idx]
-            gt = vf.get(self._gt)
-            if gt is None:
-                for c in range(ncols):
-                    axes[r, c].axis("off")
-                continue
-
-            for c, name in enumerate(names):
-                ax = axes[r, c]
-                if name not in vf:
-                    ax.axis("off")
-                    continue
-                pred = vf[name]
-                valid = (gt > 0) & (pred > 0)
-                err = np.where(valid, np.abs(pred - gt), 0.0).astype(np.float32)
-                im = ax.imshow(err, cmap=cmap, vmin=0.001, vmax=0.1)
-                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="|error| (m)")
-                mean_err = float(np.abs(pred[valid] - gt[valid]).mean()) if valid.any() else 0.0
-                label = self._r.method_labels.get(name, name)
-                if c == 0:
-                    ax.set_title(f"Frame {frame_idx + 1} • {label}\nMAE={mean_err:.4f} m", fontsize=9)
-                else:
-                    ax.set_title(f"{label}\nMAE={mean_err:.4f} m", fontsize=9)
-                ax.axis("off")
-
-        gt_label = self._r.method_labels.get(self._gt, self._gt)
-        fig.suptitle(f"Absolute Error vs {gt_label} (4 random frames, m)", fontsize=11, y=1.01)
-        fig.tight_layout()
-        return self._save(fig, "error_maps.png")
+from benchmark_inbolt import infer_depth_m, load_model
+import benchmark_inbolt as bi
 
 
 # ── constants ────────────────────────────────────────────────────────────────
 
-#DATA_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260415T084601Z-3-001/Data Collection'
-DATA_DIR       =  r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260518-03' 
-
-ORIGINAL_PATH  = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
-# FINETUNED_PATH  = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415_epoch_030.pth'
-# MODEL_PATH      = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
-#FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
-#DEFAULT_OUT     = f'{code_dir}/../reports/inbolt_ffs_benchmark-model37-111-set-20260414_142239'
+DATA_DIR        = f'{code_dir}/../data/d405'
+ORIGINAL_PATH   = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_0518_epoch_067.pth'
-DEFAULT_OUT     = f'{code_dir}/../reports/benchmark_inbolt_data_0518'
-N_VIZ = 5
+DEFAULT_OUT     = f'{code_dir}/../reports/benchmark_d405'
+
+# RealSense D405 IR intrinsics / baseline (used to convert disparity → depth).
+# fx (px) for native 1280x720 IR ≈ 638.77, stereo baseline ≈ 18.0 mm.
+D405_FX_PX       = 638.77
+D405_BASELINE_MM = 18.0
+BF               = D405_FX_PX * D405_BASELINE_MM   # focal_px * baseline_mm
 
 METHODS: Dict[str, Dict[str, str]] = {
-    'original': {'label': 'FFS Original', 'color': '#2980b9'},
-    'finetuned': {'label': 'FFS Fine-tuned (INBOLT)', 'color': '#e74c3c'},
-    'depth_rs': {'label': 'RealSense Hardware Depth', 'color': '#f39c12'},
-    'zivid_gt': {'label': 'Zivid GT (projected to RS)', 'color': '#27ae60'},
+    'depth_rs':  {'label': 'RealSense Hardware Depth', 'color': '#f39c12'},
+    'original':  {'label': 'FFS Original',             'color': '#2980b9'},
+    'finetuned': {'label': 'FFS Fine-tuned',           'color': '#e74c3c'},
 }
-GT_NAME = 'zivid_gt'
-RS_NAME = 'depth_rs'
-RS_FPS = 30.0
 
 
-def resolve_finetuned_model_path(preferred_path: str) -> Optional[str]:
-    """Return an existing fine-tuned Inbolt checkpoint path, or None if not found."""
-    preferred = Path(preferred_path)
-    if preferred.exists():
-        return str(preferred)
+# ── data loading ─────────────────────────────────────────────────────────────
 
-    weights_dir = Path(code_dir) / '..' / 'weights'
-    candidate_names = [
-        'model_finetuned_inbolt.pth',
-        'model_finetuned_mo.pth',
-    ]
+_INDEX_RE = re.compile(r'imageL_d16_(\d+)\.png$')
 
-    # 1) Try known candidate file names anywhere under weights/
-    for name in candidate_names:
-        found = sorted(weights_dir.glob(f'**/{name}'))
-        if found:
-            logging.warning(
-                f'Preferred fine-tuned model not found at {preferred}. Using fallback {found[0]}'
+
+def discover_frames(data_dir: Path) -> List[str]:
+    """Return sorted list of frame indices that have L/R/D triplets available."""
+    indices: List[str] = []
+    for p in sorted(data_dir.glob('imageL_d16_*.png')):
+        m = _INDEX_RE.search(p.name)
+        if not m:
+            continue
+        idx = m.group(1)
+        right = data_dir / f'imageR_d16_{int(idx):03d}.png'
+        depth = data_dir / f'imageD_d16_{int(idx):03d}.png'
+        if right.exists() and depth.exists():
+            indices.append(idx)
+        else:
+            logging.warning(f'Skipping frame {idx}: missing right/depth pair')
+    return indices
+
+
+def load_frame(data_dir: Path, idx: str):
+    left  = cv2.imread(str(data_dir / f'imageL_d16_{int(idx):03d}.png'), cv2.IMREAD_UNCHANGED)
+    right = cv2.imread(str(data_dir / f'imageR_d16_{int(idx):03d}.png'), cv2.IMREAD_UNCHANGED)
+    depth = cv2.imread(str(data_dir / f'imageD_d16_{int(idx):03d}.png'), cv2.IMREAD_UNCHANGED)
+    # crop image center of size 480x640 images to match FFS input resolution
+    # the input image is 720x1280, 
+
+    if left is not None and right is not None:
+        h, w = left.shape
+        top, bot = (h - 480) // 2, (w - 640) // 2
+        left = left[top:top + 480, bot:bot + 640]
+        right = right[top:top + 480, bot:bot + 640]
+        depth = depth[top:top + 480, bot:bot + 640]
+    return left, right, depth
+
+
+# ── report ───────────────────────────────────────────────────────────────────
+
+def _save_depth_png_mm(depth_m: np.ndarray, path: Path) -> None:
+    depth_mm = np.clip(depth_m * 1000.0, 0, 65535).astype(np.uint16)
+    cv2.imwrite(str(path), depth_mm)
+
+
+def _load_depth_png_m(path: Path) -> np.ndarray:
+    depth_mm = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if depth_mm is None:
+        return np.zeros((0, 0), np.float32)
+    return depth_mm.astype(np.float32) / 1000.0
+
+
+def _render_comparison(left: np.ndarray, depths: Dict[str, np.ndarray],
+                       frame_idx: str, out_path: Path,
+                       vmin: float = 0.1, vmax: float = 1.0) -> None:
+    ncols = 1 + len(depths)
+    fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 3.6))
+    axes[0].imshow(left, cmap='gray')
+    axes[0].set_title(f'Frame {frame_idx} • Left IR')
+    axes[0].axis('off')
+
+    cmap = plt.get_cmap('turbo').copy()
+    cmap.set_bad('#222222')
+    for ax, (name, d) in zip(axes[1:], depths.items()):
+        masked = np.where(d > 0, d, np.nan)
+        im = ax.imshow(masked, cmap=cmap, vmin=vmin, vmax=vmax)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='m')
+        ax.set_title(METHODS[name]['label'])
+        ax.axis('off')
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130, bbox_inches='tight')
+    plt.close(fig)
+
+
+def _write_html_report(out_dir: Path, frame_indices: List[str],
+                       method_names: List[str], timings_ms: Dict[str, List[float]],
+                       comparison_pngs: List[Path]) -> Path:
+    html_path = out_dir / 'report.html'
+
+    rows = []
+    for name in method_names:
+        if name in timings_ms and timings_ms[name]:
+            arr = np.asarray(timings_ms[name], dtype=np.float64)
+            mean_ms = float(arr.mean())
+            fps = 1000.0 / mean_ms if mean_ms > 0 else 0.0
+            rows.append(
+                f'<tr><td>{METHODS[name]["label"]}</td>'
+                f'<td>{mean_ms:.1f}</td><td>{fps:.1f}</td></tr>'
             )
-            return str(found[0])
+        else:
+            rows.append(
+                f'<tr><td>{METHODS[name]["label"]}</td><td>n/a</td><td>n/a</td></tr>'
+            )
+    timing_table = (
+        '<table border="1" cellpadding="6" cellspacing="0">'
+        '<tr><th>Method</th><th>Mean inference time (ms)</th><th>FPS</th></tr>'
+        + ''.join(rows) + '</table>'
+    )
 
-    # 2) Fallback to any Inbolt fine-tuned checkpoint, prefer lexicographically latest
-    generic = sorted(weights_dir.glob('**/model_finetuned_inbolt*.pth'))
-    if generic:
-        chosen = generic[-1]
-        logging.warning(
-            f'Preferred fine-tuned model not found at {preferred}. Using discovered checkpoint {chosen}'
+    figures_html = []
+    for idx, png in zip(frame_indices, comparison_pngs):
+        rel = png.relative_to(out_dir).as_posix()
+        figures_html.append(
+            f'<h3>Frame {idx}</h3>'
+            f'<img src="{rel}" style="max-width:100%; height:auto;"/>'
         )
-        return str(chosen)
 
-    return None
+    body = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>D405 FFS Benchmark</title>
+<style>
+body {{ font-family: Arial, sans-serif; max-width: 1400px; margin: 24px auto; padding: 0 16px; }}
+h1 {{ color: #2c3e50; }}
+h3 {{ margin-top: 28px; color: #34495e; }}
+table {{ border-collapse: collapse; }}
+th {{ background: #ecf0f1; }}
+</style></head><body>
+<h1>RealSense D405 — FastFoundationStereo Benchmark</h1>
+<p><b>Dataset:</b> {len(frame_indices)} frames loaded from <code>data/d405</code>.</p>
+<p>Each row compares the left IR image, the RealSense hardware depth
+(<code>imageD_*</code>), and depth maps produced by the original and
+fine-tuned FastFoundationStereo models on the same stereo pair. Depth
+maps are rendered with a common colour scale (m).</p>
+
+<h2>Inference timing</h2>
+{timing_table}
+
+<h2>Per-frame depth comparison</h2>
+{''.join(figures_html)}
+
+</body></html>
+"""
+    html_path.write_text(body)
+    return html_path
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('--out_dir', default=DEFAULT_OUT, help='Output directory for the report')
-    parser.add_argument('--data_dir', default=DATA_DIR, help='Path to dataset root')
-    parser.add_argument('--original', default=ORIGINAL_PATH, help='Path to original model weights')
-    parser.add_argument('--finetuned', default=FINETUNED_PATH, help='Path to fine-tuned model weights')
-    parser.add_argument('--n_viz', type=int, default=N_VIZ, help='Frames saved for visual comparison')
+    parser.add_argument('--data_dir',  default=DATA_DIR)
+    parser.add_argument('--out_dir',   default=DEFAULT_OUT)
+    parser.add_argument('--original',  default=ORIGINAL_PATH)
+    parser.add_argument('--finetuned', default=FINETUNED_PATH)
+    parser.add_argument('--bf', type=float, default=BF,
+                        help='focal_px * baseline_mm used to convert disparity to depth')
+    parser.add_argument('--max_frames', type=int, default=0,
+                        help='limit number of frames processed (0 = all)')
     args = parser.parse_args()
 
     U.set_logging_format()
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── load stereo models ───────────────────────────────────────────────────
-    models = {}
-    finetuned_path = resolve_finetuned_model_path(args.finetuned)
-    if finetuned_path is not None:
-        models['finetuned'] = load_model(finetuned_path)
-    else:
-        logging.warning(
-            f'Fine-tuned model not found (preferred: {args.finetuned}) and no fallback checkpoint found — skipping'
-        )
+    data_dir = Path(args.data_dir).resolve()
+    out_dir  = Path(args.out_dir).resolve()
+    (out_dir / 'depth_original').mkdir(parents=True, exist_ok=True)
+    (out_dir / 'depth_finetuned').mkdir(parents=True, exist_ok=True)
+    (out_dir / 'comparisons').mkdir(parents=True, exist_ok=True)
 
-    models['original'] = load_model(args.original)
-
-    active_methods = [GT_NAME, RS_NAME] + list(models.keys())
-
-    # ── dataset ──────────────────────────────────────────────────────────────
-    source = DataSource(train_mode = False)
-    n = source.init_directory(input_rectified=args.data_dir)
-    logging.info(f'Found {n} samples in {args.data_dir}')
-    if n == 0:
-        logging.error('No samples found — check DATA_DIR path')
+    if not data_dir.is_dir():
+        logging.error(f'Dataset directory not found: {data_dir}')
         return
 
-    # ── accumulators ─────────────────────────────────────────────────────────
-    all_metrics = []
-    viz_frames = []
-    valid_acc = {}
-    dist_bin_mae = {m: [] for m in active_methods}
-    close_range_valid = {m: [] for m in active_methods}
-    timing_ms_raw = {m: [] for m in models}
-    H = W = None
+    # Patch BF inside benchmark_inbolt so its infer_depth_m uses the D405 value.
+    bi.BF = args.bf
+    logging.info(f'Using BF = {args.bf:.3f} (fx_px * baseline_mm)')
 
-    depth_acc_keys = ['zivid_gt', RS_NAME] + list(models.keys())
-    depth_accs = {k: DepthBinAccumulator() for k in depth_acc_keys}
+    frame_indices = discover_frames(data_dir)
+    if args.max_frames > 0:
+        frame_indices = frame_indices[:args.max_frames]
+    if not frame_indices:
+        logging.error(f'No frames found in {data_dir}')
+        return
+    logging.info(f'Found {len(frame_indices)} frames in {data_dir}')
 
-    for idx in range(n):
-        #data = source.get_item_projected(idx)
-        data  = source.get_item_transformed_and_projected(idx)  # 2026-05-18 with plane fitting
-        left = data['left']
-        right = data['right']
-        gt_mm = data['depth_zivid'].astype(np.float32)
-        rs_mm = data['depth_rs'].astype(np.float32)
+    # ── enumerate models that exist on disk ──────────────────────────────────
+    model_specs = []
+    if Path(args.original).exists():
+        model_specs.append(('original', args.original))
+    else:
+        logging.warning(f'Original model not found: {args.original}')
+    if Path(args.finetuned).exists():
+        model_specs.append(('finetuned', args.finetuned))
+    else:
+        logging.warning(f'Fine-tuned model not found: {args.finetuned}')
+    if not model_specs:
+        logging.error('No models available — aborting')
+        return
 
-        if H is None:
-            H, W = gt_mm.shape[:2]
-            for m in active_methods:
-                valid_acc[m] = np.zeros((H, W), np.float32)
+    method_names = ['depth_rs'] + [m for m, _ in model_specs]
+    timings_ms: Dict[str, List[float]] = {m: [] for m, _ in model_specs}
 
-        gt_m = gt_mm / 1000.0
-        rs_m = rs_mm / 1000.0
+    # ── 1) load each model in turn and dump per-frame depth to PNGs ──────────
+    sub_dirs = {'original': 'depth_original', 'finetuned': 'depth_finetuned'}
+    for mname, mpath in model_specs:
+        sub_dir = out_dir / sub_dirs[mname]
+        model = load_model(mpath)
+        try:
+            for i, idx in enumerate(frame_indices):
+                left, right, _ = load_frame(data_dir, idx)
+                if left is None or right is None:
+                    logging.warning(f'Skipping frame {idx}: failed to load L/R')
+                    continue
+                t0 = time.monotonic()
+                depth_m = infer_depth_m(model, left, right)
+                timings_ms[mname].append((time.monotonic() - t0) * 1000.0)
+                _save_depth_png_mm(depth_m, sub_dir / f'depth_{idx}.png')
+                if (i + 1) % 5 == 0 or (i + 1) == len(frame_indices):
+                    logging.info(f'[{mname}] {i + 1}/{len(frame_indices)} frames processed')
+        finally:
+            del model
+            torch.cuda.empty_cache()
 
-        # valid only for flat regions
-        valid = (gt_m > 0) 
-        #valid = find_flat_regions(gt_mm, valid)
-        gt_m[valid == False] = 0.0
+    # ── 2) build per-frame comparison figures from saved depth maps ──────────
+    comparison_pngs: List[Path] = []
+    for idx in frame_indices:
+        left, _, depth_mm = load_frame(data_dir, idx)
+        if left is None or depth_mm is None:
+            continue
+        frame_depths: Dict[str, np.ndarray] = {
+            'depth_rs': depth_mm.astype(np.float32) / 1000.0,
+        }
+        for mname, _ in model_specs:
+            d = _load_depth_png_m(out_dir / sub_dirs[mname] / f'depth_{idx}.png')
+            if d.size > 0:
+                frame_depths[mname] = d
+        cmp_png = out_dir / 'comparisons' / f'compare_{idx}.png'
+        _render_comparison(left, frame_depths, idx, cmp_png)
+        comparison_pngs.append(cmp_png)
 
-        frame_depths = {GT_NAME: gt_m, RS_NAME: rs_m}
-        for mname, model in models.items():
-            t0 = time.monotonic()
-            frame_depths[mname] = infer_depth_m(model, left, right)
-            # save raw data to p.g images 16 bit PNGs for later analysis if needed
-            #cv2.imwrite(str(out_dir / f'{mname}_{idx:03d}.png'), (frame_depths[mname] * 1000.0).astype(np.uint16))
-            timing_ms_raw[mname].append((time.monotonic() - t0) * 1000.0)
-
-        gt_close_mask = (gt_m > 0) & (gt_m < CLOSE_RANGE_THRESHOLD_M)
-        n_close = int(gt_close_mask.sum())
-
-        # # create point clouds for visualization
-        # if idx % 10 == 0:
-        #     for mname in active_methods:
-        #         pred = frame_depths[mname]
-
-        #         XYZ = source.project_camera_to_3d(pred, CAMERA_MATRIX_RS, DIST_COEFFS_RS)  # (N, 3) array of 3D points in Zivid camera space
-        #         mname_path = os.path.join(out_dir, f'{mname}_{idx:03d}.ply')
-        #         source.save_to_ply(XYZ/1000, mname_path) # save in meters for visualization
-
-
-        for mname in active_methods:
-            pred = frame_depths[mname]
-
-            valid_acc[mname] += (pred > 0).astype(np.float32)
-
-            if mname == GT_NAME:
-                fm = FrameMetrics(
-                    GT_NAME,
-                    0.0,
-                    0.0,
-                    0.0,
-                    100.0,
-                    float((pred > 0).mean()) * 100.0,
-                    0.0,
-                    mae_pen=0.0,
-                    mre_pen=0.0,
-                )
-            elif mname == RS_NAME:
-                fm = compute_metrics(pred, gt_m, elapsed_ms=0.0, method_name=RS_NAME)
-            else:
-                fm = compute_metrics(pred, gt_m, timing_ms_raw[mname][-1], mname)
-
-            all_metrics.append(fm)
-            dist_bin_mae[mname].append(compute_bin_mae(pred, gt_m))
-
-            close_cov = (
-                float((pred[gt_close_mask] > 0).mean()) * 100.0
-                if n_close > 0 else 0.0
-            )
-            close_range_valid[mname].append(close_cov)
-
-        depth_accs['zivid_gt'].update(gt_m, gt_m)
-        depth_accs[RS_NAME].update(rs_m, gt_m)
-        for mname in models:
-            depth_accs[mname].update(frame_depths[mname], gt_m)
-
-        if idx < args.n_viz:
-            viz_frames.append({k: v.copy() for k, v in frame_depths.items()})
-
-        if (idx + 1) % 200 == 0 or (idx + 1) == n:
-            logging.info(f'  {idx + 1}/{n} frames processed')
-
-    for m in active_methods:
-        valid_acc[m] /= max(n, 1)
-
-    mean_timing = {
-        m: float(np.mean(ts)) if ts else 0.0
-        for m, ts in timing_ms_raw.items()
-    }
-    mean_timing[GT_NAME] = 0.0
-    mean_timing[RS_NAME] = 1000.0 / RS_FPS
-
-    method_configs = {
-        'original': {'model_path': args.original},
-        RS_NAME: {'source': f'RealSense hardware depth (~{RS_FPS:.0f} FPS)'},
-        GT_NAME: {'source': 'Projected Zivid depth map used as Inbolt ground truth'},
-    }
-    if 'finetuned' in models and finetuned_path is not None:
-        method_configs['finetuned'] = {'model_path': finetuned_path}
-
-    results = BenchmarkResults(
-        method_names=active_methods,
-        method_labels={m: METHODS[m]['label'] for m in active_methods},
-        method_colors={m: METHODS[m]['color'] for m in active_methods},
-        ground_truth_name=GT_NAME,
-        n_frames=n,
-        width=W,
-        height=H,
-        all_metrics=all_metrics,
-        viz_frames=viz_frames,
-        coverage_maps=valid_acc,
-        dist_bin_mae=dist_bin_mae,
-        close_range_valid=close_range_valid,
-        source=f'INBOLT dataset ({args.data_dir})',
-        method_configs=method_configs,
+    html_path = _write_html_report(
+        out_dir, frame_indices, method_names, timings_ms, comparison_pngs,
     )
-
-    stats = aggregate(results, mean_timing)
-    if RS_NAME in stats:
-        stats[RS_NAME].fps_mean = RS_FPS
-
-    reporter = ReportGeneratorInbolt(results, stats, out_dir)
-    reporter.generate()
-
-    plot_colors = {
-        'zivid_gt': METHODS[GT_NAME]['color'],
-        RS_NAME: METHODS[RS_NAME]['color'],
-        **{m: METHODS[m]['color'] for m in models if m in METHODS},
-    }
-    plot_labels = {
-        'zivid_gt': 'Zivid GT (spatial spread)',
-        RS_NAME: METHODS[RS_NAME]['label'],
-        'original': METHODS['original']['label'],
-        'finetuned': METHODS['finetuned']['label'],
-    }
-    labeled_accs = {
-        plot_labels.get(k, k): v
-        for k, v in depth_accs.items()
-        if depth_accs[k].count.sum() > 0
-    }
-    labeled_colors = {
-        plot_labels.get(k, k): plot_colors.get(k)
-        for k in depth_accs
-        if depth_accs[k].count.sum() > 0
-    }
-
-    plot_depth_vs_distance(
-        accumulators=labeled_accs,
-        colors=labeled_colors,
-        out_path=out_dir / 'depth_vs_distance.png',
-    )
-    logging.info(f'All outputs written to {out_dir}')
+    logging.info(f'Report written to {html_path}')
+    logging.info(f'All outputs under {out_dir}')
 
 
 if __name__ == '__main__':
