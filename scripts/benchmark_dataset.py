@@ -50,11 +50,11 @@ import benchmark_inbolt as bi
 # ── constants ────────────────────────────────────────────────────────────────
 
 #DATA_DIR        = f'{code_dir}/../data/d405'
-DATA_DIR        = f'{code_dir}/../data/d455'
+DATA_DIR        = f'{code_dir}/../data/d435'
 ORIGINAL_PATH   = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
-FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_0518_epoch_067.pth'
-#FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
-DEFAULT_OUT     = f'{code_dir}/../reports/benchmark_d455'
+#FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_0518_epoch_067.pth'
+FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
+DEFAULT_OUT     = f'{code_dir}/../reports/benchmark_d435'
 
 # RealSense D405 IR intrinsics / baseline (used to convert disparity → depth).
 # fx (px) for native 1280x720 IR ≈ 638.77, stereo baseline ≈ 18.0 mm.
@@ -64,6 +64,9 @@ BF               = D405_FX_PX * D405_BASELINE_MM   # focal_px * baseline_mm
 D455_FX_PX       = 638.77
 D455_BASELINE_MM = 100.0
 BF               = D455_FX_PX * D455_BASELINE_MM   # focal_px * baseline_mm
+D435_FX_PX       = 388.462
+D435_BASELINE_MM = 49.95
+BF               = D435_FX_PX * D435_BASELINE_MM   # focal_px * baseline_mm
 
 METHODS: Dict[str, Dict[str, str]] = {
     'depth_rs':  {'label': 'RealSense Hardware Depth', 'color': '#f39c12'},
@@ -101,17 +104,17 @@ def load_frame(data_dir: Path, idx: str):
     # crop image center of size 480x640 images to match FFS input resolution
     # the input image is 720x1280, 
 
-    # D405
-    if left is not None and right is not None:
-        h, w = left.shape
-        top, bot = (h - 480) // 2, (w - 640) // 2
-        # left = left[top:top + 480, bot:bot + 640]
-        # right = right[top:top + 480, bot:bot + 640]
-        # depth = depth[top:top + 480, bot:bot + 640]
-
-        left = cv2.resize(left, (640, 360), interpolation=cv2.INTER_AREA)
-        right = cv2.resize(right, (640, 360), interpolation=cv2.INTER_AREA)
-        depth = cv2.resize(depth, (640, 360), interpolation=cv2.INTER_AREA)
+    # # D405
+    # if left is not None and right is not None:
+    #     h, w = left.shape
+    #     top, bot = (h - 480) // 2, (w - 640) // 2
+    #     # left = left[top:top + 480, bot:bot + 640]
+    #     # right = right[top:top + 480, bot:bot + 640]
+    #     # depth = depth[top:top + 480, bot:bot + 640]
+    #     # D455
+    #     left = cv2.resize(left, (640, 360), interpolation=cv2.INTER_AREA)
+    #     right = cv2.resize(right, (640, 360), interpolation=cv2.INTER_AREA)
+    #     depth = cv2.resize(depth, (640, 360), interpolation=cv2.INTER_AREA)
     return left, right, depth
 
 
