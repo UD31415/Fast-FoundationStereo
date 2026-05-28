@@ -335,6 +335,7 @@ class DataSource:
             "right_img": right_img,
             "depth_rs_img": depth_rs_img,
             "rgb_img": rgb_img,
+            "cad_img_projected": None, # cad projection data can be added later when needed
         }
 
     def get_item(self, index: int, debug: bool = False) -> dict[str, Any]:
@@ -356,6 +357,115 @@ class DataSource:
             depth_pcd_raw.paint_uniform_color([1.0, 0.0, 0.0])
 
             o3d.visualization.draw([cad_pcd, cad_pcd_aligned, depth_pcd_raw])
+
+        return item
+
+    def get_camera_intrinsics_and_distortion(self) -> tuple[np.ndarray, np.ndarray]:
+        """Read camera intrinsics/distortion from scene JSON."""
+        intrinsics = self.scene_data.get("intrinsics", {})
+        fx = float(intrinsics.get("fx", 1.0))
+        fy = float(intrinsics.get("fy", 1.0))
+        cx = float(intrinsics.get("ppx", 0.0))
+        cy = float(intrinsics.get("ppy", 0.0))
+
+        cam_matrix = np.array(
+            [
+                [fx, 0.0, cx],
+                [0.0, fy, cy],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+
+        coeffs = intrinsics.get("coeffs", [0.0, 0.0, 0.0, 0.0, 0.0])
+        dist_coeffs = np.asarray(coeffs, dtype=np.float32).reshape(-1)
+        if dist_coeffs.size == 0:
+            dist_coeffs = np.zeros((5,), dtype=np.float32)
+        return cam_matrix, dist_coeffs
+
+    def project_3d_to_camera_depth(
+        self,
+        points_3d_m: np.ndarray,
+        cam_matrix: np.ndarray,
+        dist_coeffs: np.ndarray,
+        frame_size: tuple[int, int],
+    ) -> np.ndarray:
+        """Project 3D camera-frame points to a depth image (mm) using z-buffering."""
+        if points_3d_m.ndim != 2 or points_3d_m.shape[1] != 3:
+            raise ValueError("Input points_3d_m must have shape (N, 3)")
+
+        h, w = frame_size
+        valid = np.isfinite(points_3d_m).all(axis=1) & (points_3d_m[:, 2] > 1e-6)
+        if not np.any(valid):
+            return np.zeros((h, w), dtype=np.float32)
+
+        pts = points_3d_m[valid].astype(np.float32)
+        projected_pts, _ = cv2.projectPoints(
+            pts.reshape(-1, 1, 3),
+            np.zeros(3, dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+            cam_matrix.astype(np.float32),
+            dist_coeffs.astype(np.float32),
+        )
+
+        uv = projected_pts.reshape(-1, 2)
+        u_idx = np.rint(uv[:, 0]).astype(np.int32)
+        v_idx = np.rint(uv[:, 1]).astype(np.int32)
+
+        in_bounds = (u_idx >= 0) & (u_idx < w) & (v_idx >= 0) & (v_idx < h)
+        if not np.any(in_bounds):
+            return np.zeros((h, w), dtype=np.float32)
+
+        u_idx = u_idx[in_bounds]
+        v_idx = v_idx[in_bounds]
+        z_vals_mm = (pts[in_bounds, 2] * 1000.0).astype(np.float32)
+
+        lin = v_idx * w + u_idx
+        depth_buffer = np.full(h * w, np.inf, dtype=np.float32)
+        np.minimum.at(depth_buffer, lin, z_vals_mm)
+        depth_projected = depth_buffer.reshape(h, w)
+        depth_projected[~np.isfinite(depth_projected)] = 0.0
+        return depth_projected
+
+    def get_item_projected(self, index: int, debug: bool = False) -> dict[str, Any]:
+        """Return one sample with CAD depth projected onto the camera image plane."""
+        item = self.get_item(index, debug=False)
+
+        depth_rs = np.asarray(item["depth_rs_img"], dtype=np.float32)
+        h, w = depth_rs.shape[:2]
+
+        # CAD points already transformed into camera frame by t_camera_cad.
+        cad_points_cam = np.asarray(item["cad_pcd_aligned"].points, dtype=np.float32)
+        cam_matrix, dist_coeffs = self.get_camera_intrinsics_and_distortion()
+
+        projected_path = item["camera_vertices_path"].replace(".bin", "_cad_projected.png")
+        if os.path.exists(projected_path):
+            depth_cad_projected = cv2.imread(projected_path, cv2.IMREAD_UNCHANGED)
+            
+        else:
+            depth_cad_projected = self.project_3d_to_camera_depth(
+                cad_points_cam,
+                cam_matrix,
+                dist_coeffs,
+                frame_size=(h, w),
+            )
+            cv2.imwrite(
+                projected_path,
+                depth_cad_projected.astype(np.uint16),
+                [cv2.IMWRITE_PNG_COMPRESSION, 0],
+            )
+
+        depth_cad_projected = depth_cad_projected.astype(np.float32)
+        item["cad_img_projected"] = depth_cad_projected
+
+        if debug:
+            err = np.zeros_like(depth_rs, dtype=np.float32)
+            valid = (depth_rs > 0) & (depth_cad_projected > 0)
+            err[valid] = depth_rs[valid] - depth_cad_projected[valid]
+            self.show_subset(
+                [item["left_img"], item["right_img"], depth_rs, depth_cad_projected, err],
+                ["left (RS)", "right (RS)", "depth RS (mm)", "depth CAD projected (mm)", "error RS-CAD (mm)"],
+            )
 
         return item
 
@@ -544,6 +654,14 @@ class TestDataSource(unittest.TestCase):
         item = source.get_item(0, debug=False)
         source.draw_scene(item, show_depth_cloud=False)
 
+    def test_get_item_projected(self):
+        source = DataSource()
+        count = source.init_directory()
+        self.assertTrue(count > 0)
+        out = source.get_item_projected(0, debug=True)
+        self.assertIn("depth_cad_projected", out)
+        self.assertEqual(out["depth_cad_projected"].shape, out["depth_rs_img"].shape)
+
 
 
 
@@ -552,7 +670,8 @@ def RunTest():
     #tst.test_init_directory()
     #tst.test_get_item()
     #tst.test_show_images()
-    tst.test_draw_scene()
+    #tst.test_draw_scene() # ok
+    tst.test_get_item_projected()
 
 
 if __name__ == '__main__':
