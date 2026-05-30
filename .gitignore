@@ -18,3 +18,5 @@ data/pattern_cube/*
 reports/*
 
 *.bak
+data/distance/*
+data/mos/*
