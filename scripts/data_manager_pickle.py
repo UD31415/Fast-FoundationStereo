@@ -9,6 +9,8 @@ Refactored to class style (similar to data_manager_inbolt.py):
 
 from __future__ import annotations
 
+import ast
+import ast
 import copy
 import json
 import logging as log
@@ -21,11 +23,12 @@ import os
 import numpy as np
 import open3d as o3d
 import cv2
+import pandas as pd
 
 
 log.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=log.INFO)
 
-# Helper functions for loading and processing data items.
+#%% Helper functions for loading and processing data items.
 
 def compose_t_camera_cad(
     t_camera_tooltip: np.ndarray,
@@ -150,6 +153,8 @@ def read_bin_file_with_metadata(fname, Size=(640, 480), bpp=16):
 
     return A,H
 
+#%% Main DataSource class definition.
+
 class DataSource:
     """Class-based loader for scene captures and CAD alignment data."""
 
@@ -162,19 +167,38 @@ class DataSource:
         self.cad_path: Optional[str] = None
         self.t_camera_tooltip: Optional[np.ndarray] = None
         self.cad_pcd: Optional[o3d.geometry.PointCloud] = None
+        self.df: Optional[pd.DataFrame] = None   # csv file with icp results, loaded on demand
 
         log.info("DataSource is defined")
 
     def __len__(self) -> int:
         return len(self.captures)
+    
+    def scene_json_load(self, scene_type = 1):
+        if scene_type == 1:
+            json_path = Path(__file__).with_name("scene.json")
+        elif scene_type == 2:
+            json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_05\yg_pickle\2026-05-27--12-24-21\Pickle_Scene_Capture_336222073841\scene.json")
+        elif scene_type == 3:
+            json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_05\yg_pickle\2026-05-27--13-50-40\Pickle_Scene_Capture_336222073841\scene.json")
+        else:
+            raise ValueError(f"Unsupported scene type: {scene_type}")
+        
+        #json_path = Path(json_path)
 
-    def init_directory(self, scene_json_path: str = "") -> int:
+        return json_path
+
+
+
+    def init_directory(self, scene_type:int = 1) -> int:
         """Load scene metadata and optionally preload all captures into memory."""
 
-        if len(scene_json_path) < 3:
-            json_path = Path(__file__).with_name("scene.json")
-        else:
-            json_path = Path(scene_json_path)
+        json_path           = self.scene_json_load(scene_type)
+
+        # if len(scene_json_path) < 3:
+        #     json_path = Path(__file__).with_name("scene.json")
+        # else:
+        #     json_path = Path(scene_json_path)
 
         if not json_path.exists():
             log.error(f"Scene JSON file not found: {json_path}")
@@ -348,8 +372,8 @@ class DataSource:
             raise RuntimeError(f"Failed to build item at index {index}")
 
         if debug:
-            cad_pcd = copy.deepcopy(item["cad_pcd"])
-            cad_pcd_aligned = copy.deepcopy(item["cad_pcd_aligned"])
+            cad_pcd             = copy.deepcopy(item["cad_pcd"])
+            cad_pcd_aligned     = copy.deepcopy(item["cad_pcd_aligned"])
             depth_pcd_raw = copy.deepcopy(item["depth_pcd_raw"])
 
             cad_pcd.paint_uniform_color([0.5, 0.5, 0.5])
@@ -359,6 +383,61 @@ class DataSource:
             o3d.visualization.draw([cad_pcd, cad_pcd_aligned, depth_pcd_raw])
 
         return item
+    
+    def load_csv_with_icp_results(self, index: int) -> dict[int, dict[str, Any]]:
+        """Load ICP results from a CSV file into a dictionary keyed by capture index."""
+
+        csv_path = r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\Pickle\DeepCrunch_Results\a2991ebf-20ab-4887-a22d-cd84492517ef\icp_transformation_result.csv"
+        if not os.path.exists(csv_path):
+            log.warning(f"CSV file not found: {csv_path}")
+            return {}
+        
+        # is it loaded already?
+        if self.df is None:
+            self.df      = pd.read_csv(csv_path)
+
+        T_camera_cad_icp = np.array(ast.literal_eval(self.df.loc[index, 't_camera_cad_corrected']), dtype=np.float64)
+        # icp_results = {}
+        # for _, row in self.df.iterrows():
+        #     try:
+        #         index = int(row['index'])
+        #         t_camera_cad_corrected = np.array(ast.literal_eval(row['t_camera_cad_corrected']), dtype=np.float64)
+        #         icp_results[index] = {'t_camera_cad_corrected': t_camera_cad_corrected,       }
+        #     except Exception as e:
+        #         log.error(f"Error parsing row in CSV: {e}")
+        return T_camera_cad_icp
+    
+    def get_item_with_icp(self, index: int, debug: bool = False) -> dict[str, Any]:
+        """Return one loaded capture item by index."""
+        if index < 0 or index >= len(self.captures):
+            raise IndexError(f"Capture index out of range: {index}")
+
+        item                = self.load_item_data(index)
+        if item is None:
+            raise RuntimeError(f"Failed to build item at index {index}")
+        
+        # load help files that have icp results for visualization, but do not return them in the item dict since they are not needed for training or evaluation.
+        if not debug:
+            return item
+        
+        cad_pcd             = item["cad_pcd"]
+        cad_pcd_aligned     = item["cad_pcd_aligned"]
+        depth_pcd_raw       = item["depth_pcd_raw"]
+
+    
+        T_camera_cad_icp    = self.load_csv_with_icp_results(index)
+        cad_pcd_aligned_icp = o3d.geometry.PointCloud(cad_pcd)
+        cad_pcd_aligned_icp.transform(T_camera_cad_icp)
+
+
+        cad_pcd.paint_uniform_color([0.5, 0.5, 0.5]) # gray
+        cad_pcd_aligned.paint_uniform_color([0, 0, 1]) # blue
+        depth_pcd_raw.paint_uniform_color([1, 0, 0]) # red
+        cad_pcd_aligned_icp.paint_uniform_color([0, 0, 0])#black            
+
+        o3d.visualization.draw([cad_pcd, cad_pcd_aligned, depth_pcd_raw, cad_pcd_aligned_icp])
+
+        return item    
 
     def get_camera_intrinsics_and_distortion(self) -> tuple[np.ndarray, np.ndarray]:
         """Read camera intrinsics/distortion from scene JSON."""
@@ -469,6 +548,62 @@ class DataSource:
 
         return item
 
+    def get_item_icp_projected(self, index: int, debug: bool = False) -> dict[str, Any]:
+        """Return one sample with CAD depth after ICP alignment projected onto the camera image plane."""
+
+        item                = self.load_item_data(index)
+        if item is None:
+            raise RuntimeError(f"Failed to build item at index {index}")
+    
+        
+        cad_pcd             = item["cad_pcd"]
+        cad_pcd_aligned     = item["cad_pcd_aligned"]
+        depth_pcd_raw       = item["depth_pcd_raw"]
+        depth_rs            = np.asarray(item["depth_rs_img"], dtype=np.float32)
+        h, w                = depth_rs.shape[:2]
+
+        # use ICP results
+        T_camera_cad_icp    = self.load_csv_with_icp_results(index)
+        cad_pcd_aligned_icp = o3d.geometry.PointCloud(cad_pcd)
+        cad_pcd_aligned_icp.transform(T_camera_cad_icp)        
+
+        # CAD points already transformed into camera frame by t_camera_cad.
+        cad_points_cam      = np.asarray(cad_pcd_aligned_icp.points, dtype=np.float32)
+        cam_matrix, dist_coeffs = self.get_camera_intrinsics_and_distortion()
+
+        projected_path = item["camera_vertices_path"].replace(".bin", "_cad_projected.png")
+        if os.path.exists(projected_path):
+            depth_cad_projected = cv2.imread(projected_path, cv2.IMREAD_UNCHANGED)
+            
+        else:
+            depth_cad_projected = self.project_3d_to_camera_depth(
+                cad_points_cam,
+                cam_matrix,
+                dist_coeffs,
+                frame_size=(h, w),
+            )
+            # cv2.imwrite(
+            #     projected_path,
+            #     depth_cad_projected.astype(np.uint16),
+            #     [cv2.IMWRITE_PNG_COMPRESSION, 0],
+            # )
+
+        depth_cad_projected         = depth_cad_projected.astype(np.float32)
+        item["cad_img_projected"]   = depth_cad_projected
+
+        if debug:
+            err = np.zeros_like(depth_rs, dtype=np.float32)
+            valid = (depth_rs > 0) & (depth_cad_projected > 0)
+            err[valid] = depth_rs[valid] - depth_cad_projected[valid]
+            self.show_subset(
+                [item["left_img"], item["right_img"], depth_rs, depth_cad_projected, err],
+                ["left (RS)", "right (RS)", "depth RS (mm)", "depth CAD projected (mm)", "error RS-CAD (mm)"],
+            )
+            plt.show()
+
+        return item
+
+
     def create_camera_frustum_lineset(
         self,
         image_size: tuple[int, int],
@@ -578,7 +713,6 @@ class DataSource:
 
         o3d.visualization.draw(geometries)
     
-
     def show_subset(self, img_list, ttl_list, vmin=None, vmax=None, save_path='', fig_name=''):
         """Display a list of images in a grid."""
         img_num = len(img_list)
@@ -658,11 +792,25 @@ class TestDataSource(unittest.TestCase):
         source = DataSource()
         count = source.init_directory()
         self.assertTrue(count > 0)
-        out = source.get_item_projected(0, debug=True)
+        out = source.get_item_projected(4, debug=True)
         self.assertIn("depth_cad_projected", out)
         self.assertEqual(out["depth_cad_projected"].shape, out["depth_rs_img"].shape)
 
+    def test_show_icp_alignment(self):
+        source = DataSource()
+        scene_id, item_id = 3, 115
+        count = source.init_directory(scene_id)
+        self.assertTrue(count > 0)
+        item = source.get_item_with_icp(item_id, debug=True)
 
+    def test_get_item_icp_projected(self):
+        source = DataSource()
+        scene_id, item_id = 3, 115
+        count = source.init_directory(scene_id)
+        self.assertTrue(count > 0)
+        out = source.get_item_icp_projected(item_id, debug=True)
+        self.assertIn("depth_cad_projected", out)
+        self.assertEqual(out["depth_cad_projected"].shape, out["depth_rs_img"].shape)        
 
 
 def RunTest():
@@ -671,7 +819,9 @@ def RunTest():
     #tst.test_get_item()
     #tst.test_show_images()
     #tst.test_draw_scene() # ok
-    tst.test_get_item_projected()
+    #tst.test_get_item_projected()
+    #tst.test_show_icp_alignment()
+    tst.test_get_item_icp_projected()
 
 
 if __name__ == '__main__':
