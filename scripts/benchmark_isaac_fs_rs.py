@@ -72,7 +72,7 @@ from report import ReportGenerator
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-ISAC_DIR       = r'C:\Work\Data\Depth\reflective_test'
+ISAC_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/reflective_test'
 ORIGINAL_PATH  = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 FINETUNED_PATH = f'{code_dir}/../weights/20-30-48/model_finetuned_faro_kitchen_epoch_006_epoch_013.pth'
 DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_isaac_fs_rs'
@@ -80,6 +80,8 @@ DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_isaac_fs_rs'
 # ISAC dataset filtering (see data_manager_isaac.KNOWN_VIEWS = front/overhead/side/wrist)
 DEFAULT_VIEWS: Tuple[str, ...] = ('front', 'overhead', 'side', 'wrist')
 DEFAULT_EPISODES: Tuple[str, ...] = ()      # empty == all episodes
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 BF     = 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
 ITERS  = 8          # GRU update iterations
@@ -130,8 +132,8 @@ def _preprocess_ir(left: np.ndarray, right: np.ndarray):
     right = np.clip(right.astype(np.float32), 0, 255)
     left  = np.stack([left,  left,  left],  axis=-1)   # H×W×3
     right = np.stack([right, right, right], axis=-1)
-    left_t  = torch.as_tensor(left).float()[None].permute(0, 3, 1, 2).cuda()
-    right_t = torch.as_tensor(right).float()[None].permute(0, 3, 1, 2).cuda()
+    left_t  = torch.as_tensor(left).float()[None].permute(0, 3, 1, 2).to(DEVICE)
+    right_t = torch.as_tensor(right).float()[None].permute(0, 3, 1, 2).to(DEVICE)
     return left_t, right_t
 
 
