@@ -52,6 +52,20 @@ code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../')
 sys.path.append(code_dir)
 
+# Driver 580 / CUDA 13.0 does not enumerate devices without CUDA_VISIBLE_DEVICES set.
+if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'],
+            text=True
+        )
+        indices = ','.join(line.strip() for line in out.splitlines() if line.strip())
+        if indices:
+            os.environ['CUDA_VISIBLE_DEVICES'] = indices
+    except Exception:
+        os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -83,12 +97,15 @@ DEFAULT_EPISODES: Tuple[str, ...] = ()      # empty == all episodes
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-BF     = 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
+D435_FX_PX       = 388.462
+D435_BASELINE_MM = 49.95
+BF               = D435_FX_PX * D435_BASELINE_MM   # focal_px * baseline_mm
+#BF     = 32339.97067817836 # D435i 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
 ITERS  = 8          # GRU update iterations
-N_VIZ  = 5          # frames saved for visual comparison in the report
+N_VIZ  = 12         # frames saved for visual comparison in the report
 
 # Depth threshold for the "close-range" coverage metric — in mm
-CLOSE_RANGE_THRESHOLD_MM = 550.0
+CLOSE_RANGE_THRESHOLD_MM = 100.0
 
 # Distance bins used for the per-bin MAE curve — all in mm
 DIST_BINS_MM: List[Tuple[float, float]] = [
@@ -200,7 +217,7 @@ class ReportGeneratorMM(ReportGenerator):
         if not self._r.viz_frames:
             return self._empty_fig("depth_comparison.png", "No viz frames")
 
-        sel = self._get_selected_viz_indices(n_pick=4)
+        sel = self._get_selected_viz_indices(n_pick=12)
         if not sel:
             return self._empty_fig("depth_comparison.png", "No viz frames")
 
@@ -227,7 +244,7 @@ class ReportGeneratorMM(ReportGenerator):
                 ax.set_title(title, fontsize=9, wrap=True)
                 ax.axis("off")
 
-        fig.suptitle("Depth Map Comparison (4 random frames) — values in mm",
+        fig.suptitle("Depth Map Comparison (12 random frames) — values in mm",
                      fontsize=11, y=1.01)
         fig.tight_layout()
         return self._save(fig, "depth_comparison.png")
@@ -236,7 +253,7 @@ class ReportGeneratorMM(ReportGenerator):
         if not self._r.viz_frames or not self._non_gt:
             return self._empty_fig("error_maps.png", "No comparison methods")
 
-        sel = self._get_selected_viz_indices(n_pick=4)
+        sel = self._get_selected_viz_indices(n_pick=12)
         if not sel:
             return self._empty_fig("error_maps.png", "No viz frames")
 
@@ -279,7 +296,7 @@ class ReportGeneratorMM(ReportGenerator):
                 ax.axis("off")
 
         gt_label = self._r.method_labels.get(self._gt, self._gt)
-        fig.suptitle(f"Absolute Error vs {gt_label} (4 random frames, mm)", fontsize=11, y=1.01)
+        fig.suptitle(f"Absolute Error vs {gt_label} (12 random frames, mm)", fontsize=11, y=1.01)
         fig.tight_layout()
         return self._save(fig, "error_maps.png")
 
