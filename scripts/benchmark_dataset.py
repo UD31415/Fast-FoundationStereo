@@ -119,6 +119,29 @@ def load_frame(data_dir: Path, idx: str):
 
 
 # ── report ───────────────────────────────────────────────────────────────────
+def create_point_cloud_from_depth(depth_m: np.ndarray) -> np.ndarray:
+    """Convert depth map (H, W) to point cloud (N, 3) in camera coordinates."""
+    h, w = depth_m.shape
+    i, j = np.meshgrid(np.arange(w), np.arange(h), indexing='xy')
+    x = (i - w / 2) * depth_m / D435_FX_PX
+    y = (j - h / 2) * depth_m / D435_FX_PX
+    z = depth_m
+    points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+    return points
+
+def save_point_cloud_ply(points: np.ndarray, path: Path) -> None:
+    """Save point cloud to PLY file."""
+    with path.open('w') as f:
+        f.write('ply\n')
+        f.write('format ascii 1.0\n')
+        f.write(f'element vertex {len(points)}\n')
+        f.write('property float x\n')
+        f.write('property float y\n')
+        f.write('property float z\n')
+        f.write('end_header\n')
+        for p in points:
+            f.write(f'{p[0]} {p[1]} {p[2]}\n')
+        print(f"Saved point cloud to {path}")
 
 def _save_depth_png_mm(depth_m: np.ndarray, path: Path) -> None:
     depth_mm = np.clip(depth_m * 1000.0, 0, 65535).astype(np.uint16)
@@ -288,6 +311,9 @@ def main():
                 depth_m = infer_depth_m(model, left, right)
                 timings_ms[mname].append((time.monotonic() - t0) * 1000.0)
                 _save_depth_png_mm(depth_m, sub_dir / f'depth_{idx}.png')
+                XYZ = create_point_cloud_from_depth(depth_m)  # (N, 3) array of 3D points in RS camera space
+                ply_path = sub_dir / f'depth_{idx}.ply'
+                save_point_cloud_ply(XYZ, ply_path) 
                 if (i + 1) % 5 == 0 or (i + 1) == len(frame_indices):
                     logging.info(f'[{mname}] {i + 1}/{len(frame_indices)} frames processed')
         finally:
