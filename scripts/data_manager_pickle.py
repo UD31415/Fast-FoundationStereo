@@ -46,6 +46,7 @@ def compose_t_camera_cad(
 
     t_tooltip_cad = t_rot @ t_trans
     t_camera_cad = t_camera_tooltip @ t_tooltip_cad
+    t_camera_cad = t_camera_tooltip @ t_tooltip_cad
     return t_camera_cad
 
 def parse_resolution(filename: str) -> tuple[int, int]:
@@ -340,6 +341,7 @@ class DataSource:
         vertices_path       = self.get_vertices_path(capture)
         t_camera_tooltip    = np.array(self.scene_data["t_camera_tooltip"], dtype=np.float64)
         t_tooltip_cad       = np.array(capture["t_tooltip_cad"], dtype=np.float64)
+        #t_tooltip_cad       = np.linalg.inv(t_tooltip_cad)
         t_camera_cad        = compose_t_camera_cad(t_camera_tooltip, t_tooltip_cad)
         depth_pcd_raw       = load_vertices_to_pcd(Path(vertices_path))
         cad_pcd_aligned     = copy.deepcopy(self.cad_pcd)
@@ -476,6 +478,7 @@ class DataSource:
         h, w = frame_size
         valid = np.isfinite(points_3d_m).all(axis=1) & (points_3d_m[:, 2] > 1e-6)
         if not np.any(valid):
+            log.error("No valid 3D points to project.")
             return np.zeros((h, w), dtype=np.float32)
 
         pts = points_3d_m[valid].astype(np.float32)
@@ -564,6 +567,7 @@ class DataSource:
 
         # use ICP results
         T_camera_cad_icp    = self.load_csv_with_icp_results(index)
+        T_camera_cad_icp    = np.linalg.inv(T_camera_cad_icp) # apply ICP correction to the original camera-cad transform
         cad_pcd_aligned_icp = o3d.geometry.PointCloud(cad_pcd)
         cad_pcd_aligned_icp.transform(T_camera_cad_icp)        
 
@@ -761,7 +765,7 @@ class TestDataSource(unittest.TestCase):
         count = source.init_directory()
         self.assertTrue(count > 0)
 
-        out = source.get_item(0, debug=True)
+        out = source.get_item(4, debug=True)
         self.assertIn("depth_pcd_raw", out)
         self.assertIn("cad_pcd_aligned", out)
         self.assertEqual(out["t_camera_cad"].shape, (4, 4))
@@ -798,14 +802,14 @@ class TestDataSource(unittest.TestCase):
 
     def test_show_icp_alignment(self):
         source = DataSource()
-        scene_id, item_id = 3, 115
+        scene_id, item_id = 3, 25
         count = source.init_directory(scene_id)
         self.assertTrue(count > 0)
         item = source.get_item_with_icp(item_id, debug=True)
 
     def test_get_item_icp_projected(self):
         source = DataSource()
-        scene_id, item_id = 3, 115
+        scene_id, item_id = 3, 125
         count = source.init_directory(scene_id)
         self.assertTrue(count > 0)
         out = source.get_item_icp_projected(item_id, debug=True)
