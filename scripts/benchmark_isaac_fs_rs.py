@@ -78,8 +78,8 @@ FINETUNED_PATH = f'{code_dir}/../weights/20-30-48/model_finetuned_faro_kitchen_e
 DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_isaac_fs_rs'
 
 # ISAC dataset filtering (see data_manager_isaac.KNOWN_VIEWS = front/overhead/side/wrist)
-DEFAULT_VIEWS: Tuple[str, ...] = ('front', 'overhead', 'side', 'wrist')
-DEFAULT_EPISODES: Tuple[str, ...] = ()      # empty == all episodes
+DEFAULT_VIEWS: Tuple[str, ...]    = ('wrist',) #('front', 'overhead', 'side', 'wrist')
+DEFAULT_EPISODES: Tuple[str, ...] = ('episode_02',)      # empty == all episodes
 
 BF     = 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
 ITERS  = 8          # GRU update iterations
