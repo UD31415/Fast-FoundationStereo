@@ -45,7 +45,7 @@ def compose_t_camera_cad(
     t_trans[:3, 3] = t_tooltip_cad_raw[:3, 3]
 
     t_tooltip_cad = t_rot @ t_trans
-    t_camera_cad = t_camera_tooltip @ t_tooltip_cad
+    #t_camera_cad = t_camera_tooltip @ t_tooltip_cad
     t_camera_cad = t_camera_tooltip @ t_tooltip_cad
     return t_camera_cad
 
@@ -71,18 +71,18 @@ def load_vertices_to_pcd(path: Path) -> o3d.geometry.PointCloud:
             f"for {width}x{height} vertices, got {len(raw)}."
         )
 
-    xyz_flat = np.frombuffer(raw[:pixel_data_bytes], dtype=np.float32).copy()
-    xyz = xyz_flat.reshape(height * width, 3)
+    xyz_flat    = np.frombuffer(raw[:pixel_data_bytes], dtype=np.float32).copy()
+    xyz         = xyz_flat.reshape(height * width, 3)
 
-    valid = xyz[:, 2] != 0.0
-    xyz = xyz[valid] * 0.001  # mm -> m
+    valid       = xyz[:, 2] != 0.0
+    xyz         = xyz[valid] * 0.001  # mm -> m
 
     # Match previous convention used by this script.
-    xyz[:, 1] *= -1
-    xyz[:, 2] *= -1
+    #xyz[:, 1] *= -1
+    #xyz[:, 2] *= -1
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64))
+    pcd             = o3d.geometry.PointCloud()
+    pcd.points      = o3d.utility.Vector3dVector(xyz.astype(np.float64))
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
     )
@@ -154,6 +154,96 @@ def read_bin_file_with_metadata(fname, Size=(640, 480), bpp=16):
 
     return A,H
 
+def interpolate_points_to_grid(
+    u: np.ndarray,
+    v: np.ndarray,
+    z: np.ndarray,
+    image_size: tuple[int, int],
+    method: str = "linear",
+    fill_value: float = 0.0,
+) -> np.ndarray:
+    """Interpolate scattered points ``(u, v, z)`` onto a regular ``(h, w)`` grid.
+
+    Builds a regular grid via ``np.meshgrid`` over the image and uses
+    ``scipy.interpolate.griddata`` to interpolate the ``z`` values at every
+    pixel center.
+
+    Args:
+        u: 1D array of horizontal pixel coordinates of the input samples.
+        v: 1D array of vertical pixel coordinates of the input samples.
+        z: 1D array of values to interpolate at the ``(u, v)`` locations.
+        image_size: ``(h, w)`` size of the output grid.
+        method: One of ``"linear"``, ``"nearest"``, ``"cubic"`` (passed to
+            ``griddata``).
+        fill_value: Value used for grid points outside the convex hull of the
+            input samples (ignored when ``method="nearest"``).
+
+    Returns:
+        ``(h, w)`` float32 array of interpolated values.
+    """
+    from scipy.interpolate import griddata
+
+    u = np.asarray(u, dtype=np.float32).ravel()
+    v = np.asarray(v, dtype=np.float32).ravel()
+    z = np.asarray(z, dtype=np.float32).ravel()
+
+    if not (u.shape == v.shape == z.shape):
+        raise ValueError("u, v, z must have the same number of elements")
+
+    h, w = image_size
+
+    valid = np.isfinite(u) & np.isfinite(v) & np.isfinite(z)
+    u, v, z = u[valid], v[valid], z[valid]
+
+    if u.size == 0:
+        return np.full((h, w), fill_value, dtype=np.float32)
+
+    ui, vi = np.meshgrid(np.arange(w, dtype=np.float32),
+                         np.arange(h, dtype=np.float32))
+
+    grid_z = griddata(
+        points=np.column_stack((u, v)),
+        values=z,
+        xi=(ui, vi),
+        method=method,
+        fill_value=fill_value,
+    )
+    return grid_z.astype(np.float32)
+
+def interp_splat_close(u, v, z, image_size, kernel=3):
+    h, w = image_size
+    img = np.zeros((h, w), np.float32)
+    lin = v.astype(np.int32) * w + u.astype(np.int32)
+    buf = np.full(h * w, np.inf, np.float32)
+    np.minimum.at(buf, lin, z.astype(np.float32))
+    img = np.where(np.isfinite(buf), buf, 0).reshape(h, w)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel, kernel))
+    return cv2.morphologyEx(img, cv2.MORPH_CLOSE, k)
+
+def mesh_to_depth_o3d(mesh: o3d.geometry.TriangleMesh,
+                      cam_matrix: np.ndarray,
+                      image_size: tuple[int, int],
+                      extrinsic: np.ndarray = np.eye(4)) -> np.ndarray:
+    h, w = image_size
+    fx, fy = cam_matrix[0, 0], cam_matrix[1, 1]
+    cx, cy = cam_matrix[0, 2], cam_matrix[1, 2]
+
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+
+    rays = scene.create_rays_pinhole(
+        intrinsic_matrix=o3d.core.Tensor(cam_matrix, o3d.core.Dtype.Float64),
+        extrinsic_matrix=o3d.core.Tensor(extrinsic,  o3d.core.Dtype.Float64),
+        width_px=w, height_px=h,
+    )
+    ans = scene.cast_rays(rays)
+    depth = ans["t_hit"].numpy()                # distance along ray
+    depth[~np.isfinite(depth)] = 0.0
+    # convert ray distance to z-depth
+    dirs = rays.numpy()[..., 3:6]
+    depth = depth * dirs[..., 2] / np.linalg.norm(dirs, axis=-1)
+    return depth.astype(np.float32)
+
 #%% Main DataSource class definition.
 
 class DataSource:
@@ -182,6 +272,8 @@ class DataSource:
             json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_05\yg_pickle\2026-05-27--12-24-21\Pickle_Scene_Capture_336222073841\scene.json")
         elif scene_type == 3:
             json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_05\yg_pickle\2026-05-27--13-50-40\Pickle_Scene_Capture_336222073841\scene.json")
+        elif scene_type == 4:
+            json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06\yg_pickle\2026-06-04--11-24-34\Pickle_Scene_Capture_336222073841\scene.json")
         else:
             raise ValueError(f"Unsupported scene type: {scene_type}")
         
@@ -234,10 +326,12 @@ class DataSource:
         if not cad_mesh.has_vertex_normals():
             cad_mesh.compute_vertex_normals()
 
-        cad_pcd = cad_mesh.sample_points_poisson_disk(
-            number_of_points=10000,
-            use_triangle_normal=True,
-        )
+        num_samples     = 80000
+        cad_pcd         = cad_mesh.sample_points_poisson_disk(number_of_points=num_samples,  use_triangle_normal=True)  
+
+        # 2. Sample densely spaced points on the mesh surface
+        # Increase 'number_of_points' to make the projection look completely solid
+        #cad_pcd         = cad_mesh.sample_points_uniformly(number_of_points=num_samples)     
         return cad_pcd
 
     def get_vertices_path(self, capture: dict[str, Any]) -> str:
@@ -298,7 +392,9 @@ class DataSource:
         elif path.find("IR") != -1 or path.find("RightIR") != -1:
             fbpp                = 8
         elif path.find("RGB") != -1:
-            fbpp                = 24            
+            fsize               = (fsize[0],fsize[1],3)  # >>1 bug
+            fsize               = (640,480,3)
+            fbpp                = 8            
         else:
             fbpp               = 8
             log.error(f"Cannot determine image type from filename: {path}")
@@ -345,7 +441,7 @@ class DataSource:
         t_camera_cad        = compose_t_camera_cad(t_camera_tooltip, t_tooltip_cad)
         depth_pcd_raw       = load_vertices_to_pcd(Path(vertices_path))
         cad_pcd_aligned     = copy.deepcopy(self.cad_pcd)
-        cad_pcd_aligned.transform(t_camera_cad)
+        #cad_pcd_aligned.transform(t_camera_cad)
 
         return {
             "index": index,
@@ -409,6 +505,22 @@ class DataSource:
         #         log.error(f"Error parsing row in CSV: {e}")
         return T_camera_cad_icp
     
+    def load_csv_with_camera_tooltip_results(self, index: int) -> dict[int, dict[str, Any]]:
+        """Load Camera Tooltip corrected results from a CSV file into a dictionary keyed by capture index."""
+
+        csv_path = r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\Pickle\DeepCrunch_Results\a2991ebf-20ab-4887-a22d-cd84492517ef\icp_transformation_result.csv"
+        if not os.path.exists(csv_path):
+            log.warning(f"CSV file not found: {csv_path}")
+            return {}
+        
+        # is it loaded already?
+        if self.df is None:
+            self.df      = pd.read_csv(csv_path)
+
+        T_camera_tooltip = np.array(ast.literal_eval(self.df.loc[index, 't_camera_tooltip']), dtype=np.float64)
+
+        return T_camera_tooltip    
+    
     def get_item_with_icp(self, index: int, debug: bool = False) -> dict[str, Any]:
         """Return one loaded capture item by index."""
         if index < 0 or index >= len(self.captures):
@@ -431,13 +543,17 @@ class DataSource:
         cad_pcd_aligned_icp = o3d.geometry.PointCloud(cad_pcd)
         cad_pcd_aligned_icp.transform(T_camera_cad_icp)
 
+        camera_axis_pcd = o3d.geometry.TriangleMesh.create_coordinate_frame(size=float(0.1))
+        #camera_axis.transform(t_camera_tooltip)
+        camera_axis_pcd.transform(T_camera_cad_icp)        
+
 
         cad_pcd.paint_uniform_color([0.5, 0.5, 0.5]) # gray
         cad_pcd_aligned.paint_uniform_color([0, 0, 1]) # blue
         depth_pcd_raw.paint_uniform_color([1, 0, 0]) # red
         cad_pcd_aligned_icp.paint_uniform_color([0, 0, 0])#black            
 
-        o3d.visualization.draw([cad_pcd, cad_pcd_aligned, depth_pcd_raw, cad_pcd_aligned_icp])
+        o3d.visualization.draw([cad_pcd, cad_pcd_aligned, depth_pcd_raw, cad_pcd_aligned_icp, camera_axis_pcd])
 
         return item    
 
@@ -464,13 +580,8 @@ class DataSource:
             dist_coeffs = np.zeros((5,), dtype=np.float32)
         return cam_matrix, dist_coeffs
 
-    def project_3d_to_camera_depth(
-        self,
-        points_3d_m: np.ndarray,
-        cam_matrix: np.ndarray,
-        dist_coeffs: np.ndarray,
-        frame_size: tuple[int, int],
-    ) -> np.ndarray:
+    def project_3d_to_camera_depth(self, points_3d_m: np.ndarray, cam_matrix: np.ndarray,  dist_coeffs: np.ndarray,
+        frame_size: tuple[int, int],    ) -> np.ndarray:
         """Project 3D camera-frame points to a depth image (mm) using z-buffering."""
         if points_3d_m.ndim != 2 or points_3d_m.shape[1] != 3:
             raise ValueError("Input points_3d_m must have shape (N, 3)")
@@ -480,8 +591,11 @@ class DataSource:
         if not np.any(valid):
             log.error("No valid 3D points to project.")
             return np.zeros((h, w), dtype=np.float32)
+        
+        # transfer to mm
+        points_3d_mm = points_3d_m * 1000.0
 
-        pts = points_3d_m[valid].astype(np.float32)
+        pts = points_3d_mm[valid].astype(np.float32)
         projected_pts, _ = cv2.projectPoints(
             pts.reshape(-1, 1, 3),
             np.zeros(3, dtype=np.float32),
@@ -490,7 +604,7 @@ class DataSource:
             dist_coeffs.astype(np.float32),
         )
 
-        uv = projected_pts.reshape(-1, 2)
+        uv    = projected_pts.reshape(-1, 2)
         u_idx = np.rint(uv[:, 0]).astype(np.int32)
         v_idx = np.rint(uv[:, 1]).astype(np.int32)
 
@@ -498,26 +612,64 @@ class DataSource:
         if not np.any(in_bounds):
             return np.zeros((h, w), dtype=np.float32)
 
-        u_idx = u_idx[in_bounds]
-        v_idx = v_idx[in_bounds]
-        z_vals_mm = (pts[in_bounds, 2] * 1000.0).astype(np.float32)
+        u_idx       = u_idx[in_bounds]
+        v_idx       = v_idx[in_bounds]
+        z_vals_mm   = (pts[in_bounds, 2]).astype(np.float32)
 
-        lin = v_idx * w + u_idx
+        # old way
+        # interpolate depth values into the image using z-buffering
+        # use regular grid indices for u and v to handle duplicates and out-of-order points correctly.        
+        lin          = v_idx * w + u_idx
         depth_buffer = np.full(h * w, np.inf, dtype=np.float32)
         np.minimum.at(depth_buffer, lin, z_vals_mm)
         depth_projected = depth_buffer.reshape(h, w)
         depth_projected[~np.isfinite(depth_projected)] = 0.0
+
+        # # do linear interpolation of depth values for points that project to the same pixel, taking the minimum (closest) depth.
+        # depth_projected = interpolate_points_to_grid(u_idx, v_idx, z_vals_mm, image_size=(h, w))
+
+        # depth_projected = interp_splat_close(u_idx, v_idx, z_vals_mm, image_size=(h, w), kernel=3)
+
+
         return depth_projected
 
     def get_item_projected(self, index: int, debug: bool = False) -> dict[str, Any]:
         """Return one sample with CAD depth projected onto the camera image plane."""
-        item = self.get_item(index, debug=False)
+        #item = self.get_item(index, debug=False)
 
-        depth_rs = np.asarray(item["depth_rs_img"], dtype=np.float32)
-        h, w = depth_rs.shape[:2]
+        item                = self.load_item_data(index)
+        if item is None:
+            raise RuntimeError(f"Failed to build item at index {index}")     
+
+        cad_pcd             = item["cad_pcd"]
+        #cad_pcd_aligned     = item["cad_pcd_aligned"]
+        depth_pcd_raw       = item["depth_pcd_raw"]
+        t_tooltip_cad       = item["t_tooltip_cad"]
+        depth_rs            = np.asarray(item["depth_rs_img"], dtype=np.float32)
+        h, w                = depth_rs.shape[:2]  
+
+        # use Camera Tooltip results
+        #T_camera_tooltip        = self.load_csv_with_camera_tooltip_results(index)
+        T_camera_tooltip2       = np.array([[0, -1, 0, 0], #degenerated tooltip to camera (assuming the target was formed relative to camera)
+                                            [1, 0, 0, 0],
+                                            [0, 0, 1, 0],
+                                            [0, 0, 0, 1]])
+
+
+        #T_camera_cad = compose_t_camera_cad(t_camera_tooltip, t_tooltip_cad)        
+        # create 180degree rotation around x axis to flip the CAD model since the Camera Tooltip results are based on flipped CAD model, and we want to visualize the effect of Camera Tooltip correction on the original CAD model.  
+        T_flip_z_direction       = np.eye(4, dtype=np.float64)
+        T_flip_z_direction[1, 1] = -1; T_flip_z_direction[2, 2] = -1
+
+        T_camera_cad            = compose_t_camera_cad(T_camera_tooltip2, t_tooltip_cad)
+        T_camera_cad            = T_flip_z_direction @ T_camera_cad
+        T_camera_cad_icp        = T_camera_cad 
+        cad_pcd_aligned         = o3d.geometry.PointCloud(cad_pcd)
+        cad_pcd_aligned.transform(T_camera_cad_icp)        # T_cam_cad                 
+
 
         # CAD points already transformed into camera frame by t_camera_cad.
-        cad_points_cam = np.asarray(item["cad_pcd_aligned"].points, dtype=np.float32)
+        cad_points_cam          = np.asarray(cad_pcd_aligned.points, dtype=np.float32)
         cam_matrix, dist_coeffs = self.get_camera_intrinsics_and_distortion()
 
         projected_path = item["camera_vertices_path"].replace(".bin", "_cad_projected.png")
@@ -525,20 +677,16 @@ class DataSource:
             depth_cad_projected = cv2.imread(projected_path, cv2.IMREAD_UNCHANGED)
             
         else:
-            depth_cad_projected = self.project_3d_to_camera_depth(
-                cad_points_cam,
-                cam_matrix,
-                dist_coeffs,
-                frame_size=(h, w),
-            )
-            cv2.imwrite(
-                projected_path,
-                depth_cad_projected.astype(np.uint16),
-                [cv2.IMWRITE_PNG_COMPRESSION, 0],
-            )
+            depth_cad_projected = self.project_3d_to_camera_depth( cad_points_cam,  cam_matrix,  dist_coeffs,  frame_size=(h, w))
+            # cv2.imwrite(
+            #     projected_path,
+            #     depth_cad_projected.astype(np.uint16),
+            #     [cv2.IMWRITE_PNG_COMPRESSION, 0],
+            # )
 
-        depth_cad_projected = depth_cad_projected.astype(np.float32)
-        item["cad_img_projected"] = depth_cad_projected
+
+        depth_cad_projected         = depth_cad_projected.astype(np.float32)
+        item["cad_img_projected"]   = depth_cad_projected
 
         if debug:
             err = np.zeros_like(depth_rs, dtype=np.float32)
@@ -546,8 +694,19 @@ class DataSource:
             err[valid] = depth_rs[valid] - depth_cad_projected[valid]
             self.show_subset(
                 [item["left_img"], item["right_img"], depth_rs, depth_cad_projected, err],
-                ["left (RS)", "right (RS)", "depth RS (mm)", "depth CAD projected (mm)", "error RS-CAD (mm)"],
+                ["left (RS)", "right (RS)", "depth RS (mm)", "depth CAD projected (mm)", "error RS-CAD (mm)"],vmax = 500,
             )
+            plt.show()
+
+        if debug:
+            camera_axis_pcd = o3d.geometry.TriangleMesh.create_coordinate_frame(size=float(0.1))
+            #camera_axis_pcd.transform(T_flip_z_direction)        
+
+            cad_pcd.paint_uniform_color([0.5, 0.5, 0.5]) # gray
+            depth_pcd_raw.paint_uniform_color([1, 0, 0]) # red
+            cad_pcd_aligned.paint_uniform_color([0, 0, 0])#black            
+
+            o3d.visualization.draw([cad_pcd, depth_pcd_raw, cad_pcd_aligned, camera_axis_pcd])
 
         return item
 
@@ -566,13 +725,17 @@ class DataSource:
         h, w                = depth_rs.shape[:2]
 
         # use ICP results
-        T_camera_cad_icp    = self.load_csv_with_icp_results(index)
-        T_camera_cad_icp    = np.linalg.inv(T_camera_cad_icp) # apply ICP correction to the original camera-cad transform
-        cad_pcd_aligned_icp = o3d.geometry.PointCloud(cad_pcd)
-        cad_pcd_aligned_icp.transform(T_camera_cad_icp)        
+        T_camera_cad_icp        = self.load_csv_with_icp_results(index)
+        # create 180degree rotation around x axis to flip the CAD model since the ICP results are based on flipped CAD model, and we want to visualize the effect of ICP correction on the original CAD model.  
+        T_flip_z_direction       = np.eye(4, dtype=np.float64)
+        T_flip_z_direction[1, 1] = -1; T_flip_z_direction[2, 2] = -1
+        T_camera_cad_icp        = T_camera_cad_icp #@ T_flip_z_direction
+        #T_camera_cad_icp    = np.linalg.inv(T_camera_cad_icp) # apply ICP correction to the original camera-cad transform
+        cad_pcd_aligned_icp     = o3d.geometry.PointCloud(cad_pcd)
+        cad_pcd_aligned_icp.transform(T_camera_cad_icp)        # T_cam_cad
 
         # CAD points already transformed into camera frame by t_camera_cad.
-        cad_points_cam      = np.asarray(cad_pcd_aligned_icp.points, dtype=np.float32)
+        cad_points_cam          = np.asarray(cad_pcd_aligned_icp.points, dtype=np.float32)
         cam_matrix, dist_coeffs = self.get_camera_intrinsics_and_distortion()
 
         projected_path = item["camera_vertices_path"].replace(".bin", "_cad_projected.png")
@@ -580,12 +743,10 @@ class DataSource:
             depth_cad_projected = cv2.imread(projected_path, cv2.IMREAD_UNCHANGED)
             
         else:
-            depth_cad_projected = self.project_3d_to_camera_depth(
-                cad_points_cam,
-                cam_matrix,
-                dist_coeffs,
-                frame_size=(h, w),
-            )
+            depth_cad_projected = self.project_3d_to_camera_depth(cad_points_cam, cam_matrix, dist_coeffs, frame_size=(h, w))
+            
+            #depth_cad_projected = mesh_to_depth_o3d(cad_pcd,cam_matrix, image_size=(h, w))
+
             # cv2.imwrite(
             #     projected_path,
             #     depth_cad_projected.astype(np.uint16),
@@ -601,12 +762,23 @@ class DataSource:
             err[valid] = depth_rs[valid] - depth_cad_projected[valid]
             self.show_subset(
                 [item["left_img"], item["right_img"], depth_rs, depth_cad_projected, err],
-                ["left (RS)", "right (RS)", "depth RS (mm)", "depth CAD projected (mm)", "error RS-CAD (mm)"],
+                ["left (RS)", "right (RS)", "depth RS (mm)", "depth CAD projected (mm)", "error RS-CAD (mm)"],vmax = 500,
             )
             plt.show()
 
-        return item
+        if debug:
+            camera_axis_pcd = o3d.geometry.TriangleMesh.create_coordinate_frame(size=float(0.1))
+            #camera_axis_pcd.transform(T_flip_z_direction)        
 
+            cad_pcd.paint_uniform_color([0.5, 0.5, 0.5]) # gray
+            cad_pcd_aligned.paint_uniform_color([0, 0, 1]) # blue
+            depth_pcd_raw.paint_uniform_color([1, 0, 0]) # red
+            cad_pcd_aligned_icp.paint_uniform_color([0, 0, 0])#black            
+
+            o3d.visualization.draw([cad_pcd, cad_pcd_aligned, depth_pcd_raw, cad_pcd_aligned_icp, camera_axis_pcd])
+
+
+        return item
 
     def create_camera_frustum_lineset(
         self,
@@ -727,6 +899,7 @@ class DataSource:
         for k in range(img_num):
             ri, ci = k // col_num, k % col_num
             if img_list[k] is None: continue
+            vmax = 50 if k in [0,1] else vmax
             axes[ri, ci].imshow(img_list[k], vmin=vmin, vmax=vmax)
             axes[ri, ci].set_title(ttl_list[k])
         for k in range(img_num, row_num * col_num):
@@ -794,22 +967,23 @@ class TestDataSource(unittest.TestCase):
 
     def test_get_item_projected(self):
         source = DataSource()
-        count = source.init_directory()
+        scene_id, item_id = 4, 15
+        count = source.init_directory(scene_id)
         self.assertTrue(count > 0)
-        out = source.get_item_projected(4, debug=True)
+        out = source.get_item_projected(item_id, debug=True)
         self.assertIn("depth_cad_projected", out)
         self.assertEqual(out["depth_cad_projected"].shape, out["depth_rs_img"].shape)
 
     def test_show_icp_alignment(self):
         source = DataSource()
-        scene_id, item_id = 3, 25
+        scene_id, item_id = 3, 95
         count = source.init_directory(scene_id)
         self.assertTrue(count > 0)
         item = source.get_item_with_icp(item_id, debug=True)
 
     def test_get_item_icp_projected(self):
         source = DataSource()
-        scene_id, item_id = 3, 125
+        scene_id, item_id = 3, 12 # 42, 55-ok
         count = source.init_directory(scene_id)
         self.assertTrue(count > 0)
         out = source.get_item_icp_projected(item_id, debug=True)
@@ -823,9 +997,9 @@ def RunTest():
     #tst.test_get_item()
     #tst.test_show_images()
     #tst.test_draw_scene() # ok
-    #tst.test_get_item_projected()
+    tst.test_get_item_projected()
     #tst.test_show_icp_alignment()
-    tst.test_get_item_icp_projected()
+    #tst.test_get_item_icp_projected()
 
 
 if __name__ == '__main__':
