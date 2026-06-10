@@ -671,10 +671,10 @@ class TestDataSource(unittest.TestCase):
 def RunTest() -> None:
     tst = TestDataSource()
     # tst.test_init_directory()
-    # tst.test_get_item()
-    #tst.test_show_images()
+    #tst.test_get_item()
+    tst.test_show_images()
     # tst.test_draw_point_cloud()
-    tst.test_create_object_mask()
+    #tst.test_create_object_mask()
 
 
 if __name__ == '__main__':

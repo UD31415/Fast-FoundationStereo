@@ -92,30 +92,31 @@ FINETUNED_PATH = f'{code_dir}/../weights/20-30-48/model_finetuned_faro_kitchen_e
 DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_isaac_fs_rs'
 
 # ISAC dataset filtering (see data_manager_isaac.KNOWN_VIEWS = front/overhead/side/wrist)
-DEFAULT_VIEWS: Tuple[str, ...] = ('front', 'overhead', 'side', 'wrist')
-DEFAULT_EPISODES: Tuple[str, ...] = ()      # empty == all episodes
+DEFAULT_VIEWS: Tuple[str, ...] = ('wrist',) #('front', 'overhead', 'side', 'wrist')
+DEFAULT_EPISODES: Tuple[str, ...] = ('episode_02',)      # empty == all episodes
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-D435_FX_PX       = 388.462
+D435_FX_PX       = 642.72 #388.462
 D435_BASELINE_MM = 49.95
 BF               = D435_FX_PX * D435_BASELINE_MM   # focal_px * baseline_mm
 #BF     = 32339.97067817836 # D435i 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
-ITERS  = 8          # GRU update iterations
-N_VIZ  = 12         # frames saved for visual comparison in the report
+ITERS           = 8          # GRU update iterations
+N_VIZ           = 12         # frames saved for visual comparison in the report
 
 # Depth threshold for the "close-range" coverage metric — in mm
-CLOSE_RANGE_THRESHOLD_MM = 100.0
+CLOSE_RANGE_THRESHOLD_MM = 20.0
 
 # Distance bins used for the per-bin MAE curve — all in mm
 DIST_BINS_MM: List[Tuple[float, float]] = [
-    (0.0,    500.0),
+    (0.0,    100.0),
+    (100.0,  200.0),
+    (200.0,  500.0),
     (500.0,  1000.0),
-    (1000.0, 2000.0),
-    (2000.0, 3000.0),
+    (1000.0,  1500.0),
 ]
-BIN_LABELS_MM  = ["0–500 mm", "500–1000 mm", "1000–2000 mm", "2000–3000 mm"]
-BIN_CENTERS_MM = [250.0, 750.0, 1500.0, 2500.0]
+BIN_LABELS_MM  = ["0–100 mm", "100–200 mm", "200–500 mm", "500–1000 mm", "1000–1500 mm"]
+BIN_CENTERS_MM = [50.0, 150.0, 350.0, 750.0, 1250.0]
 
 METHODS: Dict[str, Dict[str, str]] = {
     "original":  {"label": "FFS Original",                "color": "#2980b9"},
@@ -236,7 +237,7 @@ class ReportGeneratorMM(ReportGenerator):
                 if name not in vf:
                     ax.axis("off")
                     continue
-                im = ax.imshow(vf[name], cmap=cmap, vmin=1.0, vmax=5000.0)
+                im = ax.imshow(vf[name], cmap=cmap, vmin=1.0, vmax=1500.0)
                 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="mm")
                 title = self._r.method_labels.get(name, name)
                 if c == 0:
