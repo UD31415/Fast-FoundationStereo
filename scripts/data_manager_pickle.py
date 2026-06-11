@@ -419,7 +419,7 @@ class DataSource:
             return None            
         return img
 
-    def load_item_data(self, index: int) -> dict[str, Any]:
+    def load_item_data(self, index: int, use_aligned :bool = False) -> dict[str, Any]:
         """Create full data item for one capture index."""
 
         output_str          = self.items[index]
@@ -441,7 +441,8 @@ class DataSource:
         t_camera_cad        = compose_t_camera_cad(t_camera_tooltip, t_tooltip_cad)
         depth_pcd_raw       = load_vertices_to_pcd(Path(vertices_path))
         cad_pcd_aligned     = copy.deepcopy(self.cad_pcd)
-        #cad_pcd_aligned.transform(t_camera_cad)
+        if use_aligned:
+            cad_pcd_aligned.transform(t_camera_cad)
 
         return {
             "index": index,
@@ -713,7 +714,7 @@ class DataSource:
     def get_item_icp_projected(self, index: int, debug: bool = False) -> dict[str, Any]:
         """Return one sample with CAD depth after ICP alignment projected onto the camera image plane."""
 
-        item                = self.load_item_data(index)
+        item                = self.load_item_data(index, use_aligned=True)
         if item is None:
             raise RuntimeError(f"Failed to build item at index {index}")
     
@@ -983,7 +984,7 @@ class TestDataSource(unittest.TestCase):
 
     def test_get_item_icp_projected(self):
         source = DataSource()
-        scene_id, item_id = 3, 12 # 42, 55-ok
+        scene_id, item_id = 4, 12 # 42, 55-ok
         count = source.init_directory(scene_id)
         self.assertTrue(count > 0)
         out = source.get_item_icp_projected(item_id, debug=True)
@@ -997,9 +998,9 @@ def RunTest():
     #tst.test_get_item()
     #tst.test_show_images()
     #tst.test_draw_scene() # ok
-    tst.test_get_item_projected()
+    #tst.test_get_item_projected()
     #tst.test_show_icp_alignment()
-    #tst.test_get_item_icp_projected()
+    tst.test_get_item_icp_projected()
 
 
 if __name__ == '__main__':
