@@ -24,6 +24,7 @@ import numpy as np
 import open3d as o3d
 import cv2
 import pandas as pd
+#from rosbags import image
 
 
 log.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=log.INFO)
@@ -781,6 +782,235 @@ class DataSource:
 
         return item
 
+# ----------------------------------
+# Recover camera pose.
+# ----------------------------------
+
+    def get_grid_coordinates(self, img_left, debug:bool=False) -> np.ndarray:
+        """Estimate camera pose using ICP between CAD and depth point clouds."""
+        # 1. Load the image
+        from scipy.ndimage import maximum_filter, label
+
+        # crop 400x400 center region for better blob detection
+        h, w = img_left.shape[:2]
+        center_h, center_w = h // 2, w // 2
+        crop_size = 200
+        img_gray = img_left[center_h - crop_size:center_h + crop_size, center_w - crop_size:center_w + crop_size].astype(np.float32) 
+
+
+        sigma1 = 2.0
+        sigma2 = sigma1 * 1.6
+        blur1 = cv2.GaussianBlur(img_gray, (0, 0), sigmaX=sigma1)
+        blur2 = cv2.GaussianBlur(img_gray, (0, 0), sigmaX=sigma2)
+        img_dog = -(blur1 - blur2)
+
+        # 2. find_local_maxima(filtered_image, neighborhood_size=5, threshold=0.1):
+        """
+        Finds local maxima in the filtered image within a specified neighborhood.
+        """
+        # 1. Apply a maximum filter in a local neighborhood
+        neighborhood_size = 37
+        local_max = maximum_filter(img_dog, size=neighborhood_size) == img_dog
+        
+        # 2. Filter out background noise by ensuring peaks are above a certain intensity
+        threshold = 0.1
+        background = (img_dog < threshold)
+        erased_background = local_max.copy()
+        erased_background[background] = False
+        
+        # 3. Label the unique peaks and get their coordinates
+        labeled, num_features = label(erased_background)
+    
+        # Find the center of mass (coordinates) for each labeled maximum
+        # scipy's label coordinates are returned as (y, x)
+        peaks = []; 
+        for i in range(1, num_features + 1):
+            mask = (labeled == i)
+            y, x = np.where(mask)
+            peaks.append((int(np.mean(x)), int(np.mean(y)))) # Store as (x, y)
+            
+
+        # 6. Extract and print the (x, y) coordinates
+        print(f"Total dots found: {len(peaks)}")
+        print("-" * 30)
+        print("Index |   X-Coord  |   Y-Coord")
+        print("-" * 30)
+
+        coordinates = []
+        for i, kp in enumerate(peaks):
+            x, y = kp
+            coordinates.append((x+center_w-crop_size, y+center_h-crop_size))
+            print(f"{i+1:5d} | {x:10.2f} | {y:10.2f}")
+
+        if not debug:
+            return coordinates
+
+
+        # 7. Optional: Visualize the results
+        keypoints = []
+        for i, kp in enumerate(peaks):
+            x, y = kp
+            keypoints.append(cv2.KeyPoint(x=float(x), y=float(y), size=1))
+
+        # Draw detected blobs as red circles
+        img_with_keypoints = cv2.drawKeypoints(
+            img_gray.astype(np.uint8), 
+            keypoints, 
+            np.array([]), 
+            (0, 0, 255), 
+            cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS
+        )
+
+        # Save and show the output image
+        #cv2.imwrite('detected_dots.png', img_with_keypoints)
+        plt.figure(figsize=(8, 6))
+        plt.imshow(img_with_keypoints)
+        plt.show(block=False)
+        return coordinates
+
+    def match_grid_to_cad(self, img_left:np.ndarray) -> np.ndarray:
+        """Match detected grid points to CAD model points to estimate camera pose."""
+        # This is a placeholder for the actual matching logic, which could involve:
+        # 1. Generating a synthetic depth image from the CAD model using the current pose estimate.
+        # 2. Detecting the same grid pattern in the synthetic depth image.
+        # 3. Using a RANSAC-based approach to find the best transformation that aligns the detected grid points with the corresponding CAD points.
+        from scipy.spatial.distance import cdist
+        from scipy.optimize import linear_sum_assignment
+
+        # For demonstration, we will return an identity matrix as a placeholder.
+        # crearte 2D grid
+        grid_spacing_mm     = 25.0
+        grid_size           = (30,30) # 30x30 grid
+        grid_points_3d      = []
+        for x in range(-grid_size[0]//2, grid_size[0]//2 + 1):
+            for y in range(-grid_size[1]//2, grid_size[1]//2 + 1):
+                grid_points_3d.append((x * grid_spacing_mm, y * grid_spacing_mm, 0))
+        
+        grid_points_3d   = np.array(grid_points_3d, dtype=np.float32) # (N, 3)
+        cad_points      = grid_points_3d[:,:2] # only x,y
+        dist_points     = np.sum(np.abs(cad_points), axis=1) # center the cad points
+        cad_index_center = np.argmin(dist_points) # 
+
+        # image points
+        img_points      = self.get_grid_coordinates(img_left, debug=True)
+        img_points      = np.asarray(img_points, dtype=np.float32)
+
+        # decide about the center of coordinates for image points. Most close point to mean
+        dist_points     = np.sum(np.abs(img_points - np.mean(img_points, axis=0)), axis=1) # center the image points
+
+        # the closest point to the center of the image points will be the origin of the grid, and we will assume it corresponds to the origin of the CAD model for simplicity. In practice, you would need a more robust method to determine the correct correspondences between image points and CAD points.
+        img_index_center = np.argmin(dist_points) #
+        img_center_pixel = img_points[img_index_center].copy()  # save original pixel offset for later PnP
+        img_points_center= img_points - img_center_pixel  # center the image points
+
+        # srarting from the img_point center define a radius and start matching points in the radius to the cad points around cad_center, 
+        # and find the best matching transformation using RANSAC or a similar method. 
+        # Using the best match estimate the camera pose relative to the CAD model.
+        # Increase the radius iteratively until a sufficient number of matches are found or a maximum radius is reached.
+        # Improve matches gradually by refining the pose estimate and re-projecting the CAD points to the image plane, then re-matching with the detected image points, and iterating until convergence.
+
+        
+        cam_matrix, dist_coeffs = self.get_camera_intrinsics_and_distortion()
+
+        # --- 1. Initial scale (pixels per mm) from smallest non-zero radii ---
+        img_radii       = np.linalg.norm(img_points_center, axis=1)
+        cad_radii       = np.linalg.norm(cad_points, axis=1)
+        img_index_sorted = np.argsort(img_radii)
+        cad_index_sorted = np.argsort(cad_radii)
+
+        # start from the closest points to the center 
+        n_match_points   = 7
+        rvec           = np.zeros(3, dtype=np.float64)
+        tvec           = np.zeros(3, dtype=np.float64)
+        tvec[2]        = 500.0 # initial depth guess in mm
+
+        is_matched      = False
+        while not is_matched:
+
+            # protect
+            if n_match_points >= len(img_points) or n_match_points >= len(cad_points):
+                log.warning("match_grid_to_cad: not enough points to match")
+                break
+
+            # points in the current radius
+            img_points_current = img_points[img_index_sorted[:n_match_points]] 
+            cad_points_current = grid_points_3d[cad_index_sorted[:n_match_points],:]
+
+            # project cad on image using current estimate of scale and rotation, and find the best matches between projected cad points and detected image points using nearest neighbor search within a certain radius.
+            cad_points_projected = cv2.projectPoints(
+                cad_points_current.reshape(-1, 1, 3), rvec, tvec, 
+                cam_matrix, dist_coeffs )[0].reshape(-1, 2)
+            
+            # try to match using minimal distance and a reasonable threshold based on the current scale estimate (e.g., 5 pixels)
+            # create a distance matrix between the points and find the best matches
+            # Hungarian algorithm: globally optimal one-to-one assignment that minimizes total reprojection distance.
+            distance_matrix = cdist(img_points_current, cad_points_projected, metric='euclidean')
+
+            # Gate by a distance threshold so impossible pairs cannot be forced into the assignment.
+            # Use a generous tolerance early (when the pose is rough) and tighten it as more points are matched.
+            gate_pix = max(grid_spacing_mm * 0.5, 50.0 / max(1.0, np.sqrt(n_match_points)))
+            cost_matrix = distance_matrix.copy()
+            cost_matrix[cost_matrix > gate_pix] = 1e6  # large penalty for pairs beyond the gate
+
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+            # Keep only assignments whose original distance is within the gate (drop the penalized ones).
+            valid_pair_mask = distance_matrix[row_ind, col_ind] <= gate_pix
+            if int(valid_pair_mask.sum()) < 4:
+                log.warning(
+                    f"match_grid_to_cad: hungarian found only {int(valid_pair_mask.sum())} valid pairs "
+                    f"at radius={n_match_points}, gate={gate_pix:.1f}px"
+                )
+                n_match_points = n_match_points * 2 + 3
+                continue
+
+            row_ind             = row_ind[valid_pair_mask]
+            col_ind             = col_ind[valid_pair_mask]
+
+            img_points_pnp     = img_points_current[row_ind].astype(np.float32)
+            cad_points_matched = cad_points_current[col_ind].astype(np.float32)
+            # use the best matches to estimate a new transformation using RANSAC or a similar method
+            # PnP estimation with RANSAC to find the best pose that aligns the matched points, and count the number of inliers based on a reprojection error threshold (e.g., 5 pixels).
+            success, rvec, tvec, inlier_mask = cv2.solvePnPRansac(
+                cad_points_matched,
+                img_points_pnp,
+                cam_matrix,
+                dist_coeffs,
+                rvec,
+                tvec,
+                useExtrinsicGuess=True,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+                reprojectionError=10.0,
+                iterationsCount=100,
+                confidence=0.95
+            )
+            if not success:
+                log.warning(f"match_grid_to_cad: solvePnP failed radius={n_match_points}")
+                break
+
+            # find the best match with the most inliers, and if the number of inliers is sufficient (e.g., at least 4), consider it a successful match and use the estimated transformation as the initial pose estimate for further refinement.
+            num_inliers = inlier_mask.size if success else 0
+            log.info(f"match_grid_to_cad: radius={n_match_points}, inliers={num_inliers}")
+
+            mask_index  = inlier_mask.flatten()
+
+            plt.figure(figsize=(8, 6))
+            plt.imshow(img_left, cmap='gray')
+            plt.scatter(img_points_current[:, 0], img_points_current[:, 1], c='blue', label='Detected Points')
+            plt.scatter(cad_points_projected[:, 0], cad_points_projected[:, 1], c='red', label='Projected CAD Points')
+            #plt.scatter(cad_points_matched[mask_index, 0], cad_points_matched[mask_index, 1], marker='o', c='green', label='Inlier Points')
+            plt.legend()
+            plt.title(f"Radius={n_match_points}, Inliers={num_inliers}")
+            plt.show(block=False)
+
+            n_match_points = n_match_points*2 + 3 # increase the radius to include more points in the next iteration
+
+        return rvec, tvec
+
+# ----------------------------------
+# Visualization helpers.
+# ----------------------------------
+
     def create_camera_frustum_lineset(
         self,
         image_size: tuple[int, int],
@@ -991,6 +1221,41 @@ class TestDataSource(unittest.TestCase):
         self.assertIn("depth_cad_projected", out)
         self.assertEqual(out["depth_cad_projected"].shape, out["depth_rs_img"].shape)        
 
+    def test_get_grid_coordinates(self):
+        source = DataSource()
+        scene_id, item_id = 4, 3
+        count = source.init_directory(scene_id)
+        self.assertTrue(count > 0)
+        item = source.get_item(item_id, debug=False)
+        coordinates = source.get_grid_coordinates(item["left_img"])
+        self.assertTrue(len(coordinates) > 0)
+
+    def test_match_grid_to_cad(self):
+        source = DataSource()
+        scene_id, item_id = 4, 2
+        count                   = source.init_directory(scene_id)
+        self.assertTrue(count > 0)
+        item                    = source.get_item(item_id, debug=False)
+        rvec, tvec              = source.match_grid_to_cad(item["left_img"])
+        # transfrom rvec tvec to T_camera_cad homogenious transformation matrix
+        R, _                    = cv2.Rodrigues(rvec)
+        T_camera_cad = np.eye(4, dtype=np.float64)
+        T_camera_cad[:3, :3]    = R
+        T_camera_cad[:3, 3]     = tvec/1000.0 # convert mm to m
+
+        # use ICP results
+        T_camera_cad_icp        = source.load_csv_with_icp_results(item_id)
+        T_camera_cad_icp        = T_camera_cad_icp #@ T_flip_z_direction
+
+        print("Estimated T_camera_cad from grid matching:"  )
+        print(T_camera_cad)
+        print("ICP refined T_camera_cad:"  )
+        print(T_camera_cad_icp)
+
+
+        plt.show()
+        self.assertEqual(rvec.shape, (3,))
+        self.assertEqual(tvec.shape, (3,))
 
 def RunTest():
     tst = TestDataSource()
@@ -1000,8 +1265,9 @@ def RunTest():
     #tst.test_draw_scene() # ok
     #tst.test_get_item_projected()
     #tst.test_show_icp_alignment()
-    tst.test_get_item_icp_projected()
-
+    #tst.test_get_item_icp_projected()
+    #tst.test_get_grid_coordinates()
+    tst.test_match_grid_to_cad()
 
 if __name__ == '__main__':
     RunTest()

@@ -81,12 +81,16 @@ DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_isaac_fs_rs'
 DEFAULT_VIEWS: Tuple[str, ...]    = ('wrist',) #('front', 'overhead', 'side', 'wrist')
 DEFAULT_EPISODES: Tuple[str, ...] = ('episode_02',)      # empty == all episodes
 
-BF     = 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
-ITERS  = 8          # GRU update iterations
-N_VIZ  = 5          # frames saved for visual comparison in the report
+D435_FX_PX       = 388.462
+D435_BASELINE_MM = 49.95
+BF               = D435_FX_PX * D435_BASELINE_MM   # focal_px * baseline_mm
+
+BF              = 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
+ITERS           = 8          # GRU update iterations
+N_VIZ           = 5          # frames saved for visual comparison in the report
 
 # Depth threshold for the "close-range" coverage metric — in mm
-CLOSE_RANGE_THRESHOLD_MM = 550.0
+CLOSE_RANGE_THRESHOLD_MM = 150.0
 
 # Distance bins used for the per-bin MAE curve — all in mm
 DIST_BINS_MM: List[Tuple[float, float]] = [
