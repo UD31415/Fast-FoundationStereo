@@ -215,7 +215,6 @@ def _invert_rigid(t: np.ndarray) -> np.ndarray:
     out[:3, 3] = -r.T @ p
     return out
 
-
 def compose_t_camera_cad(
     t_camera_tooltip: np.ndarray,
     t_tooltip_cad_raw: np.ndarray,
@@ -243,6 +242,62 @@ def compose_t_camera_cad(
 
     t_tooltip_cad = t_rot @ t_trans
     return t_tooltip_camera @ t_tooltip_cad
+
+def interpolate_points_to_grid(
+    u: np.ndarray,
+    v: np.ndarray,
+    z: np.ndarray,
+    image_size: tuple[int, int],
+    method: str = "linear",
+    fill_value: float = 0.0,
+) -> np.ndarray:
+    """Interpolate scattered points ``(u, v, z)`` onto a regular ``(h, w)`` grid.
+
+    Builds a regular grid via ``np.meshgrid`` over the image and uses
+    ``scipy.interpolate.griddata`` to interpolate the ``z`` values at every
+    pixel center.
+
+    Args:
+        u: 1D array of horizontal pixel coordinates of the input samples.
+        v: 1D array of vertical pixel coordinates of the input samples.
+        z: 1D array of values to interpolate at the ``(u, v)`` locations.
+        image_size: ``(h, w)`` size of the output grid.
+        method: One of ``"linear"``, ``"nearest"``, ``"cubic"`` (passed to
+            ``griddata``).
+        fill_value: Value used for grid points outside the convex hull of the
+            input samples (ignored when ``method="nearest"``).
+
+    Returns:
+        ``(h, w)`` float32 array of interpolated values.
+    """
+    from scipy.interpolate import griddata
+
+    u = np.asarray(u, dtype=np.float32).ravel()
+    v = np.asarray(v, dtype=np.float32).ravel()
+    z = np.asarray(z, dtype=np.float32).ravel()
+
+    if not (u.shape == v.shape == z.shape):
+        raise ValueError("u, v, z must have the same number of elements")
+
+    h, w = image_size
+
+    valid = np.isfinite(u) & np.isfinite(v) & np.isfinite(z)
+    u, v, z = u[valid], v[valid], z[valid]
+
+    if u.size == 0:
+        return np.full((h, w), fill_value, dtype=np.float32)
+
+    ui, vi = np.meshgrid(np.arange(w, dtype=np.float32),
+                         np.arange(h, dtype=np.float32))
+
+    grid_z = griddata(
+        points=np.column_stack((u, v)),
+        values=z,
+        xi=(ui, vi),
+        method=method,
+        fill_value=fill_value,
+    )
+    return grid_z.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +453,6 @@ def create_object_mask(
         out = remap[out]
 
     return out
-
 
 def colorize_label_mask(labels: np.ndarray, seed: int = 0) -> np.ndarray:
     """Map an integer label image to a deterministic RGB colour image."""
@@ -569,6 +623,46 @@ class DataSource:
     # ------------------------------------------------------------------
     # CAD / intrinsics helpers
     # ------------------------------------------------------------------
+    def render_points_from_mesh(self, mesh_t: o3d.t.geometry.TriangleMesh) -> o3d.geometry.PointCloud:
+
+        # 1. Load legacy mesh and convert to Tensor API
+        # mesh_legacy = o3d.geometry.TriangleMesh.create_sphere(radius=1.0)
+        # mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh_legacy)
+
+        # 2. Build the Raycasting Scene
+        scene = o3d.t.geometry.RaycastingScene()
+        _ = scene.add_triangles(mesh_t)
+
+        # 3. Create a 3D coordinate grid matrix
+        # Adjust bounds and grid spacing based on your mesh dimensions
+        grid_spacing = 0.1
+        bbox = mesh_t.get_axis_aligned_bounding_box()
+        x = np.arange(bbox.min_bound[0], bbox.max_bound[0], grid_spacing)
+        y = np.arange(bbox.min_bound[1], bbox.max_bound[1], grid_spacing)
+        z = np.arange(bbox.min_bound[2], bbox.max_bound[2], grid_spacing)
+
+        grid_x, grid_y, grid_z = np.meshgrid(x, y, z, indexing='ij')
+        grid_points = np.stack([grid_x, grid_y, grid_z], axis=-1).astype(np.float32)
+
+        # 4. Filter grid coordinates near the shell boundary
+        # Only project grid coordinates within 1 voxel size of the mesh surface
+        distances = scene.compute_distance(grid_points).numpy()
+        surface_mask = distances <= grid_spacing
+        candidate_grid_points = grid_points[surface_mask]
+
+        # 5. Snap the remaining grid coordinates directly onto the outer surface
+        ans = scene.compute_closest_point(candidate_grid_points)
+        surface_snapped_points = ans['points'].numpy()
+
+        # 6. Save out to a legacy PointCloud container
+        sampled_pcd = o3d.geometry.PointCloud()
+        sampled_pcd.points = o3d.utility.Vector3dVector(surface_snapped_points)
+
+        # Optional visualization
+        o3d.visualization.draw_geometries([sampled_pcd])
+
+        return sampled_pcd
+
 
     def _load_cad_pcd(self, cad_path: str) -> Optional[o3d.geometry.PointCloud]:
         """Load and cache the sampled CAD point cloud (in metres)."""
@@ -592,9 +686,28 @@ class DataSource:
             mesh.compute_vertex_normals()
 
         cad_pcd = mesh.sample_points_poisson_disk(
-            number_of_points=90000,
+            number_of_points=150000,
             use_triangle_normal=True,
         )
+
+        # # Define your grid reference step size (voxel size)
+        # voxel_size = 0.0001 
+
+        # # Simplify the mesh using vertex clustering based on the grid size
+        # # Contraction option determines how points pool together (e.g., Average)
+        # simplified_mesh = mesh.simplify_vertex_clustering(
+        #     voxel_size=voxel_size,
+        #     contraction=o3d.geometry.SimplificationContraction.Average
+        # )
+
+        #simplified_mesh = mesh.subdivide_loop(number_of_iterations=10)
+
+        # # Extract the remaining grid-aligned points
+        # cad_pcd = o3d.geometry.PointCloud()
+        # cad_pcd.points = simplified_mesh.vertices
+
+        #cad_pcd = self.render_points_from_mesh(mesh)
+
         self._cad_cache[cad_path] = cad_pcd
         # Also cache the metres-scaled mesh for raycast rendering.
         self._cad_mesh_cache[cad_path] = mesh
@@ -839,6 +952,9 @@ class DataSource:
         np.minimum.at(depth_buffer, lin, z_vals_mm)
         depth_projected = depth_buffer.reshape(h, w)
         depth_projected[~np.isfinite(depth_projected)] = 0.0
+
+        #depth_projected_2 = interpolate_points_to_grid(u_idx, v_idx, z_vals_mm, image_size=(h, w))
+
         return depth_projected
 
     @staticmethod
@@ -1200,6 +1316,235 @@ class DataSource:
         )
         return ls
 
+    # ------------------------------------------------------------------
+    # Grid-detection / pose recovery (ported from data_manager_pickle.py)
+    # ------------------------------------------------------------------
+
+    def get_grid_coordinates(
+        self,
+        img_left: np.ndarray,
+        debug: bool = False,
+    ) -> list[tuple[int, int]]:
+        """Detect grid-of-dots peak coordinates in the centre of an IR image.
+
+        Ported from ``DataSource.get_grid_coordinates`` in
+        ``data_manager_pickle.py``: a Difference-of-Gaussians filter on a
+        400x400 centre crop, then non-maximum suppression with a maximum
+        filter and connected-component labelling.
+
+        Returns a list of ``(x, y)`` peaks in the original image's pixel
+        coordinates.
+        """
+        from scipy.ndimage import maximum_filter, label
+
+        if img_left is None or img_left.size == 0:
+            return []
+        if img_left.ndim == 3:
+            img_left = cv2.cvtColor(img_left, cv2.COLOR_BGR2GRAY)
+
+        h, w = img_left.shape[:2]
+        center_h, center_w = h // 2, w // 2
+        crop_size = 200
+        img_gray = img_left[
+            center_h - crop_size:center_h + crop_size,
+            center_w - crop_size:center_w + crop_size,
+        ].astype(np.float32)
+
+        sigma1 = 2.0
+        sigma2 = sigma1 * 1.6
+        blur1 = cv2.GaussianBlur(img_gray, (0, 0), sigmaX=sigma1)
+        blur2 = cv2.GaussianBlur(img_gray, (0, 0), sigmaX=sigma2)
+        img_dog = -(blur1 - blur2)
+
+        neighborhood_size = 37
+        local_max = maximum_filter(img_dog, size=neighborhood_size) == img_dog
+
+        threshold = 0.1
+        background = img_dog < threshold
+        erased = local_max.copy()
+        erased[background] = False
+
+        labeled, num_features = label(erased)
+
+        peaks: list[tuple[int, int]] = []
+        for i in range(1, num_features + 1):
+            ys, xs = np.where(labeled == i)
+            if xs.size == 0:
+                continue
+            peaks.append((int(np.mean(xs)), int(np.mean(ys))))
+
+        log.info(f"get_grid_coordinates: {len(peaks)} dots found")
+
+        coordinates: list[tuple[int, int]] = [
+            (x + center_w - crop_size, y + center_h - crop_size) for (x, y) in peaks
+        ]
+
+        if debug:
+            keypoints = [
+                cv2.KeyPoint(x=float(x), y=float(y), size=1) for (x, y) in peaks
+            ]
+            img_with_kp = cv2.drawKeypoints(
+                img_gray.astype(np.uint8),
+                keypoints,
+                np.array([]),
+                (0, 0, 255),
+                cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS,
+            )
+            plt.figure(figsize=(8, 6))
+            plt.imshow(img_with_kp)
+            plt.title(f"DoG peaks ({len(peaks)})")
+            plt.show(block=False)
+
+        return coordinates
+
+    def match_grid_to_cad(
+        self,
+        img_left: np.ndarray,
+        json_path: str,
+        debug: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Estimate camera->CAD pose by matching detected grid dots to a CAD grid.
+
+        Ported from ``DataSource.match_grid_to_cad`` in
+        ``data_manager_pickle.py``. Uses iterative Hungarian matching +
+        ``cv2.solvePnPRansac`` against a synthetic 30x30 CAD grid (25 mm
+        spacing). Returns ``(rvec, tvec)`` in mm.
+
+        Parameters
+        ----------
+        img_left : grayscale IR image used for dot detection.
+        json_path : the session JSON path; used to fetch the camera
+            intrinsics (``K``, distortion).
+        """
+        from scipy.spatial.distance import cdist
+        from scipy.optimize import linear_sum_assignment
+
+        # Synthetic CAD grid in mm.
+        grid_spacing_mm = 25.0
+        grid_size = (30, 30)
+        grid_points_3d = np.array(
+            [
+                (x * grid_spacing_mm, y * grid_spacing_mm, 0.0)
+                for x in range(-grid_size[0] // 2, grid_size[0] // 2 + 1)
+                for y in range(-grid_size[1] // 2, grid_size[1] // 2 + 1)
+            ],
+            dtype=np.float32,
+        )
+        cad_points = grid_points_3d[:, :2]
+
+        # Detect dots in the image.
+        img_points_list = self.get_grid_coordinates(img_left, debug=debug)
+        if len(img_points_list) < 4:
+            log.warning(
+                "match_grid_to_cad: too few image points "
+                f"({len(img_points_list)}) for a robust pose estimate"
+            )
+            return np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
+
+        img_points = np.asarray(img_points_list, dtype=np.float32)
+
+        # Centre of detected points -> origin assumption.
+        dist_to_mean = np.sum(np.abs(img_points - np.mean(img_points, axis=0)), axis=1)
+        img_index_center = int(np.argmin(dist_to_mean))
+        img_center_pixel = img_points[img_index_center].copy()
+        img_points_centered = img_points - img_center_pixel
+
+        cam_matrix, dist_coeffs = self.get_intrinsics_matrix(json_path)
+
+        img_radii = np.linalg.norm(img_points_centered, axis=1)
+        cad_radii = np.linalg.norm(cad_points, axis=1)
+        img_index_sorted = np.argsort(img_radii)
+        cad_index_sorted = np.argsort(cad_radii)
+
+        n_match_points = 7
+        rvec = np.zeros(3, dtype=np.float64)
+        tvec = np.zeros(3, dtype=np.float64)
+        tvec[2] = 500.0  # initial depth guess in mm
+
+        success_any = False
+        while True:
+            if (
+                n_match_points >= len(img_points)
+                or n_match_points >= len(cad_points)
+            ):
+                log.warning("match_grid_to_cad: exhausted available points")
+                break
+
+            img_pts_cur = img_points[img_index_sorted[:n_match_points]]
+            cad_pts_cur = grid_points_3d[cad_index_sorted[:n_match_points], :]
+
+            cad_pts_proj = cv2.projectPoints(
+                cad_pts_cur.reshape(-1, 1, 3),
+                rvec, tvec, cam_matrix, dist_coeffs,
+            )[0].reshape(-1, 2)
+
+            distance_matrix = cdist(img_pts_cur, cad_pts_proj, metric="euclidean")
+            gate_pix = max(grid_spacing_mm * 0.5, 50.0 / max(1.0, np.sqrt(n_match_points)))
+            cost_matrix = distance_matrix.copy()
+            cost_matrix[cost_matrix > gate_pix] = 1e6
+
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            valid_pair_mask = distance_matrix[row_ind, col_ind] <= gate_pix
+            if int(valid_pair_mask.sum()) < 4:
+                log.warning(
+                    f"match_grid_to_cad: only {int(valid_pair_mask.sum())} valid pairs "
+                    f"at radius={n_match_points}, gate={gate_pix:.1f}px"
+                )
+                n_match_points = n_match_points * 2 + 3
+                continue
+
+            row_ind = row_ind[valid_pair_mask]
+            col_ind = col_ind[valid_pair_mask]
+
+            img_pnp = img_pts_cur[row_ind].astype(np.float32)
+            cad_pnp = cad_pts_cur[col_ind].astype(np.float32)
+
+            success, rvec, tvec, inlier_mask = cv2.solvePnPRansac(
+                cad_pnp,
+                img_pnp,
+                cam_matrix,
+                dist_coeffs,
+                rvec,
+                tvec,
+                useExtrinsicGuess=True,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+                reprojectionError=10.0,
+                iterationsCount=100,
+                confidence=0.95,
+            )
+            if not success:
+                log.warning(
+                    f"match_grid_to_cad: solvePnP failed at radius={n_match_points}"
+                )
+                break
+
+            success_any = True
+            num_inliers = inlier_mask.size if inlier_mask is not None else 0
+            log.info(
+                f"match_grid_to_cad: radius={n_match_points}, inliers={num_inliers}"
+            )
+
+            if debug:
+                plt.figure(figsize=(8, 6))
+                plt.imshow(img_left, cmap="gray")
+                plt.scatter(
+                    img_pts_cur[:, 0], img_pts_cur[:, 1],
+                    c="blue", label="Detected",
+                )
+                plt.scatter(
+                    cad_pts_proj[:, 0], cad_pts_proj[:, 1],
+                    c="red", label="Projected CAD",
+                )
+                plt.legend()
+                plt.title(f"Radius={n_match_points}, Inliers={num_inliers}")
+                plt.show(block=False)
+
+            n_match_points = n_match_points * 2 + 3
+
+        if not success_any:
+            log.warning("match_grid_to_cad: no successful PnP iteration")
+        return rvec.reshape(3), tvec.reshape(3)
+
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -1312,14 +1657,42 @@ class TestDataSource(unittest.TestCase):
         self.assertEqual(out["depth_cad_projected"].shape, out["depth_img"].shape)
 
     def test_get_grid_coordinates(self):
-        self.skipTest(
-            "get_grid_coordinates is not implemented in the xls-based DataSource"
-        )
+        source = DataSource()
+        count = source.init_directory()
+        self.assertTrue(count > 0)
+        item_id = min(3, count - 1)
+        item = source.get_item(item_id, debug=False)
+        coordinates = source.get_grid_coordinates(item["ir_left_img"], debug=True)
+        plt.show()
+        self.assertTrue(len(coordinates) > 0)
 
     def test_match_grid_to_cad(self):
-        self.skipTest(
-            "match_grid_to_cad is not implemented in the xls-based DataSource"
+        source = DataSource()
+        count = source.init_directory()
+        self.assertTrue(count > 0)
+        item_id = min(2, count - 1)
+        item = source.get_item(item_id, debug=False)
+
+        rvec, tvec = source.match_grid_to_cad(
+            item["ir_left_img"], item["json_path"], debug=True
         )
+        # Build T_camera_cad from rvec/tvec (mm) for inspection.
+        R, _ = cv2.Rodrigues(rvec)
+        t_camera_cad = np.eye(4, dtype=np.float64)
+        t_camera_cad[:3, :3] = R
+        t_camera_cad[:3, 3] = tvec / 1000.0  # mm -> m
+
+        # Optionally compare with the ICP-refined pose if available.
+        if source.load_icp_csv():
+            t_camera_cad_icp = source._icp_t_camera_cad(item["capture_idx"])
+            log.info(f"Estimated T_camera_cad (grid):\n{t_camera_cad}")
+            log.info(f"ICP T_camera_cad:\n{t_camera_cad_icp}")
+        else:
+            log.info(f"Estimated T_camera_cad (grid):\n{t_camera_cad}")
+
+        plt.show()
+        self.assertEqual(rvec.shape, (3,))
+        self.assertEqual(tvec.shape, (3,))
 
 
 def RunTest() -> None:
