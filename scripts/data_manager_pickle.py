@@ -275,6 +275,11 @@ class DataSource:
             json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_05\yg_pickle\2026-05-27--13-50-40\Pickle_Scene_Capture_336222073841\scene.json")
         elif scene_type == 4:
             json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06\yg_pickle\2026-06-04--11-24-34\Pickle_Scene_Capture_336222073841\scene.json")
+         
+        elif scene_type == 5: # metal
+            json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06\yg_pickle\2026-06-04--12-23-55\Pickle_Scene_Capture_336222073841\scene.json")
+ 
+        
         else:
             raise ValueError(f"Unsupported scene type: {scene_type}")
         
@@ -1198,7 +1203,7 @@ class TestDataSource(unittest.TestCase):
 
     def test_get_item_projected(self):
         source = DataSource()
-        scene_id, item_id = 4, 15
+        scene_id, item_id = 5, 4
         count = source.init_directory(scene_id)
         self.assertTrue(count > 0)
         out = source.get_item_projected(item_id, debug=True)
