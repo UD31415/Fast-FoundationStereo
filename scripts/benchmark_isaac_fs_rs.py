@@ -52,6 +52,20 @@ code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../')
 sys.path.append(code_dir)
 
+# Driver 580 / CUDA 13.0 does not enumerate devices without CUDA_VISIBLE_DEVICES set.
+if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'],
+            text=True
+        )
+        indices = ','.join(line.strip() for line in out.splitlines() if line.strip())
+        if indices:
+            os.environ['CUDA_VISIBLE_DEVICES'] = indices
+    except Exception:
+        os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -72,35 +86,37 @@ from report import ReportGenerator
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-ISAC_DIR       = r'C:\Work\Data\Depth\reflective_test'
+ISAC_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/reflective_test'
 ORIGINAL_PATH  = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 FINETUNED_PATH = f'{code_dir}/../weights/20-30-48/model_finetuned_faro_kitchen_epoch_006_epoch_013.pth'
 DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_isaac_fs_rs'
 
 # ISAC dataset filtering (see data_manager_isaac.KNOWN_VIEWS = front/overhead/side/wrist)
-DEFAULT_VIEWS: Tuple[str, ...]    = ('wrist',) #('front', 'overhead', 'side', 'wrist')
+DEFAULT_VIEWS: Tuple[str, ...] = ('wrist',) #('front', 'overhead', 'side', 'wrist')
 DEFAULT_EPISODES: Tuple[str, ...] = ('episode_02',)      # empty == all episodes
 
-D435_FX_PX       = 388.462
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+D435_FX_PX       = 642.72 #388.462
 D435_BASELINE_MM = 49.95
 BF               = D435_FX_PX * D435_BASELINE_MM   # focal_px * baseline_mm
-
-BF              = 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
+#BF     = 32339.97067817836 # D435i 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
 ITERS           = 8          # GRU update iterations
-N_VIZ           = 5          # frames saved for visual comparison in the report
+N_VIZ           = 12         # frames saved for visual comparison in the report
 
 # Depth threshold for the "close-range" coverage metric — in mm
-CLOSE_RANGE_THRESHOLD_MM = 150.0
+CLOSE_RANGE_THRESHOLD_MM = 20.0
 
 # Distance bins used for the per-bin MAE curve — all in mm
 DIST_BINS_MM: List[Tuple[float, float]] = [
-    (0.0,    500.0),
+    (0.0,    100.0),
+    (100.0,  200.0),
+    (200.0,  500.0),
     (500.0,  1000.0),
-    (1000.0, 2000.0),
-    (2000.0, 3000.0),
+    (1000.0,  1500.0),
 ]
-BIN_LABELS_MM  = ["0–500 mm", "500–1000 mm", "1000–2000 mm", "2000–3000 mm"]
-BIN_CENTERS_MM = [250.0, 750.0, 1500.0, 2500.0]
+BIN_LABELS_MM  = ["0–100 mm", "100–200 mm", "200–500 mm", "500–1000 mm", "1000–1500 mm"]
+BIN_CENTERS_MM = [50.0, 150.0, 350.0, 750.0, 1250.0]
 
 METHODS: Dict[str, Dict[str, str]] = {
     "original":  {"label": "FFS Original",                "color": "#2980b9"},
@@ -134,8 +150,8 @@ def _preprocess_ir(left: np.ndarray, right: np.ndarray):
     right = np.clip(right.astype(np.float32), 0, 255)
     left  = np.stack([left,  left,  left],  axis=-1)   # H×W×3
     right = np.stack([right, right, right], axis=-1)
-    left_t  = torch.as_tensor(left).float()[None].permute(0, 3, 1, 2).cuda()
-    right_t = torch.as_tensor(right).float()[None].permute(0, 3, 1, 2).cuda()
+    left_t  = torch.as_tensor(left).float()[None].permute(0, 3, 1, 2).to(DEVICE)
+    right_t = torch.as_tensor(right).float()[None].permute(0, 3, 1, 2).to(DEVICE)
     return left_t, right_t
 
 
@@ -202,7 +218,7 @@ class ReportGeneratorMM(ReportGenerator):
         if not self._r.viz_frames:
             return self._empty_fig("depth_comparison.png", "No viz frames")
 
-        sel = self._get_selected_viz_indices(n_pick=4)
+        sel = self._get_selected_viz_indices(n_pick=12)
         if not sel:
             return self._empty_fig("depth_comparison.png", "No viz frames")
 
@@ -221,7 +237,7 @@ class ReportGeneratorMM(ReportGenerator):
                 if name not in vf:
                     ax.axis("off")
                     continue
-                im = ax.imshow(vf[name], cmap=cmap, vmin=1.0, vmax=5000.0)
+                im = ax.imshow(vf[name], cmap=cmap, vmin=1.0, vmax=1500.0)
                 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="mm")
                 title = self._r.method_labels.get(name, name)
                 if c == 0:
@@ -229,7 +245,7 @@ class ReportGeneratorMM(ReportGenerator):
                 ax.set_title(title, fontsize=9, wrap=True)
                 ax.axis("off")
 
-        fig.suptitle("Depth Map Comparison (4 random frames) — values in mm",
+        fig.suptitle("Depth Map Comparison (12 random frames) — values in mm",
                      fontsize=11, y=1.01)
         fig.tight_layout()
         return self._save(fig, "depth_comparison.png")
@@ -238,7 +254,7 @@ class ReportGeneratorMM(ReportGenerator):
         if not self._r.viz_frames or not self._non_gt:
             return self._empty_fig("error_maps.png", "No comparison methods")
 
-        sel = self._get_selected_viz_indices(n_pick=4)
+        sel = self._get_selected_viz_indices(n_pick=12)
         if not sel:
             return self._empty_fig("error_maps.png", "No viz frames")
 
@@ -281,7 +297,7 @@ class ReportGeneratorMM(ReportGenerator):
                 ax.axis("off")
 
         gt_label = self._r.method_labels.get(self._gt, self._gt)
-        fig.suptitle(f"Absolute Error vs {gt_label} (4 random frames, mm)", fontsize=11, y=1.01)
+        fig.suptitle(f"Absolute Error vs {gt_label} (12 random frames, mm)", fontsize=11, y=1.01)
         fig.tight_layout()
         return self._save(fig, "error_maps.png")
 
