@@ -261,7 +261,7 @@ class DataSource:
         self.cad_pcd: Optional[o3d.geometry.PointCloud] = None
         self.df: Optional[pd.DataFrame] = None   # csv file with icp results, loaded on demand
 
-        log.info("DataSource is defined")
+        log.info("Pickle DataSource is defined")
 
     def __len__(self) -> int:
         return len(self.captures)

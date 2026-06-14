@@ -50,7 +50,7 @@ log.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=log.INF
 
 # Default dataset root on disk.
 DEFAULT_ROOT = r"C:\Work\Data\Depth\reflective_test"
-DEFAULT_ROOT = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/reflective_test'
+#DEFAULT_ROOT = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/reflective_test'
 
 
 # Known view names. Sub-folders not present on disk are silently skipped.
@@ -588,7 +588,7 @@ class TestDataSource(unittest.TestCase):
         count = ds.init_directory()
         self.assertGreater(count, 0)
 
-        out = ds.get_item(4, debug=False)
+        out = ds.get_item(4, debug=True)
         self.assertEqual(out["ir_left_img"].ndim, 2)
         self.assertEqual(out["ir_right_img"].ndim, 2)
         self.assertEqual(out["depth_rs_img"].dtype, np.uint16)
@@ -671,8 +671,8 @@ class TestDataSource(unittest.TestCase):
 def RunTest() -> None:
     tst = TestDataSource()
     # tst.test_init_directory()
-    #tst.test_get_item()
-    tst.test_show_images()
+    tst.test_get_item()
+    #tst.test_show_images()
     # tst.test_draw_point_cloud()
     #tst.test_create_object_mask()
 
