@@ -599,7 +599,7 @@ class TestDataSource(unittest.TestCase):
 
     def test_show_images(self):
         ds = DataSource()
-        count = ds.init_directory()
+        count = ds.init_directory(episodes = ("episode_02",), views = ("wrist",))
         if count == 0:
             log.warning("No samples found, skipping show test.")
             return
@@ -625,7 +625,7 @@ class TestDataSource(unittest.TestCase):
 
     def test_create_object_mask(self):
         ds = DataSource()
-        count = ds.init_directory()
+        count = ds.init_directory(episodes = ("episode_02",), views = ("wrist",))
         if count == 0:
             log.warning("No samples found, skipping object-mask test.")
             return

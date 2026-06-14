@@ -182,13 +182,14 @@ class FastFoundationStereo(nn.Module):
   def upsample_disp(self, disp, mask_feat_4, stem_2x):
     with torch.amp.autocast('cuda', enabled=self.args.mixed_precision, dtype=U.AMP_DTYPE):
       xspx = self.spx_2_gru(mask_feat_4, stem_2x)   # 1/2 resolution
+      #xspx     = stem_2x
       spx_pred = self.spx_gru(xspx)
       spx_pred = F.softmax(spx_pred, 1)
       up_disp = context_upsample(disp*4., spx_pred).unsqueeze(1)
     return up_disp.to(self.dtype)
 
 
-  def forward(self, image1, image2, iters=12, test_mode=False, low_memory=False, init_disp=None, profile=False, optimize_build_volume='pytorch1'):
+  def forward_original(self, image1, image2, iters=12, test_mode=False, low_memory=False, init_disp=None, profile=False, optimize_build_volume='pytorch1'):
     """ Estimate disparity between pair of frames """
     B,C,H,W = image1.shape
     low_memory = low_memory or (self.args.get('low_memory', False))
@@ -260,6 +261,80 @@ class FastFoundationStereo(nn.Module):
 
     return init_disp, disp_preds
   
+  def forward(self, image1, image2, iters=12, test_mode=False, low_memory=False, init_disp=None, profile=False, optimize_build_volume='pytorch1'):
+    """ Estimate disparity between pair of frames """
+    B,C,H,W = image1.shape
+    low_memory = low_memory or (self.args.get('low_memory', False))
+    image1 = normalize_image(image1)
+    image2 = normalize_image(image2)
+    with torch.amp.autocast('cuda', enabled=self.args.mixed_precision, dtype=U.AMP_DTYPE):
+      out            = self.feature(torch.cat([image1, image2], dim=0))
+      features_left  = [o[:B] for o in out]
+      features_right = [o[B:] for o in out]
+      stem_2x        = self.stem_2(image1)
+
+      if optimize_build_volume=='pytorch1':
+        gwc_volume = build_gwc_volume_optimized_pytorch1(features_left[0], features_right[0], self.args.max_disp//4, self.cv_group, normalize=self.args.normalize)
+      elif optimize_build_volume=='triton':
+        gwc_volume = build_gwc_volume_triton(features_left[0], features_right[0], self.args.max_disp//4, self.cv_group, normalize=self.args.normalize)
+      else:
+        raise RuntimeError(f"Invalid optimize_build_volume: {optimize_build_volume}")
+
+      #left_tmp  = self.proj_cmb(features_left[0])
+      #right_tmp = self.proj_cmb(features_right[0])
+      #concat_volume = build_concat_volume_optimized_pytorch1(left_tmp, right_tmp, maxdisp=self.args.max_disp//4)
+      #del left_tmp, right_tmp
+      comb_volume = gwc_volume #torch.cat([gwc_volume, concat_volume], dim=1)
+      #del concat_volume, gwc_volume
+
+      comb_volume = self.corr_stem(comb_volume)
+      comb_volume = self.corr_feature_att(comb_volume, features_left[0])
+      comb_volume = self.cost_agg(comb_volume, features_left)
+
+      # Init disp from geometry encoding volume
+      logits      = self.classifier(comb_volume).squeeze(1)
+      prob      = F.softmax(logits, dim=1)
+      if init_disp is None:
+        init_disp = disparity_regression(prob, self.args.max_disp//4)
+
+      cnet_list = self.cnet(features_left[0], features_left[1], features_left[2])
+      cnet_list = list(cnet_list)
+      net_list = [torch.tanh(x[0]) for x in cnet_list]
+      #inp_list = [torch.relu(x[1]) for x in cnet_list]
+      #inp_list = [self.cam(x) * x for x in inp_list]
+      #att = [self.sam(x) for x in inp_list]
+
+    geo_fn      = Combined_Geo_Encoding_Volume(features_left[0].to(self.dtype), features_right[0].to(self.dtype), comb_volume.to(self.dtype), num_levels=self.args.corr_levels)
+    b, c, h, w  = features_left[0].shape
+    coords      = torch.arange(w, dtype=torch.float, device=init_disp.device).reshape(1,1,w,1).repeat(b, h, 1, 1)
+    disp        = init_disp.to(self.dtype)
+    disp_preds  = []
+
+    del comb_volume, features_left, features_right, cnet_list
+
+    # GRUs iterations to update disparity (1/4 resolution)
+    for itr in range(iters):
+      disp = disp.detach()
+      geo_feat = geo_fn(disp, coords, dx=self.dx, low_memory=low_memory)
+      with torch.amp.autocast('cuda', enabled=self.args.mixed_precision, dtype=U.AMP_DTYPE):
+        #net_list, mask_feat_4, delta_disp = self.update_block(net_list, inp_list, geo_feat.to(self.dtype), disp, att)
+        net_list, mask_feat_4, delta_disp = self.update_block(net_list, geo_feat.to(self.dtype), disp)
+
+      disp = disp + delta_disp.to(self.dtype)
+      if test_mode and itr < iters-1:
+        continue
+
+      # upsample predictions
+      disp_up = self.upsample_disp(disp.to(self.dtype), mask_feat_4.to(self.dtype), stem_2x.to(self.dtype))
+      disp_preds.append(disp_up)
+
+
+    if test_mode:
+      return disp_up
+
+    return init_disp, disp_preds
+
+
   def run_hierachical(self, image1, image2, iters=12, test_mode=False, low_memory=False, small_ratio=0.5):
       B,_,H,W = image1.shape
       img1_small = F.interpolate(image1, scale_factor=small_ratio, align_corners=False, mode='bilinear')
