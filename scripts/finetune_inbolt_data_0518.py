@@ -184,7 +184,7 @@ class InboltDataset(Dataset):
         right = np.stack([right, right, right], axis=-1)
         valid = depth > 0
 
-        left, right, depth, valid = extract_patches(left, right, depth, valid)        
+        #left, right, depth, valid = extract_patches(left, right, depth, valid)        
         # depth (mm) → disparity (pixels):  disp = focal * baseline / depth
         disp  = np.zeros_like(depth, dtype=np.float32)
         

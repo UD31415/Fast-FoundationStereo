@@ -346,7 +346,6 @@ def depth_to_point_cloud(
 
     return pcd
 
-
 def estimate_normals_from_depth_map(depth_map: np.ndarray) -> np.ndarray:
     """Per-pixel surface normals from a depth map via the Sobel gradient."""
     if depth_map.dtype != np.float32:
@@ -370,7 +369,6 @@ def estimate_normals_from_depth_map(depth_map: np.ndarray) -> np.ndarray:
         out=np.zeros_like(direction),
         where=magnitude != 0,
     )
-
 
 def create_object_mask(
     depth_gt: np.ndarray,
@@ -544,15 +542,15 @@ class DataSource:
         self.stl_name = stl_name
 
         for json_path in session_jsons:
-            self._index_session(json_path)
+            self.index_session(json_path)
 
         log.info(
-            f"ISAC DataSource: indexed {len(self.items)} captures across "
+            f"DataSource: indexed {len(self.items)} captures across "
             f"{len(self.sessions)} sessions"
         )
         return len(self.items)
 
-    def _index_session(self, json_path: str) -> None:
+    def index_session(self, json_path: str) -> None:
         """Load one session JSON and append its captures to ``self.items``."""
         path = Path(json_path)
         if not path.exists():
@@ -664,7 +662,7 @@ class DataSource:
         return sampled_pcd
 
 
-    def _load_cad_pcd(self, cad_path: str) -> Optional[o3d.geometry.PointCloud]:
+    def load_cad_pcd(self, cad_path: str) -> Optional[o3d.geometry.PointCloud]:
         """Load and cache the sampled CAD point cloud (in metres)."""
         if not cad_path:
             return None
@@ -713,7 +711,7 @@ class DataSource:
         self._cad_mesh_cache[cad_path] = mesh
         return cad_pcd
 
-    def _load_cad_mesh(self, cad_path: str) -> Optional[o3d.geometry.TriangleMesh]:
+    def load_cad_mesh(self, cad_path: str) -> Optional[o3d.geometry.TriangleMesh]:
         """Load and cache the CAD mesh, scaled to metres."""
         if not cad_path:
             return None
@@ -793,7 +791,7 @@ class DataSource:
         log.info(f"Loaded ICP table with {len(self.icp_table)} rows from {path}")
         return True
 
-    def _icp_t_camera_cad(self, capture_idx: int) -> Optional[np.ndarray]:
+    def load_icp_t_camera_cad(self, capture_idx: int) -> Optional[np.ndarray]:
         """Return the ICP-refined ``t_camera_cad`` for a capture, if any."""
         if self.icp_table is None:
             return None
@@ -825,8 +823,8 @@ class DataSource:
 
         ir_left         = load_image_any(meta["ir_left_path"])
         ir_right        = load_image_any(meta["ir_right_path"])
-        depth_img = load_image_any(meta["depth_path"])
-        rgb = load_image_any(meta["rgb_path"]) if meta["rgb_path"] else None
+        depth_img       = load_image_any(meta["depth_path"])
+        rgb             = load_image_any(meta["rgb_path"]) if meta["rgb_path"] else None
 
         vertices_path = meta["vertices_path"]
         depth_pcd_raw: Optional[o3d.geometry.PointCloud] = None
@@ -837,51 +835,51 @@ class DataSource:
                 log.warning(f"Failed to load vertices {vertices_path}: {exc}")
 
         # Pose composition: camera <- CAD using Uri's convention.
-        t_camera_tooltip = session["t_camera_tooltip"]
-        t_tooltip_cad = np.array(capture.get("t_tooltip_cad", np.eye(4)), dtype=np.float64)
-        t_camera_cad = compose_t_camera_cad(t_camera_tooltip, t_tooltip_cad)
+        t_camera_tooltip    = session["t_camera_tooltip"]
+        t_tooltip_cad       = np.array(capture.get("t_tooltip_cad", np.eye(4)), dtype=np.float64)
+        t_camera_cad        = compose_t_camera_cad(t_camera_tooltip, t_tooltip_cad)
 
-        cad_pcd = self._load_cad_pcd(session["cad_path"])
+        cad_pcd             = self.load_cad_pcd(session["cad_path"])
         cad_pcd_aligned: Optional[o3d.geometry.PointCloud] = None
         if cad_pcd is not None:
             cad_pcd_aligned = copy.deepcopy(cad_pcd)
             cad_pcd_aligned.transform(t_camera_cad)
 
         # ICP-refined alignment, when available.
-        t_camera_cad_icp = self._icp_t_camera_cad(meta["capture_idx"])
+        t_camera_cad_icp    = self.load_icp_t_camera_cad(meta["capture_idx"])
         cad_pcd_aligned_icp: Optional[o3d.geometry.PointCloud] = None
         if cad_pcd is not None and t_camera_cad_icp is not None:
             cad_pcd_aligned_icp = copy.deepcopy(cad_pcd)
             cad_pcd_aligned_icp.transform(t_camera_cad_icp)
 
-        intrinsics = session["intrinsics"]
+        intrinsics           = session["intrinsics"]
         item: dict[str, Any] = {
-            "index": index,
-            "json_path": json_path,
-            "capture_idx": meta["capture_idx"],
+            "index"                 : index,
+            "json_path"             : json_path,
+            "capture_idx"           : meta["capture_idx"],
             # paths
-            "ir_left_path": meta["ir_left_path"],
-            "ir_right_path": meta["ir_right_path"],
-            "depth_path": meta["depth_path"],
-            "rgb_path": meta["rgb_path"],
-            "vertices_path": vertices_path,
-            "cad_path": session["cad_path"],
+            "ir_left_path"          : meta["ir_left_path"],
+            "ir_right_path"         : meta["ir_right_path"],
+            "depth_path"            : meta["depth_path"],
+            "rgb_path"              : meta["rgb_path"],
+            "vertices_path"         : vertices_path,
+            "cad_path"              : session["cad_path"],
             # images / clouds
-            "ir_left_img": ir_left,
-            "ir_right_img": ir_right,
-            "depth_img": depth_img,
-            "rgb_img": rgb,
-            "depth_pcd_raw": depth_pcd_raw,
-            "cad_pcd": cad_pcd,
-            "cad_pcd_aligned": cad_pcd_aligned,
-            "cad_pcd_aligned_icp": cad_pcd_aligned_icp,
+            "ir_left_img"           : ir_left,
+            "ir_right_img"          : ir_right,
+            "depth_img"             : depth_img,
+            "rgb_img"               : rgb,
+            "depth_pcd_raw"         : depth_pcd_raw,
+            "cad_pcd"               : cad_pcd,
+            "cad_pcd_aligned"       : cad_pcd_aligned,
+            "cad_pcd_aligned_icp"   : cad_pcd_aligned_icp,
             # transforms / metadata
-            "t_camera_tooltip": t_camera_tooltip,
-            "t_tooltip_cad": t_tooltip_cad,
-            "t_camera_cad": t_camera_cad,
-            "t_camera_cad_icp": t_camera_cad_icp,
-            "robot_position": meta["robot_position"],
-            "intrinsics": intrinsics,
+            "t_camera_tooltip"      : t_camera_tooltip,
+            "t_tooltip_cad"         : t_tooltip_cad,
+            "t_camera_cad"          : t_camera_cad,
+            "t_camera_cad_icp"      : t_camera_cad_icp,
+            "robot_position"        : meta["robot_position"],
+            "intrinsics"            : intrinsics,
         }
 
         if debug:
@@ -898,6 +896,78 @@ class DataSource:
     # ------------------------------------------------------------------
     # CAD -> camera-image projection
     # ------------------------------------------------------------------
+
+    def project_mesh_on_camera(self, mesh, cam_matrix, cam_dist_coeffs, cam_extrinsics, frame_size=(720, 1280)):
+        # NOTE: Open3D's ``OffscreenRenderer`` (Filament backend) is not
+        # supported on Windows wheels (it requires EGL headless). On Windows
+        # we use a hidden ``Visualizer`` window + ``capture_screen_float_buffer``
+        # to render a mesh to an RGB image with explicit pinhole intrinsics.
+
+        image_height, image_width = frame_size
+
+        # Build pinhole intrinsics from a vertical FOV of 60 deg.
+        # fov_deg = 60.0
+        # fy = image_height / (2.0 * np.tan(np.deg2rad(fov_deg) / 2.0))
+        # fx = fy
+        # cx = image_width / 2.0
+        # cy = image_height / 2.0
+        fx, fy, cx, cy = cam_matrix[0, 0], cam_matrix[1, 1], cam_matrix[0, 2], cam_matrix[1, 2]
+        intrinsic = o3d.camera.PinholeCameraIntrinsic(image_width, image_height, fx, fy, cx, cy)
+
+        # Mesh to render.
+        mesh = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
+        mesh.compute_vertex_normals()
+
+        # # Look-at extrinsic: camera at (2, 2, 2), looking at origin, +Z up.
+        # eye = np.array([2.0, 2.0, 2.0], dtype=np.float64)
+        # center = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        # up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        # f = (center - eye)
+        # f /= np.linalg.norm(f)
+        # s = np.cross(f, up)
+        # s /= np.linalg.norm(s)
+        # u = np.cross(s, f)
+        # # Open3D's pinhole convention: +Z forward, +Y down.
+        # # Build R such that R @ world = camera; rows are camera basis vectors.
+        # rotation = np.stack([s, -u, f], axis=0)
+        # translation = -rotation @ eye
+        # extrinsic = np.eye(4, dtype=np.float64)
+        # extrinsic[:3, :3] = rotation
+        # extrinsic[:3, 3] = translation
+
+        extrinsic = cam_extrinsics
+
+        vis = o3d.visualization.Visualizer()
+        created = vis.create_window(
+            visible=False, width=image_width, height=image_height
+        )
+        if not created:
+            self.skipTest("Could not create Open3D window for offscreen render")
+
+        try:
+            vis.add_geometry(mesh)
+
+            ctr             = vis.get_view_control()
+            params          = ctr.convert_to_pinhole_camera_parameters()
+            params.intrinsic = intrinsic
+            params.extrinsic = extrinsic
+            ctr.convert_from_pinhole_camera_parameters( params, allow_arbitrary=True)
+
+            vis.poll_events()
+            vis.update_renderer()
+            float_img       = vis.capture_screen_float_buffer(do_render=True)
+        finally:
+            vis.destroy_window()
+
+        image_ndarray = np.asarray(float_img)
+        self.assertEqual(image_ndarray.shape, (image_height, image_width, 3))
+
+        # Save out the rendered RGB frame for inspection.
+        rgb_uint8 = np.ascontiguousarray(
+            (np.clip(image_ndarray, 0.0, 1.0) * 255.0).astype(np.uint8)
+        )
+        return rgb_uint8
 
     @staticmethod
     def project_3d_to_camera_depth(
@@ -1051,21 +1121,21 @@ class DataSource:
         use_icp : when ``True`` the ICP-refined CAD alignment is used
             (calls :meth:`load_icp_csv` if necessary).
         """
-        if method not in ("splat", "raycast"):
+        if method not in ("splat", "raycast","open3d"):
             raise ValueError(f"Unknown projection method: {method!r}")
 
         if use_icp and self.icp_table is None:
             self.load_icp_csv()
 
-        item = self.get_item(index, debug=False)
+        item        = self.get_item(index, debug=False)
 
-        depth_img = item.get("depth_img")
+        depth_img   = item.get("depth_img")
         if depth_img is None:
             raise RuntimeError(
                 f"Item {index}: depth_img is missing; cannot derive frame size."
             )
-        h, w = depth_img.shape[:2]
-        cam_matrix, dist_coeffs = self.get_intrinsics_matrix(item["json_path"])
+        h, w        = depth_img.shape[:2]
+        cam_matrix, cam_dist_coeffs = self.get_intrinsics_matrix(item["json_path"])
 
         if method == "splat":
             cad_cloud = (
@@ -1078,15 +1148,15 @@ class DataSource:
                 )
                 depth_cad_projected = np.zeros((h, w), dtype=np.float32)
             else:
-                cad_points_cam = np.asarray(cad_cloud.points, dtype=np.float32)
+                cad_points_cam      = np.asarray(cad_cloud.points, dtype=np.float32)
                 depth_cad_projected = self.project_3d_to_camera_depth(
-                    cad_points_cam, cam_matrix, dist_coeffs, frame_size=(h, w)
+                    cad_points_cam, cam_matrix, cam_dist_coeffs, frame_size=(h, w)
                 )
-        else:  # raycast
+        elif method == "raycast":
             t_camera_cad = (
                 item.get("t_camera_cad_icp") if use_icp else item.get("t_camera_cad")
             )
-            mesh = self._load_cad_mesh(item["cad_path"])
+            mesh = self.load_cad_mesh(item["cad_path"])
             if mesh is None or t_camera_cad is None:
                 log.warning(
                     f"Item {index}: no mesh or pose for raycast; "
@@ -1094,16 +1164,39 @@ class DataSource:
                 )
                 depth_cad_projected = np.zeros((h, w), dtype=np.float32)
             else:
-                if np.linalg.norm(np.asarray(dist_coeffs).ravel()) > 1e-3:
+                if np.linalg.norm(np.asarray(cam_dist_coeffs).ravel()) > 1e-3:
                     log.warning(
                         "render_mesh_depth assumes a pinhole camera; "
                         "non-zero distortion coefficients will be ignored."
                     )
-                mesh_cam = copy.deepcopy(mesh)
+                mesh_cam            = copy.deepcopy(mesh)
                 mesh_cam.transform(np.asarray(t_camera_cad, dtype=np.float64))
                 depth_cad_projected = self.render_mesh_depth(
                     mesh_cam, cam_matrix, frame_size=(h, w), output_units="mm"
                 )
+
+        else: # method == "open3d"
+            t_camera_cad = (
+                item.get("t_camera_cad_icp") if use_icp else item.get("t_camera_cad")
+            )
+            mesh = self.load_cad_mesh(item["cad_path"])
+            if mesh is None or t_camera_cad is None:
+                log.warning(
+                    f"Item {index}: no mesh or pose for raycast; "
+                    "depth_cad_projected will be zeros."
+                )
+                depth_cad_projected = np.zeros((h, w), dtype=np.float32)
+            else:
+                if np.linalg.norm(np.asarray(cam_dist_coeffs).ravel()) > 1e-3:
+                    log.warning(
+                        "render_mesh_depth assumes a pinhole camera; "
+                        "non-zero distortion coefficients will be ignored."
+                    )
+                depth_cad_projected = self.project_mesh_on_camera(
+                    mesh, cam_matrix, cam_dist_coeffs, t_camera_cad, frame_size=(h, w)
+                )
+                # Convert the rendered RGB back to a depth image by taking the red channel.
+                depth_cad_projected = depth_cad_projected[..., 0].astype(np.float32)
 
         item["depth_cad_projected"] = depth_cad_projected
         item["cad_img_projected"] = depth_cad_projected  # legacy alias
@@ -1162,8 +1255,13 @@ class DataSource:
                 disp = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 axes[ri, ci].imshow(disp)
             else:
-                vmax = np.percentile(img, 95) #if img.dtype == np.uint8 else 1000
-                vmax = 600 if k == 3 else vmax
+                if 'ir' in ttl_list[k].lower():
+                    vmax = 200
+                elif 'depth' in ttl_list[k].lower():
+                    vmax = 1000
+                else:
+                    vmax = np.percentile(img, 95) #if img.dtype == np.uint8 else 1000
+                #vmax = 600 if k == 3 else vmax
                 axes[ri, ci].imshow(img, cmap="gray" if img.ndim == 2 and img.dtype == np.uint8 else None, vmax = vmax )
             axes[ri, ci].set_title(ttl_list[k])
         # for k in range(img_num, row_num * col_num):
@@ -1587,8 +1685,7 @@ class TestDataSource(unittest.TestCase):
         self.assertIn("depth_pcd_raw", out)
         self.assertIn("cad_pcd_aligned", out)
         self.assertEqual(out["t_camera_cad"].shape, (4, 4))
-        self.assertTrue(out["depth_pcd_raw"] is not None
-                        and len(out["depth_pcd_raw"].points) > 0)
+        self.assertTrue(out["depth_pcd_raw"] is not None and len(out["depth_pcd_raw"].points) > 0)
 
     def test_show_images(self):
         p = DataSource()
@@ -1633,6 +1730,94 @@ class TestDataSource(unittest.TestCase):
         self.assertEqual(out["depth_cad_projected"].shape, out["depth_img"].shape)
         # Raycast produces a fully dense silhouette: at least one pixel hit.
         self.assertGreater(int(np.count_nonzero(out["depth_cad_projected"])), 0)
+
+    def test_get_item_projected_open3d(self):
+        source          = DataSource()
+        count           = source.init_directory()
+        self.assertTrue(count > 0)
+        item_id         = np.random.randint(0, count)
+        out = source.get_item_projected(item_id, debug=True, method="open3d")
+        self.assertIn("depth_cad_projected", out)
+        self.assertEqual(out["projection_method"], "open3d  ")
+        self.assertEqual(out["depth_cad_projected"].shape, out["depth_img"].shape)
+        # Open3D produces a fully dense silhouette: at least one pixel hit.
+        self.assertGreater(int(np.count_nonzero(out["depth_cad_projected"])), 0)
+
+    def test_project_on_camera(self):
+        # NOTE: Open3D's ``OffscreenRenderer`` (Filament backend) is not
+        # supported on Windows wheels (it requires EGL headless). On Windows
+        # we use a hidden ``Visualizer`` window + ``capture_screen_float_buffer``
+        # to render a mesh to an RGB image with explicit pinhole intrinsics.
+
+        image_width, image_height = 640, 480
+
+        # Build pinhole intrinsics from a vertical FOV of 60 deg.
+        fov_deg = 60.0
+        fy = image_height / (2.0 * np.tan(np.deg2rad(fov_deg) / 2.0))
+        fx = fy
+        cx = image_width / 2.0
+        cy = image_height / 2.0
+        intrinsic = o3d.camera.PinholeCameraIntrinsic(
+            image_width, image_height, fx, fy, cx, cy
+        )
+
+        # Mesh to render.
+        mesh = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
+        mesh.compute_vertex_normals()
+
+        # Look-at extrinsic: camera at (2, 2, 2), looking at origin, +Z up.
+        eye = np.array([2.0, 2.0, 2.0], dtype=np.float64)
+        center = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        f = (center - eye)
+        f /= np.linalg.norm(f)
+        s = np.cross(f, up)
+        s /= np.linalg.norm(s)
+        u = np.cross(s, f)
+        # Open3D's pinhole convention: +Z forward, +Y down.
+        # Build R such that R @ world = camera; rows are camera basis vectors.
+        rotation = np.stack([s, -u, f], axis=0)
+        translation = -rotation @ eye
+        extrinsic = np.eye(4, dtype=np.float64)
+        extrinsic[:3, :3] = rotation
+        extrinsic[:3, 3] = translation
+
+        vis = o3d.visualization.Visualizer()
+        created = vis.create_window(
+            visible=False, width=image_width, height=image_height
+        )
+        if not created:
+            self.skipTest("Could not create Open3D window for offscreen render")
+
+        try:
+            vis.add_geometry(mesh)
+
+            ctr = vis.get_view_control()
+            params = ctr.convert_to_pinhole_camera_parameters()
+            params.intrinsic = intrinsic
+            params.extrinsic = extrinsic
+            ctr.convert_from_pinhole_camera_parameters( params, allow_arbitrary=True)
+
+            vis.poll_events()
+            vis.update_renderer()
+            float_img = vis.capture_screen_float_buffer(do_render=True)
+        finally:
+            vis.destroy_window()
+
+        image_ndarray = np.asarray(float_img)
+        self.assertEqual(image_ndarray.shape, (image_height, image_width, 3))
+
+        # Save out the rendered RGB frame for inspection.
+        rgb_uint8 = np.ascontiguousarray(
+            (np.clip(image_ndarray, 0.0, 1.0) * 255.0).astype(np.uint8)
+        )
+        out_path = Path("projected_mesh_output.png").resolve()
+        ok = o3d.io.write_image(str(out_path), o3d.geometry.Image(rgb_uint8))
+        log.info(f"test_project_on_camera: wrote {out_path} (ok={ok})")
+        self.assertTrue(out_path.exists())
+
+
 
     def test_show_icp_alignment(self):
         source = DataSource()
@@ -1698,11 +1883,13 @@ class TestDataSource(unittest.TestCase):
 def RunTest() -> None:
     tst = TestDataSource()
     # tst.test_init_directory()
-    # tst.test_get_item()
-    #tst.test_show_images()
-    # tst.test_draw_scene()
-    tst.test_get_item_projected()
+    #tst.test_get_item()
+    # tst.test_show_images()
+    # tst.test_draw_scene() # ok
+    tst.test_get_item_projected() # ok
     # tst.test_get_item_projected_raycast()
+    #tst.test_get_item_projected_open3d()
+    #tst.test_project_on_camera()
     # tst.test_show_icp_alignment()
     #tst.test_get_item_icp_projected()
     # tst.test_get_grid_coordinates()
