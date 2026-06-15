@@ -88,7 +88,10 @@ from report import ReportGenerator
 
 ISAC_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/reflective_test'
 ORIGINAL_PATH  = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
-FINETUNED_PATH = f'{code_dir}/../weights/20-30-48/model_finetuned_faro_kitchen_epoch_006_epoch_013.pth'
+#FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
+#FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_data_0518_bf_epoch_071.pth'
+FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_0518_epoch_067.pth'
+#FINETUNED_PATH = f'{code_dir}/../weights/20-30-48/model_finetuned_faro_kitchen_epoch_006_epoch_013.pth'
 DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_isaac_fs_rs'
 
 # ISAC dataset filtering (see data_manager_isaac.KNOWN_VIEWS = front/overhead/side/wrist)
@@ -96,8 +99,9 @@ DEFAULT_VIEWS: Tuple[str, ...] = ('wrist',) #('front', 'overhead', 'side', 'wris
 DEFAULT_EPISODES: Tuple[str, ...] = ('episode_02',)      # empty == all episodes
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {DEVICE}")
 
-D435_FX_PX       = 642.72 #388.462
+D435_FX_PX       = 674.4 #642.72 #388.462
 D435_BASELINE_MM = 49.95
 BF               = D435_FX_PX * D435_BASELINE_MM   # focal_px * baseline_mm
 #BF     = 32339.97067817836 # D435i 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
@@ -120,7 +124,7 @@ BIN_CENTERS_MM = [50.0, 150.0, 350.0, 750.0, 1250.0]
 
 METHODS: Dict[str, Dict[str, str]] = {
     "original":  {"label": "FFS Original",                "color": "#2980b9"},
-    "finetuned": {"label": "FFS Fine-tuned (FARO)",       "color": "#e74c3c"},
+    "finetuned": {"label": "FFS Fine-tuned (INBOLT)",     "color": "#e74c3c"},
     "depth_rs":  {"label": "RealSense Hardware Depth",    "color": "#f39c12"},
     "isaac_gt":  {"label": "ISAC GT (depth_left)",        "color": "#27ae60"},
 }

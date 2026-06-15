@@ -82,17 +82,19 @@ ITERS  = 8          # GRU update iterations
 N_VIZ  = 5         # frames saved for visual comparison in the report
 
 # Depth threshold for the "close-range" coverage metric — in mm
-CLOSE_RANGE_THRESHOLD_MM = 550.0
+CLOSE_RANGE_THRESHOLD_MM = 100.0
 
 # Distance bins used for the per-bin MAE curve — all in mm
 DIST_BINS_MM: List[Tuple[float, float]] = [
-    (0.0,    500.0),
-    (500.0,  1000.0),
+    (0.0,    250.0),
+    (250.0,  500.0),
+    (500.0,  750.0),
+    (750.0,  1000.0),
     (1000.0, 2000.0),
     (2000.0, 3000.0)
 ]
-BIN_LABELS_MM  = ["0–500 mm", "500–1000 mm", "1000–2000 mm", "2000–3000 mm"]
-BIN_CENTERS_MM = [250.0, 750.0, 1500.0, 2500.0]
+BIN_LABELS_MM  = ["0–250 mm", "250–500 mm", "500–750 mm", "750–1000 mm", "1000–2000 mm", "2000–3000 mm"]
+BIN_CENTERS_MM = [125.0, 375.0, 625.0, 875.0, 1500.0, 2500.0]
 
 METHODS: Dict[str, Dict[str, str]] = {
     "original":  {"label": "FFS Original",            "color": "#2980b9"},

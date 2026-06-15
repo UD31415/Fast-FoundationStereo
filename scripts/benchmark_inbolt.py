@@ -60,8 +60,8 @@ DEFAULT_OUT     = f'{code_dir}/../reports/inbolt_benchmark'
 
 #BF              = 50.102706998586 * 385.509887695312  #49470.45   # focal_px * baseline_mm  (calibrated from camera)
 BF              = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18
-ITERS           = 4          # GRU iterations
-N_VIZ           = 5         # number of frames saved for visual comparison in report
+ITERS           = 8          # GRU iterations
+N_VIZ           = 8         # number of frames saved for visual comparison in report
 
 DEPTH_BIN_SIZE_M = 0.1       # width of each distance bin for accuracy/noise plots
 MAX_DEPTH_M      = 2.0       # maximum depth considered in plots
