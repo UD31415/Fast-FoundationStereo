@@ -23,3 +23,4 @@ reports/*
 *.bak
 data/distance/*
 data/mos/*
+*.out
