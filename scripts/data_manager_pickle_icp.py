@@ -182,6 +182,9 @@ class DataSource:
             json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_05\yg_pickle\2026-05-27--12-24-21\Pickle_Scene_Capture_336222073841\scene.json")
         elif scene_type == 3:
             json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_05\yg_pickle\2026-05-27--13-50-40\Pickle_Scene_Capture_336222073841\scene.json")
+        elif scene_type == 5:
+            json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\Pickle\DeepCrunch_Results\1abd6860-0e7a-4e60-8566-415660d1abfa\scene.json")
+
         else:
             raise ValueError(f"Unsupported scene type: {scene_type}")
         
@@ -390,6 +393,7 @@ class DataSource:
         """Load ICP results from a CSV file into a dictionary keyed by capture index."""
 
         csv_path = r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\Pickle\DeepCrunch_Results\a2991ebf-20ab-4887-a22d-cd84492517ef\icp_transformation_result.csv"
+        csv_path = r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\Pickle\DeepCrunch_Results\1abd6860-0e7a-4e60-8566-415660d1abfa\icp_transformation_result.csv"
         if not os.path.exists(csv_path):
             log.warning(f"CSV file not found: {csv_path}")
             return {}
@@ -727,6 +731,7 @@ class DataSource:
         for k in range(img_num):
             ri, ci = k // col_num, k % col_num
             if img_list[k] is None: continue
+            vmax = 50 if k in [0,1] else vmax
             axes[ri, ci].imshow(img_list[k], vmin=vmin, vmax=vmax)
             axes[ri, ci].set_title(ttl_list[k])
         for k in range(img_num, row_num * col_num):
@@ -809,7 +814,7 @@ class TestDataSource(unittest.TestCase):
 
     def test_get_item_icp_projected(self):
         source = DataSource()
-        scene_id, item_id = 3, 125
+        scene_id, item_id = 5, 5
         count = source.init_directory(scene_id)
         self.assertTrue(count > 0)
         out = source.get_item_icp_projected(item_id, debug=True)

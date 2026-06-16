@@ -663,7 +663,7 @@ class DataSource:
                                         rs_dist = DIST_COEFFS_RS,  # RS distortion coeffs
                                     )                
 
-            cv2.imwrite(zivid_projected_path, depth_zivid_projected.astype(np.uint16), [cv2.IMWRITE_PNG_COMPRESSION, 0])  # save projected depth for visualization  
+            #cv2.imwrite(zivid_projected_path, depth_zivid_projected.astype(np.uint16), [cv2.IMWRITE_PNG_COMPRESSION, 0])  # save projected depth for visualization  
 
         # # improving matching
         # pcd_zivid = self.depth_to_pointcloud_base(
@@ -830,6 +830,10 @@ class DataSource:
         axes = np.array(axes).reshape(row_num, col_num)
         for k in range(img_num):
             ri, ci = k // col_num, k % col_num
+            vmax = 255 if 'left'  in ttl_list[k].lower() else vmax
+            vmax = 255 if 'right' in ttl_list[k].lower() else vmax
+            vmax = 1500 if 'depth' in ttl_list[k].lower() else vmax
+            vmax = 25 if 'error' in ttl_list[k].lower() else vmax
             axes[ri, ci].imshow(img_list[k], vmin=vmin, vmax=vmax)
             axes[ri, ci].set_title(ttl_list[k])
         for k in range(img_num, row_num * col_num):
@@ -1238,7 +1242,7 @@ class TestDataSource(unittest.TestCase):
         #img_num = p.init_directory(r'C:\Work\Data\Depth\Data Collection-02')
         img_num = p.init_directory(r'C:\Work\Data\Depth\Data Collection-03')
         self.assertTrue(img_num > 0)
-        for k in np.random.randint(0, img_num, size=min(4, img_num)):
+        for k in np.random.randint(0, img_num, size=min(6, img_num)):
         #for k in range(0, img_num):
             out = p.get_item_transformed_and_projected(int(k), debug=False)
             err = p.compute_depth_error(out["depth_rs"], out["depth_zivid"])
