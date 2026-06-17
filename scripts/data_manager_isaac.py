@@ -418,14 +418,14 @@ class DataSource:
 
         resolution = params.get("resolution", [None, None])
         model = params.get("model", "?")
-        log.info(
-            f"[{ep_name}] camera_params.json: model={model} "
-            f"resolution={resolution} fx={fx:.3f} fy={fy:.3f} "
-            f"cx={cx:.3f} cy={cy:.3f} baseline_mm={baseline_mm:.3f}"
-        )
-        log.info(
-            f"[{ep_name}] K =\n{np.array2string(K, precision=4, suppress_small=True)}"
-        )
+        # log.info(
+        #     f"[{ep_name}] camera_params.json: model={model} "
+        #     f"resolution={resolution} fx={fx:.3f} fy={fy:.3f} "
+        #     f"cx={cx:.3f} cy={cy:.3f} baseline_mm={baseline_mm:.3f}"
+        # )
+        # log.info(
+        #     f"[{ep_name}] K =\n{np.array2string(K, precision=4, suppress_small=True)}"
+        # )
         log.info(
             f"[{ep_name}] focal length @ pitch={sensor_pitch_um:.3f}um: "
             f"fx={focal_mm_x:.4f} mm, fy={focal_mm_y:.4f} mm"
@@ -554,6 +554,34 @@ class DataSource:
         """Override the heuristic pinhole intrinsics."""
         self._intrinsics_override = (float(fx), float(fy), float(cx), float(cy))
 
+    def estimate_baseline_focal_length_product(self, camera_params):
+
+        """Estimate the product of baseline and focal length (B*fx) in mm.
+
+        This is used to convert depth (mm) to disparity (px) via
+        ``d = B*fx / Z``. The dataset does not provide a baseline, so we
+        estimate it from the known depth range and the observed disparity
+        range in the IR pair.
+
+        Parameters
+        ----------
+        meta : dict[str, Any]
+            Metadata for one sample, containing paths to the IR images and
+            depth images.
+        """
+
+        if camera_params is None:
+            log.warning(f"No camera parameters found; using heuristic B*fx.")
+            # Heuristic: assume a baseline of 50 mm and fx from intrinsics.
+            fx, _, _, _ = self.estimate_intrinsics((720, 1280))
+            baseline_mm = 50.0
+        else:
+
+            fx = float(camera_params["fx"])
+            baseline_mm = float(camera_params.get("baseline_mm", 50.0))  # Default to 50 mm if not provided
+
+        return baseline_mm * fx
+
     def get_item(self, index: int, debug: bool = False) -> dict[str, Any]:
         """Load one sample (IR pair, depth, and point cloud) by index."""
         if index < 0 or index >= len(self.items):
@@ -567,6 +595,7 @@ class DataSource:
         depth_gt_img    = self.load_png(meta["depth_gt_path"])
         rgb_left        = self.load_png(meta["rgb_left_path"]) if meta["rgb_left_path"] else None
         seg_left        = self.load_png(meta["seg_left_path"]) if meta["seg_left_path"] else None
+        
 
 
         if ir_left is None or ir_right is None or depth_rs_img is None or depth_gt_img is None or seg_left is None:
@@ -587,15 +616,18 @@ class DataSource:
             cy = float(camera_params["cy"])
             w,h = camera_params.get("resolution", [1280, 720])
 
+        # to save the compute
+        # pcd = depth_to_point_cloud(
+        #     depth_mm=depth_rs_img,
+        #     fx=fx, fy=fy, cx=cx, cy=cy,
+        #     color_img=rgb_left if (rgb_left is not None and rgb_left.shape[:2] == (h, w)) else None,
+        # )
+        pcd = None
 
-        pcd = depth_to_point_cloud(
-            depth_mm=depth_rs_img,
-            fx=fx, fy=fy, cx=cx, cy=cy,
-            color_img=rgb_left if (rgb_left is not None and rgb_left.shape[:2] == (h, w)) else None,
-        )
+        bf              = self.estimate_baseline_focal_length_product(camera_params)
 
         item: dict[str, Any] = {
-            "index": index,
+            "index"         : index,
             "episode"       : meta["episode"],
             "view"          : meta["view"],
             "frame_index"   : meta["frame_index"],
@@ -613,6 +645,7 @@ class DataSource:
             "rgb_left_img"  : rgb_left,
             "seg_left_img"  : seg_left,
             "depth_pcd"     : pcd,
+            "bf"            : bf,
             "intrinsics"    : {"fx": fx, "fy": fy, "cx": cx, "cy": cy, "width": w, "height": h},
         }
 
