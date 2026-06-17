@@ -36,17 +36,17 @@ from scripts.data_manager_isaac import DataSource
 
 # ── constants ────────────────────────────────────────────────────────────────
 
-ISAAC_DIR    = r'\\syn11.iil.intel.com\algonas\Local\Data\new_depth_stereo_datasets\isaac_datasets\isaac_basic_objects'
+ISAAC_DIR    = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/isaac_basic_objects'
 # MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 # OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415.pth'
 MODEL_PATH = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
-OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_0518.pth'
+OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac.pth'
 
 
 # BF         = 49.8624*385.73  # D435 - focal_px * baseline_mm (calibrated from camera)  # D435 - focal_px * baseline_mm (calibrated from camera)
 #BF         = 50.102706998586 * 385.509887695312 # new data 2
-BF         = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18
-EPOCHS     = 120
+#BF         = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18
+EPOCHS     = 50
 LR         = 2e-5
 ITERS      = 8          # GRU iterations (same as inference)
 GAMMA      = 0.9        # sequence loss weight decay
@@ -150,18 +150,16 @@ def extract_patches(left, right, depth, valid, patch_size=512, min_valid_ratio=0
     sl = (slice(y, y + patch_size), slice(x, x + patch_size))
     return left[sl], right[sl], depth[sl], valid[sl]
 
-
-
 # ── dataset ──────────────────────────────────────────────────────────────────
 
 class IsaacDataset(Dataset):
     def __init__(self, root,train_mode=True):
-        self.source = DataSource(train_mode=train_mode)
-        n = self.source.init_directory(input_rectified=root)
+        self.source = DataSource()
+        n = self.source.init_directory(root = root)
         logging.info(f"DataSource found {n} samples in {root}")
 
     def __len__(self):
-        return len(self.source.imgs)
+        return self.source.__len__()
 
     def __getitem__(self, idx):
         data  = self.source.get_item(idx)  # 2026-04
