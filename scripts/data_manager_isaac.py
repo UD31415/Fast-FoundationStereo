@@ -17,6 +17,7 @@ Folder layout expected under the dataset root (default
                 depth_viz_right/frame_NNNN.png  # uint8 RGB visualization
                 rgb_left/frame_NNNN.png      # uint8 RGB
                 rgb_right/frame_NNNN.png     # uint8 RGB
+                seg_semantic_left/frame_NNNN.png   # uint8 (H, W) semantic segmentation mask
 
 This module mirrors the structure of ``data_manager_pickle.py``:
 
@@ -30,6 +31,7 @@ This module mirrors the structure of ``data_manager_pickle.py``:
 
 from __future__ import annotations
 
+import json
 import logging as log
 import os
 import re
@@ -49,8 +51,9 @@ log.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=log.INF
 
 
 # Default dataset root on disk.
-DEFAULT_ROOT = r"C:\Work\Data\Depth\reflective_test"
+#DEFAULT_ROOT = r"C:\Work\Data\Depth\reflective_test"
 #DEFAULT_ROOT = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/reflective_test'
+DEFAULT_ROOT = r'\\syn11.iil.intel.com\algonas\Local\Data\new_depth_stereo_datasets\isaac_datasets\isaac_basic_objects'
 
 
 # Known view names. Sub-folders not present on disk are silently skipped.
@@ -333,10 +336,107 @@ class DataSource:
         #self.depth_kind: str = DEFAULT_DEPTH_KIND
         # Each entry describes one (episode, view, frame) sample.
         self.items: list[dict[str, Any]] = []
-        log.info("ISAC DataSource is defined")
+        # Per-episode camera parameters loaded from <episode>/camera_params.json.
+        self.episode_camera_params: dict[str, dict[str, Any]] = {}
+        log.info("ISAAC DataSource is defined")
 
     def __len__(self) -> int:
         return len(self.items)
+
+    # ------------------------------------------------------------------
+    # Camera parameters
+    # ------------------------------------------------------------------
+
+    def load_and_print_camera_params(
+        self,
+        episode_dir: str | os.PathLike[str],
+        sensor_pitch_um: float = 3.0,
+        disparity_range_px: tuple[float, float] = (1.0, 192.0),
+    ) -> Optional[dict[str, Any]]:
+        """Load ``<episode_dir>/camera_params.json`` and print derived quantities.
+
+        For each episode this prints:
+
+        * the camera intrinsics matrix ``K`` (3x3),
+        * focal length in millimetres given a pixel pitch (``sensor_pitch_um``,
+          default 3.0 um for the RealSense D455 OV9782 IR sensors),
+        * baseline (mm and m) and the depth range corresponding to the supplied
+          disparity range, ``Z = fx * B / d``.
+
+        ``disparity_range_px`` is ``(min_disparity, max_disparity)``; the
+        smaller disparity yields the maximum depth and vice versa.
+
+        Returns the parsed JSON dict (with a ``K`` numpy array added under the
+        ``"K"`` key) or ``None`` if the file is missing/invalid. The result
+        is cached in ``self.episode_camera_params[episode_name]``.
+        """
+        episode_dir = Path(episode_dir)
+        params_path = episode_dir / "camera_params.json"
+        if not params_path.is_file():
+            log.warning(f"camera_params.json not found in {episode_dir}")
+            return None
+
+        try:
+            with open(params_path, "r", encoding="utf-8") as f:
+                params: dict[str, Any] = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning(f"Failed to read {params_path}: {exc}")
+            return None
+
+        try:
+            fx = float(params["fx"])
+            fy = float(params["fy"])
+            cx = float(params["cx"])
+            cy = float(params["cy"])
+            baseline_mm = float(params["baseline_mm"])
+            resolution = params.get("resolution", [None, None])
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning(f"Incomplete camera_params.json at {params_path}: {exc}")
+            return None
+
+        K = np.array(
+            [[fx, 0.0, cx],
+             [0.0, fy, cy],
+             [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+
+        baseline_m = baseline_mm * 1.0e-3
+        # Z = fx * B / d ; min disparity -> max depth, max disparity -> min depth.
+        d_min, d_max = float(disparity_range_px[0]), float(disparity_range_px[1])
+        z_max_m = fx * baseline_m / d_min if d_min > 0 else float("inf")
+        z_min_m = fx * baseline_m / d_max if d_max > 0 else float("inf")
+
+        # Focal length in mm from pixel focal length and sensor pixel pitch.
+        focal_mm_x = fx * sensor_pitch_um * 1.0e-3
+        focal_mm_y = fy * sensor_pitch_um * 1.0e-3
+
+        params["K"] = K
+
+        ep_name = episode_dir.name
+        self.episode_camera_params[ep_name] = params
+
+        resolution = params.get("resolution", [None, None])
+        model = params.get("model", "?")
+        # log.info(
+        #     f"[{ep_name}] camera_params.json: model={model} "
+        #     f"resolution={resolution} fx={fx:.3f} fy={fy:.3f} "
+        #     f"cx={cx:.3f} cy={cy:.3f} baseline_mm={baseline_mm:.3f}"
+        # )
+        # log.info(
+        #     f"[{ep_name}] K =\n{np.array2string(K, precision=4, suppress_small=True)}"
+        # )
+        log.info(
+            f"[{ep_name}] focal length @ pitch={sensor_pitch_um:.3f}um: "
+            f"fx={focal_mm_x:.4f} mm, fy={focal_mm_y:.4f} mm"
+        )
+        log.info(
+            f"[{ep_name}] baseline={baseline_mm:.3f} mm  "
+            f"disparity range [{d_min:.2f}, {d_max:.2f}] px -> "
+            f"depth range [{z_min_m:.4f}, {z_max_m:.4f}] m"
+        )
+
+        return params
 
     # ------------------------------------------------------------------
     # Discovery / indexing
@@ -366,6 +466,7 @@ class DataSource:
         view_names = views if views is not None else KNOWN_VIEWS
 
         for ep_dir in episode_dirs:
+            self.load_and_print_camera_params(ep_dir)
             for view in view_names:
                 view_dir = ep_dir / view
                 if not view_dir.is_dir():
@@ -377,6 +478,7 @@ class DataSource:
                 depth_rs_dir  = view_dir / "depth_tyzx"
                 rgb_left_dir  = view_dir / "rgb_left"
                 rgb_right_dir = view_dir / "rgb_right"
+                seg_left_dir = view_dir / "seg_semantic_left"
 
                 if not (ir_left_dir.is_dir() and ir_right_dir.is_dir() and depth_rs_dir.is_dir() and depth_gt_dir.is_dir()):
                     log.warning(
@@ -396,23 +498,25 @@ class DataSource:
                     ir_r = ir_right_dir / name
                     depth_rs  = depth_rs_dir / name
                     depth_gt   = depth_gt_dir / name
-                    if not (ir_l.exists() and ir_r.exists() and depth_rs.exists() and depth_gt.exists()):
+                    seg_left = seg_left_dir / name
+                    if not (ir_l.exists() and ir_r.exists() and depth_rs.exists() and depth_gt.exists() and seg_left.exists()):
                         continue
 
                     self.items.append({
-                        "episode": ep_dir.name,
-                        "view": view,
-                        "frame_index": fi,
-                        "ir_left_path": str(ir_l),
-                        "ir_right_path": str(ir_r),
-                        "depth_rs_path": str(depth_rs),
-                        "depth_gt_path": str(depth_gt),
-                        "rgb_left_path": str((rgb_left_dir / name)) if (rgb_left_dir / name).exists() else "",
+                        "episode"       : ep_dir.name,
+                        "view"          : view,
+                        "frame_index"   : fi,
+                        "ir_left_path"  : str(ir_l),
+                        "ir_right_path" : str(ir_r),
+                        "depth_rs_path" : str(depth_rs),
+                        "depth_gt_path" : str(depth_gt),
+                        "rgb_left_path" : str((rgb_left_dir / name)) if (rgb_left_dir / name).exists() else "",
                         "rgb_right_path": str((rgb_right_dir / name)) if (rgb_right_dir / name).exists() else "",
+                        "seg_left_path" : str(seg_left),
                     })
 
         log.info(
-            f"ISAC DataSource: indexed {len(self.items)} samples from {self.root}"
+            f"ISAAC DataSource: indexed {len(self.items)} samples from {self.root}"
         )
         return len(self.items)
 
@@ -450,49 +554,99 @@ class DataSource:
         """Override the heuristic pinhole intrinsics."""
         self._intrinsics_override = (float(fx), float(fy), float(cx), float(cy))
 
+    def estimate_baseline_focal_length_product(self, camera_params):
+
+        """Estimate the product of baseline and focal length (B*fx) in mm.
+
+        This is used to convert depth (mm) to disparity (px) via
+        ``d = B*fx / Z``. The dataset does not provide a baseline, so we
+        estimate it from the known depth range and the observed disparity
+        range in the IR pair.
+
+        Parameters
+        ----------
+        meta : dict[str, Any]
+            Metadata for one sample, containing paths to the IR images and
+            depth images.
+        """
+
+        if camera_params is None:
+            log.warning(f"No camera parameters found; using heuristic B*fx.")
+            # Heuristic: assume a baseline of 50 mm and fx from intrinsics.
+            fx, _, _, _ = self.estimate_intrinsics((720, 1280))
+            baseline_mm = 50.0
+        else:
+
+            fx = float(camera_params["fx"])
+            baseline_mm = float(camera_params.get("baseline_mm", 50.0))  # Default to 50 mm if not provided
+
+        return baseline_mm * fx
+
     def get_item(self, index: int, debug: bool = False) -> dict[str, Any]:
         """Load one sample (IR pair, depth, and point cloud) by index."""
         if index < 0 or index >= len(self.items):
             raise IndexError(f"Sample index out of range: {index}")
 
-        meta = self.items[index]
+        meta            = self.items[index]
 
-        ir_left   = self.load_png(meta["ir_left_path"])
-        ir_right  = self.load_png(meta["ir_right_path"])
-        depth_rs_img = self.load_png(meta["depth_rs_path"])
-        depth_gt_img = self.load_png(meta["depth_gt_path"])
-        rgb_left  = self.load_png(meta["rgb_left_path"]) if meta["rgb_left_path"] else None
+        ir_left         = self.load_png(meta["ir_left_path"])
+        ir_right        = self.load_png(meta["ir_right_path"])
+        depth_rs_img    = self.load_png(meta["depth_rs_path"])
+        depth_gt_img    = self.load_png(meta["depth_gt_path"])
+        rgb_left        = self.load_png(meta["rgb_left_path"]) if meta["rgb_left_path"] else None
+        seg_left        = self.load_png(meta["seg_left_path"]) if meta["seg_left_path"] else None
+        
 
-        if ir_left is None or ir_right is None or depth_rs_img is None or depth_gt_img is None:
+
+        if ir_left is None or ir_right is None or depth_rs_img is None or depth_gt_img is None or seg_left is None:
             raise RuntimeError(f"Failed to load sample {index}: {meta}")
+        
+        episode_name    = meta["episode"]
+        camera_params   = self.episode_camera_params.get(episode_name)
+        if camera_params is None:
+            log.warning(f"No camera parameters found for episode {episode_name}; using heuristic intrinsics.")
 
-        h, w = depth_rs_img.shape[:2]
-        fx, fy, cx, cy = self.estimate_intrinsics((h, w))
+            h, w = depth_rs_img.shape[:2]
+            fx, fy, cx, cy = self.estimate_intrinsics((h, w))
 
-        pcd = depth_to_point_cloud(
-            depth_mm=depth_rs_img,
-            fx=fx, fy=fy, cx=cx, cy=cy,
-            color_img=rgb_left if (rgb_left is not None and rgb_left.shape[:2] == (h, w)) else None,
-        )
+        else:
+            fx = float(camera_params["fx"])
+            fy = float(camera_params["fy"])
+            cx = float(camera_params["cx"])
+            cy = float(camera_params["cy"])
+            w,h = camera_params.get("resolution", [1280, 720])
+
+        # to save the compute
+        # pcd = depth_to_point_cloud(
+        #     depth_mm=depth_rs_img,
+        #     fx=fx, fy=fy, cx=cx, cy=cy,
+        #     color_img=rgb_left if (rgb_left is not None and rgb_left.shape[:2] == (h, w)) else None,
+        # )
+        pcd = None
+
+        bf              = self.estimate_baseline_focal_length_product(camera_params)
 
         item: dict[str, Any] = {
-            "index": index,
-            "episode": meta["episode"],
-            "view": meta["view"],
-            "frame_index": meta["frame_index"],
-            "ir_left_path": meta["ir_left_path"],
-            "ir_right_path": meta["ir_right_path"],
-            "depth_rs_path": meta["depth_rs_path"],
-            "depth_gt_path": meta["depth_gt_path"],
-            "rgb_left_path": meta["rgb_left_path"],
+            "index"         : index,
+            "episode"       : meta["episode"],
+            "view"          : meta["view"],
+            "frame_index"   : meta["frame_index"],
+            "ir_left_path"  : meta["ir_left_path"],
+            "ir_right_path" : meta["ir_right_path"],
+            "depth_rs_path" : meta["depth_rs_path"],
+            "depth_gt_path" : meta["depth_gt_path"],
+            "rgb_left_path" : meta["rgb_left_path"],
             "rgb_right_path": meta["rgb_right_path"],
-            "ir_left_img": ir_left,
-            "ir_right_img": ir_right,
-            "depth_rs_img": depth_rs_img,
-            "depth_gt_img": depth_gt_img,
-            "rgb_left_img": rgb_left,
-            "depth_pcd": pcd,
-            "intrinsics": {"fx": fx, "fy": fy, "cx": cx, "cy": cy, "width": w, "height": h},
+            "seg_left_path" : meta["seg_left_path"],
+            "ir_left_img"   : ir_left,
+            "ir_right_img"  : ir_right,
+            "depth_rs_img"  : depth_rs_img,
+            "depth_gt_img"  : depth_gt_img,
+            "rgb_left_img"  : rgb_left,
+            "seg_left_img"  : seg_left,
+            "depth_pcd"     : pcd,
+            "bf"            : bf,
+            "intrinsics"    : {"fx": fx, "fy": fy, "cx": cx, "cy": cy, "width": w, "height": h},
         }
 
         if debug:
@@ -515,7 +669,7 @@ class DataSource:
     ) -> None:
         """Display a list of images in a grid."""
         img_num = len(img_list)
-        col_num = min(img_num, 2)
+        col_num = min(img_num, 3)
         row_num = int(np.ceil(img_num / col_num))
         fig, axes = plt.subplots(row_num, col_num, sharey=True, sharex=True)
         axes = np.array(axes).reshape(row_num, col_num)
@@ -531,7 +685,9 @@ class DataSource:
                 disp = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 axes[ri, ci].imshow(disp)
             else:
-                axes[ri, ci].imshow(img, cmap='gray' if img.ndim == 2 and img.dtype == np.uint8 else None)
+                vmax = 200 if 'IR' in ttl_list[k] else 32
+                vmax = 1024 if 'Depth' in ttl_list[k] else vmax
+                axes[ri, ci].imshow(img, cmap='gray' if img.ndim == 2 and img.dtype == np.uint8 else None, vmax = vmax)
             axes[ri, ci].set_title(ttl_list[k])
         for k in range(img_num, row_num * col_num):
             axes[k // col_num, k % col_num].axis('off')
@@ -545,8 +701,8 @@ class DataSource:
             f"{item['episode']} / {item['view']} / frame {item['frame_index']:04d}"
         )
         self.show_subset(
-            [item["ir_left_img"], item["ir_right_img"], item["depth_rs_img"], item["depth_gt_img"]],
-            ["IR left", "IR right", f"Depth RS  [mm]", f"Depth GT [mm]"],
+            [item["ir_left_img"], item["ir_right_img"], item["seg_left_img"], item["depth_rs_img"], item["depth_gt_img"]],
+            ["IR left", "IR right", "Segmentation", f"Depth RS  [mm]", f"Depth GT [mm]"],
             suptitle=suptitle,
         )
 
@@ -599,7 +755,7 @@ class TestDataSource(unittest.TestCase):
 
     def test_show_images(self):
         ds = DataSource()
-        count = ds.init_directory(episodes = ("episode_02",), views = ("wrist",))
+        count = ds.init_directory(episodes = ("episode_05",), views = ("wrist",))
         if count == 0:
             log.warning("No samples found, skipping show test.")
             return
@@ -671,8 +827,8 @@ class TestDataSource(unittest.TestCase):
 def RunTest() -> None:
     tst = TestDataSource()
     # tst.test_init_directory()
-    tst.test_get_item()
-    #tst.test_show_images()
+    #tst.test_get_item()
+    tst.test_show_images()
     # tst.test_draw_point_cloud()
     #tst.test_create_object_mask()
 
