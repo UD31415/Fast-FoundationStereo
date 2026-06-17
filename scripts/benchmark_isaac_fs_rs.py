@@ -98,13 +98,13 @@ DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_isaac_fs_rs'
 
 # ISAC dataset filtering (see data_manager_isaac.KNOWN_VIEWS = front/overhead/side/wrist)
 DEFAULT_VIEWS: Tuple[str, ...] = ('wrist',) #('front', 'overhead', 'side', 'wrist')
-DEFAULT_EPISODES: Tuple[str, ...] = () #'episode_02',)      # empty == all episodes
+DEFAULT_EPISODES: Tuple[str, ...] = ('episode_12',)      # empty == all episodes
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {DEVICE}")
 
-D435_FX_PX       = 674.4 #642.72 #388.462
-D435_BASELINE_MM = 49.95
+# D435_FX_PX       = 674.4 #642.72 #388.462
+# D435_BASELINE_MM = 49.95
 #BF               = D435_FX_PX * D435_BASELINE_MM   # focal_px * baseline_mm
 #BF     = 32339.97067817836 # D435i 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
 ITERS           = 8          # GRU update iterations
@@ -488,7 +488,7 @@ def main():
     active_methods = [GT_NAME, RS_NAME] + list(models.keys())
 
     # ── dataset ───────────────────────────────────────────────────────────────
-    source = DataSource()
+    source = DataSource(train_mode=False)
     views_tuple    = tuple(args.views) if args.views else None
     episodes_tuple = tuple(args.episodes) if args.episodes else None
     n = source.init_directory(
