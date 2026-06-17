@@ -329,6 +329,7 @@ class ReportGeneratorMM(ReportGenerator):
         ax.set_xlabel("Distance range", fontsize=10)
         ax.set_ylabel("Mean Absolute Error (mm)", fontsize=10)
         ax.set_title("Depth Error vs Distance", fontsize=12)
+        ax.set_ylim(0, 500) # mm
         ax.legend(fontsize=9)
         ax.grid(alpha=0.3)
         fig.tight_layout()
