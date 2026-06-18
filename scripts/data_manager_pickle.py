@@ -592,7 +592,7 @@ def colorize_label_mask(labels: np.ndarray, seed: int = 0) -> np.ndarray:
 class DataSource:
     """Loader for the ISAC / Pickle Excel-driven capture dataset."""
 
-    def __init__(self,train_mode = False) -> None:
+    def __init__(self, train_mode = False) -> None:
         self.excel_path: Optional[Path] = None
         self.stl_name: Optional[str] = None
         self.manifest_df: Optional[pd.DataFrame] = None
@@ -603,6 +603,8 @@ class DataSource:
         self._cad_cache: dict[str, o3d.geometry.PointCloud] = {}
         # Cached CAD triangle meshes (in metres) keyed by cad_path.
         self._cad_mesh_cache: dict[str, o3d.geometry.TriangleMesh] = {}
+
+        self._background_mesh_cache: dict[str, o3d.geometry.TriangleMesh] = None  # background mesh - plate
 
         # Flat per-capture index. Each entry has at least:
         #   ``json_path``, ``capture_idx``, plus eager copies of useful fields.
@@ -859,6 +861,83 @@ class DataSource:
             mesh.compute_vertex_normals()
         self._cad_mesh_cache[cad_path] = mesh
         return mesh
+    
+    def load_background_mesh(self,
+        mesh_cam: o3d.geometry.TriangleMesh,
+        background_offset_m: float = 0.0,
+        background_size_m: float = 2.0,
+        background_z_m: Optional[float] = 0.0,
+    ) -> o3d.geometry.TriangleMesh:
+        """Render ``mesh_cam`` plus a flat rectangular background to a depth image.
+
+        Builds a scene composed of the input mesh (already in the camera
+        frame) and a large flat rectangle parallel to the image plane,
+        placed behind the object so that every camera ray hits something.
+        The combined scene is then rasterized with the same pinhole
+        ray-casting pipeline used by :meth:`render_mesh_depth`.
+
+        Parameters
+        ----------
+        mesh_cam : ``TriangleMesh`` whose vertices are in the *camera*
+            frame, in metres.
+        cam_matrix : 3x3 pinhole intrinsic ``K`` (pixels).
+        frame_size : ``(H, W)``.
+        background_offset_m : distance (m) placed behind the mesh's
+            furthest +Z vertex when ``background_z_m`` is not specified.
+        background_size_m : edge length (m) of the square background plane.
+        background_z_m : explicit camera-Z (m) for the background plane.
+            Overrides ``background_offset_m`` when provided.
+        output_units : ``"mm"`` (default) or ``"m"``.
+
+        Returns
+        -------
+        ``(H, W)`` ``float32`` depth image. Pixels are guaranteed to be
+        populated as long as the background plane covers the field of view.
+        """
+        if self._background_mesh_cache is not None:
+            return self._background_mesh_cache
+
+        # Determine where to place the background plane.
+        if background_z_m is None:
+            if mesh_cam is None or mesh_cam.is_empty():
+                bg_z = max(1.0, float(background_offset_m))
+            else:
+                verts = np.asarray(mesh_cam.vertices, dtype=np.float64)
+                z_max = float(verts[:, 2].max()) if verts.size else 0.0
+                bg_z = z_max + float(background_offset_m)
+        else:
+            bg_z = float(background_z_m)
+
+        # if bg_z <= 0.0:
+        #     raise ValueError(
+        #         f"Background plane must lie in front of the camera (z>0), got z={bg_z}"
+        #     )
+
+        # Build a flat rectangular background facing the camera.
+        half = 0.5 * float(background_size_m)
+        bg_vertices = np.array(
+            [
+                [-half, -half, bg_z],
+                [ half, -half, bg_z],
+                [ half,  half, bg_z],
+                [-half,  half, bg_z],
+            ],
+            dtype=np.float64,
+        )
+        # Two triangles, double-sided so orientation does not matter.
+        bg_triangles = np.array(
+            [
+                [0, 1, 2], [0, 2, 3],
+                [0, 2, 1], [0, 3, 2],
+            ],
+            dtype=np.int32,
+        )
+        bg_mesh = o3d.geometry.TriangleMesh(
+            vertices=o3d.utility.Vector3dVector(bg_vertices),
+            triangles=o3d.utility.Vector3iVector(bg_triangles),
+        )
+        self._background_mesh_cache = bg_mesh
+        return bg_mesh
 
     def get_intrinsics_matrix(self, json_path: str) -> tuple[np.ndarray, np.ndarray]:
         """Return ``(K, dist_coeffs)`` for one session."""
@@ -942,6 +1021,7 @@ class DataSource:
         if index < 0 or index >= len(self.items):
             raise IndexError(f"Sample index out of range: {index}")
 
+        log.info(f"Loading item {index}/{len(self.items)}...")
         meta            = self.items[index]
         json_path       = meta["json_path"]
         session         = self.sessions[json_path]
@@ -1231,6 +1311,98 @@ class DataSource:
             raise ValueError("output_units must be 'mm' or 'm'")
         return depth.astype(np.float32)
 
+    # @staticmethod
+    # def render_scene_depth(
+    #     mesh_cam: o3d.geometry.TriangleMesh,
+    #     cam_matrix: np.ndarray,
+    #     frame_size: tuple[int, int],
+    #     background_offset_m: float = 0.2,
+    #     background_size_m: float = 5.0,
+    #     background_z_m: Optional[float] = None,
+    #     output_units: str = "mm",
+    # ) -> np.ndarray:
+    #     """Render ``mesh_cam`` plus a flat rectangular background to a depth image.
+
+    #     Builds a scene composed of the input mesh (already in the camera
+    #     frame) and a large flat rectangle parallel to the image plane,
+    #     placed behind the object so that every camera ray hits something.
+    #     The combined scene is then rasterized with the same pinhole
+    #     ray-casting pipeline used by :meth:`render_mesh_depth`.
+
+    #     Parameters
+    #     ----------
+    #     mesh_cam : ``TriangleMesh`` whose vertices are in the *camera*
+    #         frame, in metres.
+    #     cam_matrix : 3x3 pinhole intrinsic ``K`` (pixels).
+    #     frame_size : ``(H, W)``.
+    #     background_offset_m : distance (m) placed behind the mesh's
+    #         furthest +Z vertex when ``background_z_m`` is not specified.
+    #     background_size_m : edge length (m) of the square background plane.
+    #     background_z_m : explicit camera-Z (m) for the background plane.
+    #         Overrides ``background_offset_m`` when provided.
+    #     output_units : ``"mm"`` (default) or ``"m"``.
+
+    #     Returns
+    #     -------
+    #     ``(H, W)`` ``float32`` depth image. Pixels are guaranteed to be
+    #     populated as long as the background plane covers the field of view.
+    #     """
+    #     h, w = frame_size
+
+    #     # Determine where to place the background plane.
+    #     if background_z_m is None:
+    #         if mesh_cam is None or mesh_cam.is_empty():
+    #             bg_z = max(1.0, float(background_offset_m))
+    #         else:
+    #             verts = np.asarray(mesh_cam.vertices, dtype=np.float64)
+    #             z_max = float(verts[:, 2].max()) if verts.size else 0.0
+    #             bg_z = z_max + float(background_offset_m)
+    #     else:
+    #         bg_z = float(background_z_m)
+
+    #     if bg_z <= 0.0:
+    #         raise ValueError(
+    #             f"Background plane must lie in front of the camera (z>0), got z={bg_z}"
+    #         )
+
+    #     # Build a flat rectangular background facing the camera.
+    #     half = 0.5 * float(background_size_m)
+    #     bg_vertices = np.array(
+    #         [
+    #             [-half, -half, bg_z],
+    #             [ half, -half, bg_z],
+    #             [ half,  half, bg_z],
+    #             [-half,  half, bg_z],
+    #         ],
+    #         dtype=np.float64,
+    #     )
+    #     # Two triangles, double-sided so orientation does not matter.
+    #     bg_triangles = np.array(
+    #         [
+    #             [0, 1, 2], [0, 2, 3],
+    #             [0, 2, 1], [0, 3, 2],
+    #         ],
+    #         dtype=np.int32,
+    #     )
+    #     bg_mesh = o3d.geometry.TriangleMesh(
+    #         vertices=o3d.utility.Vector3dVector(bg_vertices),
+    #         triangles=o3d.utility.Vector3iVector(bg_triangles),
+    #     )
+
+    #     # Compose the scene: input mesh + background plane.
+    #     if mesh_cam is not None and not mesh_cam.is_empty():
+    #         combined = o3d.geometry.TriangleMesh(mesh_cam) + bg_mesh
+    #     else:
+    #         combined = bg_mesh
+
+    #     return DataSource.render_mesh_depth(
+    #         combined,
+    #         cam_matrix,
+    #         frame_size,
+    #         extrinsic=None,
+    #         output_units=output_units,
+    #     )
+
     def get_item_projected(
         self,
         index: int,
@@ -1269,6 +1441,7 @@ class DataSource:
         cam_matrix, cam_dist_coeffs = self.get_intrinsics_matrix(item["json_path"])
 
         if method == "splat":
+
             cad_cloud = item.get("cad_pcd_aligned")
             if cad_cloud is None or len(cad_cloud.points) == 0:
                 log.warning(
@@ -1290,6 +1463,7 @@ class DataSource:
         
         
         elif method == "raycast":
+
             t_camera_cad = item.get("t_camera_cad")
             mesh         = self.load_cad_mesh(item["cad_path"])
             if mesh is None or t_camera_cad is None:
@@ -1304,11 +1478,15 @@ class DataSource:
                         "render_mesh_depth assumes a pinhole camera; "
                         "non-zero distortion coefficients will be ignored."
                     )
-                mesh_cam            = copy.deepcopy(mesh)
-                mesh_cam.transform(np.asarray(t_camera_cad, dtype=np.float64))
-                depth_cad_projected = self.render_mesh_depth(
-                    mesh_cam, cam_matrix, frame_size=(h, w), output_units="mm"
-                )
+                depth_projected_path = item["depth_path"].replace('.bin', '_projected.png')  # for debug visualization of projected depth maps
+                if os.path.exists(depth_projected_path):
+                    log.info(f"Item {index}: loading pre-computed projected depth from {depth_projected_path}")
+                    depth_cad_projected = cv2.imread(depth_projected_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
+                else:                    
+                    mesh_cam            = copy.deepcopy(mesh)
+                    mesh_cam.transform(np.asarray(t_camera_cad, dtype=np.float64))
+                    depth_cad_projected = self.render_mesh_depth( mesh_cam, cam_matrix, frame_size=(h, w), output_units="mm")
+                    #cv2.imwrite(depth_projected_path, depth_cad_projected.astype(np.uint16), [cv2.IMWRITE_PNG_COMPRESSION, 0])  # save projected depth for visualization  
 
         else: # method == "open3d"
 
@@ -1362,6 +1540,98 @@ class DataSource:
             plt.show()
 
         return item
+    
+
+    def get_item_and_scene_projected(
+        self,
+        index: int,
+        debug: bool = False,
+    ) -> dict[str, Any]:
+        """Return one sample with the CAD geometry + Background projected to a depth image.
+
+        Adds two fields to the item returned by :meth:`get_item`:
+
+        * ``"depth_cad_projected"`` — ``(H, W)`` ``float32`` depth in mm.
+        * ``"cad_img_projected"``   — alias kept for compatibility with the
+          legacy ``data_manager_pickle.py``.
+
+        Parameters
+        ----------
+        method : ``"splat"`` (default) projects the sampled CAD point cloud
+            with ``cv2.projectPoints`` and a z-buffer (sparse, distortion-
+            aware). ``"raycast"`` rasterizes the CAD *mesh* with
+            :meth:`render_mesh_depth` (dense, pinhole-only).
+        use_icp : when ``True`` the ICP-refined CAD alignment is used
+            (calls :meth:`load_icp_csv` if necessary).
+        """
+        item            = self.get_item(index, debug=False)
+
+        depth_img       = item["depth_img"]
+        h, w            = depth_img.shape[:2]
+
+        cam_matrix, _   = self.get_intrinsics_matrix(item["json_path"])
+
+        # load CAD
+        mesh            = self.load_cad_mesh(item["cad_path"])
+        t_camera_cad    = item["t_camera_cad"]
+        mesh_cad_cam     = copy.deepcopy(mesh)
+        mesh_cad_cam.transform(np.asarray(t_camera_cad, dtype=np.float64))
+
+        # load background mesh
+        mesh_backg      = self.load_background_mesh(mesh)        
+        mesh_backg_cam  = copy.deepcopy(mesh_backg)
+        mesh_backg_cam.transform(np.asarray(t_camera_cad, dtype=np.float64))  
+
+        # Compose the scene: input mesh + background plane.
+        #mesh_combined        = o3d.geometry.TriangleMesh(mesh_cad_cam) + mesh_backg_cam
+        mesh_combined     = mesh_cad_cam + mesh_backg_cam
+
+        # Render the depth of the combined scene.
+        depth_scene       = self.render_mesh_depth(mesh_combined, cam_matrix, frame_size=(h, w), output_units="mm")
+
+
+        item["depth_cad_projected"] = depth_scene
+        #
+        item["projection_method"] = 'raycast'
+        # show meshes and depth maps for visual inspection
+        #source.draw_point_clouds(item)
+
+        if debug:
+
+            # Object-only render (no background) for comparison / debugging.
+            depth_obj       = self.render_mesh_depth(mesh_cad_cam, cam_matrix, frame_size=(h, w), output_units="mm")
+
+            # background -only render ( background) for comparison / debugging.
+            depth_backg     = self.render_mesh_depth(mesh_backg_cam, cam_matrix, frame_size=(h, w), output_units="mm")
+        
+
+            depth_rs            = depth_img.astype(np.float32)
+            err                 = np.zeros_like(depth_rs, dtype=np.float32)
+            valid               = (depth_rs > 0) & (depth_scene > 0)
+            err[valid]          = depth_rs[valid] - depth_scene[valid]
+            self.show_subset(
+                [
+                    item.get("ir_left_img"),
+                    item.get("ir_right_img"),
+                    depth_obj,
+                    depth_rs,
+                    depth_scene,
+                    err,
+                ],
+                [
+                    "left (RS)",
+                    "right (RS)",
+                    "depth CAD (mm)",
+                    "depth RS (mm)",
+                    f"depth CAD + background (mm)",
+                    "error RS-CAD (mm)",
+                ],
+            )
+            
+            self.draw_point_clouds(item)
+            plt.show()  
+
+        return item
 
     # ------------------------------------------------------------------
     # Display helpers
@@ -1375,7 +1645,7 @@ class DataSource:
     ) -> None:
         """Display a list of images in a 2-column grid."""
         img_num = len(img_list)
-        col_num = min(img_num, 3)
+        col_num = min(img_num>>1, 3)
         row_num = int(np.ceil(img_num / col_num))
         fig, axes = plt.subplots(row_num, col_num, sharey=True, sharex=True)
         axes = np.array(axes).reshape(row_num, col_num)
@@ -1677,17 +1947,17 @@ class DataSource:
         img_points = np.asarray(img_points_list, dtype=np.float32)
 
         # Centre of detected points -> origin assumption.
-        dist_to_mean = np.sum(np.abs(img_points - np.mean(img_points, axis=0)), axis=1)
-        img_index_center = int(np.argmin(dist_to_mean))
-        img_center_pixel = img_points[img_index_center].copy()
+        dist_to_mean        = np.sum(np.abs(img_points - np.mean(img_points, axis=0)), axis=1)
+        img_index_center    = int(np.argmin(dist_to_mean))
+        img_center_pixel    = img_points[img_index_center].copy()
         img_points_centered = img_points - img_center_pixel
 
         cam_matrix, dist_coeffs = self.get_intrinsics_matrix(json_path)
 
-        img_radii = np.linalg.norm(img_points_centered, axis=1)
-        cad_radii = np.linalg.norm(cad_points, axis=1)
-        img_index_sorted = np.argsort(img_radii)
-        cad_index_sorted = np.argsort(cad_radii)
+        img_radii           = np.linalg.norm(img_points_centered, axis=1)
+        cad_radii           = np.linalg.norm(cad_points, axis=1)
+        img_index_sorted    = np.argsort(img_radii)
+        cad_index_sorted    = np.argsort(cad_radii)
 
         n_match_points = 7
         rvec = np.zeros(3, dtype=np.float64)
@@ -1878,6 +2148,85 @@ class TestDataSource(unittest.TestCase):
         # Open3D produces a fully dense silhouette: at least one pixel hit.
         self.assertGreater(int(np.count_nonzero(out["depth_cad_projected"])), 0)
 
+    def test_get_item_and_scene(self):
+        """Smoke-test :meth:`DataSource.render_scene_depth`.
+
+        Loads one item, transforms the CAD mesh into the camera frame, and
+        renders a depth image containing the object plus a flat background
+        rectangle. Validates the output shape and that both the object and
+        the background contribute pixels.
+        """
+        source          = DataSource()
+        count           = source.init_directory()
+        self.assertTrue(count > 0)
+
+        item_id         = int(np.random.randint(0, count))
+        item            = source.get_item(item_id, debug=False)
+
+        depth_img       = item["depth_img"]
+        self.assertIsNotNone(depth_img)
+        h, w            = depth_img.shape[:2]
+
+        cam_matrix, _   = source.get_intrinsics_matrix(item["json_path"])
+
+        # load CAD
+        mesh            = source.load_cad_mesh(item["cad_path"])
+        t_camera_cad    = item["t_camera_cad"]
+        self.assertIsNotNone(mesh)
+        self.assertIsNotNone(t_camera_cad)
+        mesh_cad_cam        = copy.deepcopy(mesh)
+        mesh_cad_cam.transform(np.asarray(t_camera_cad, dtype=np.float64))
+
+        # load background mesh
+        mesh_backg      = source.load_background_mesh(mesh)
+        self.assertIsNotNone(mesh_backg)
+        self.assertIsNotNone(t_camera_cad)
+        mesh_backg_cam        = copy.deepcopy(mesh_backg)
+        mesh_backg_cam.transform(np.asarray(t_camera_cad, dtype=np.float64))  
+
+        # Compose the scene: input mesh + background plane.
+        #mesh_combined        = o3d.geometry.TriangleMesh(mesh_cad_cam) + mesh_backg_cam
+        mesh_combined        = mesh_cad_cam + mesh_backg_cam
+
+        # Render the depth of the combined scene.
+        depth_scene         = source.render_mesh_depth(mesh_combined, cam_matrix, frame_size=(h, w), output_units="mm")
+
+        self.assertEqual(depth_scene.shape, (h, w))
+        self.assertEqual(depth_scene.dtype, np.float32)
+        # Background should fill (almost) every pixel.
+        self.assertGreater(int(np.count_nonzero(depth_scene)), int(0.9 * h * w))
+
+        # Object-only render (no background) for comparison / debugging.
+        depth_obj       = source.render_mesh_depth(mesh_cad_cam, cam_matrix, frame_size=(h, w), output_units="mm")
+        obj_pixels      = int(np.count_nonzero(depth_obj))
+        self.assertGreater(obj_pixels, 0)
+
+        # background -only render ( background) for comparison / debugging.
+        depth_backg     = source.render_mesh_depth(mesh_backg_cam, cam_matrix, frame_size=(h, w), output_units="mm")
+        backg_pixels = int(np.count_nonzero(depth_backg))        
+
+        # show meshes and depth maps for visual inspection
+        #source.draw_point_clouds(item)
+
+        source.show_subset(
+            [depth_img.astype(np.float32), depth_obj, depth_scene, depth_backg],
+            ["depth RS (mm)", "depth CAD only (mm)", "depth CAD+bg (mm)", "depth background only (mm)"],
+            suptitle=f"render_scene_depth (item {item_id})",
+        )
+        plt.show()
+
+    def test_get_item_and_scene_projected(self):
+        source = DataSource()
+        count = source.init_directory()
+        self.assertTrue(count > 0)
+        item_id = np.random.randint(0, count)
+        out = source.get_item_and_scene_projected(item_id, debug=True)
+        self.assertIn("depth_cad_projected", out)
+        self.assertEqual(out["projection_method"], "raycast")
+        self.assertEqual(out["depth_cad_projected"].shape, out["depth_img"].shape)
+        # Raycast produces a fully dense silhouette: at least one pixel hit.
+        self.assertGreater(int(np.count_nonzero(out["depth_cad_projected"])), 0)
+
     def test_project_on_camera(self):
         # NOTE: Open3D's ``OffscreenRenderer`` (Filament backend) is not
         # supported on Windows wheels (it requires EGL headless). On Windows
@@ -2019,15 +2368,18 @@ def RunTest() -> None:
     # tst.test_get_item() # ok
     # tst.test_show_images() # ok
     #tst.test_draw_scene() # ok
-    tst.test_get_item_projected() # ok
+    #tst.test_get_item_projected() # ok
     #tst.test_get_item_projected_raycast() # ok
     #tst.test_get_item_projected_open3d()
+    #tst.test_get_item_and_scene() # ok
+    tst.test_get_item_and_scene_projected()
+
     #tst.test_project_on_camera()
     # tst.test_show_icp_alignment()
     #tst.test_get_item_icp_projected()
     # tst.test_get_grid_coordinates()
     # tst.test_match_grid_to_cad()
-
+    
 
 if __name__ == "__main__":
     RunTest()
