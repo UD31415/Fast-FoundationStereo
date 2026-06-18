@@ -463,12 +463,12 @@ class DataSource:
         if self.train_mode:
             episode_dirs = sorted(
                 p for p in self.root.iterdir()
-                if p.is_dir() and (episodes is None or p.name in episodes)
+                if p.is_dir() and (episodes is None or p.name not in episodes)
             )
         else:
             episode_dirs = sorted(
                 p for p in self.root.iterdir()
-                if p.is_dir() and (episodes is None or p.name not in episodes)
+                if p.is_dir() and (episodes is None or p.name  in episodes)
             )
 
         view_names = views if views is not None else KNOWN_VIEWS
