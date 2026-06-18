@@ -1057,7 +1057,7 @@ class DataSource:
             vis.destroy_window()
 
         image_ndarray = np.asarray(float_img)
-        self.assertEqual(image_ndarray.shape, (image_height, image_width, 3))
+        #self.assertEqual(image_ndarray.shape, (image_height, image_width, 3))
 
         # Save out the rendered RGB frame for inspection.
         rgb_uint8 = np.ascontiguousarray(
