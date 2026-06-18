@@ -67,6 +67,36 @@ log.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=log.INF
 
 
 # ---------------------------------------------------------------------------
+# Path translation: Windows UNC -> local POSIX mount
+# ---------------------------------------------------------------------------
+# Maps the UNC roots stored inside the Excel manifest and scene JSONs to the
+# mount points used on the current host. Add new entries here if more shares
+# get mounted under different local roots.
+UNC_TO_POSIX_MAP: dict[str, str] = {
+    r"\\svm.realsenseai.com\RealSense_Validation": "/mnt/validation",
+}
+
+
+def translate_path(p: str | os.PathLike[str] | None) -> str:
+    """Translate a Windows UNC path to its local POSIX equivalent.
+
+    Non-string / empty / already-POSIX paths are returned unchanged (as ``str``).
+    """
+    if p is None:
+        return ""
+    s = str(p)
+    if not s:
+        return s
+    if os.sep == "/" and ("\\" in s or s.startswith("\\\\")):
+        for unc_root, posix_root in UNC_TO_POSIX_MAP.items():
+            if s.lower().startswith(unc_root.lower()):
+                s = posix_root + s[len(unc_root):]
+                break
+        s = s.replace("\\", "/")
+    return s
+
+
+# ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
 # set 1 - with aligned data
@@ -615,11 +645,11 @@ class DataSource:
         self._cad_mesh_cache.clear()
 
         if json_paths is not None:
-            session_jsons: list[str] = [str(p) for p in json_paths]
+            session_jsons: list[str] = [translate_path(p) for p in json_paths]
             self.excel_path = None
             self.manifest_df = None
         else:
-            self.excel_path = Path(excel_path)
+            self.excel_path = Path(translate_path(excel_path))
             if not self.excel_path.exists():
                 log.error(f"Manifest Excel does not exist: {self.excel_path}")
                 return 0
@@ -629,7 +659,7 @@ class DataSource:
             mask = df["Label"].astype(str) == LABEL_RAW
             # if stl_name is not None:
             #     mask &= df["STL name"].astype(str) == str(stl_name)
-            session_jsons = [str(p) for p in df.loc[mask, "Data Path"].tolist()]
+            session_jsons = [translate_path(p) for p in df.loc[mask, "Data Path"].tolist()]
 
         #self.stl_name = stl_name
 
@@ -662,14 +692,14 @@ class DataSource:
             return
 
         cad_name = scene.get("cad_name", "")
-        cad_path = scene.get("cad_path", "")
+        cad_path = translate_path(scene.get("cad_path", ""))
         t_camera_tooltip = np.array(scene.get("t_camera_tooltip", np.eye(4)), dtype=np.float64)
         intrinsics = scene.get("intrinsics", {}) or {}
         baseline_mm = scene.get("baseline", 0.05) * 1000.0
         bf         = baseline_mm * intrinsics.get("fx", 660.0)
 
 
-        baseline_mm = scene.get("baseline", 0.05) * 1000.0
+        #baseline_mm = scene.get("baseline", 0.05) * 1000.0
         self.sessions[str(path)] = {
             "scene"         : scene,
             "cad_path"      : cad_path,
@@ -703,7 +733,7 @@ class DataSource:
         }
         for img in capture.get("images", []) or []:
             kind = img.get("image_type", "")
-            p = img.get("path", "") or ""
+            p = translate_path(img.get("path", "") or "")
             if kind == IMG_TYPE_IR_LEFT:
                 out["ir_left_path"] = p
             elif kind == IMG_TYPE_IR_RIGHT:
@@ -1205,7 +1235,6 @@ class DataSource:
         self,
         index: int,
         debug: bool = False,
-        use_icp: bool = False,
         method: str = "splat",
     ) -> dict[str, Any]:
         """Return one sample with the CAD geometry projected to a depth image.
@@ -1228,8 +1257,6 @@ class DataSource:
         if method not in ("splat", "raycast","open3d"):
             raise ValueError(f"Unknown projection method: {method!r}")
 
-        if use_icp and self.icp_table is None:
-            self.load_icp_csv()
 
         item        = self.get_item(index, debug=False)
 
@@ -1242,9 +1269,7 @@ class DataSource:
         cam_matrix, cam_dist_coeffs = self.get_intrinsics_matrix(item["json_path"])
 
         if method == "splat":
-            cad_cloud = (
-                item.get("cad_pcd_aligned_icp") if use_icp else item.get("cad_pcd_aligned")
-            )
+            cad_cloud = item.get("cad_pcd_aligned")
             if cad_cloud is None or len(cad_cloud.points) == 0:
                 log.warning(
                     f"Item {index}: no aligned CAD cloud available; "
@@ -1252,15 +1277,21 @@ class DataSource:
                 )
                 depth_cad_projected = np.zeros((h, w), dtype=np.float32)
             else:
-                cad_points_cam      = np.asarray(cad_cloud.points, dtype=np.float32)
-                depth_cad_projected = self.project_3d_to_camera_depth(
-                    cad_points_cam, cam_matrix, cam_dist_coeffs, frame_size=(h, w)
-                )
+                cad_points_cam       = np.asarray(cad_cloud.points, dtype=np.float32)
+                depth_projected_path = item["depth_path"].replace('.bin', '_projected.png')  # for debug visualization of projected depth maps
+                if os.path.exists(depth_projected_path):
+                    log.info(f"Item {index}: loading pre-computed projected depth from {depth_projected_path}")
+                    depth_cad_projected = cv2.imread(depth_projected_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
+                else:
+                    depth_cad_projected = self.project_3d_to_camera_depth(
+                        cad_points_cam, cam_matrix, cam_dist_coeffs, frame_size=(h, w)
+                    )
+                    #cv2.imwrite(depth_projected_path, depth_cad_projected.astype(np.uint16), [cv2.IMWRITE_PNG_COMPRESSION, 0])  # save projected depth for visualization  
+        
+        
         elif method == "raycast":
-            t_camera_cad = (
-                item.get("t_camera_cad_icp") if use_icp else item.get("t_camera_cad")
-            )
-            mesh = self.load_cad_mesh(item["cad_path"])
+            t_camera_cad = item.get("t_camera_cad")
+            mesh         = self.load_cad_mesh(item["cad_path"])
             if mesh is None or t_camera_cad is None:
                 log.warning(
                     f"Item {index}: no mesh or pose for raycast; "
@@ -1280,9 +1311,8 @@ class DataSource:
                 )
 
         else: # method == "open3d"
-            t_camera_cad = (
-                item.get("t_camera_cad_icp") if use_icp else item.get("t_camera_cad")
-            )
+
+            t_camera_cad = item.get("t_camera_cad")
             mesh = self.load_cad_mesh(item["cad_path"])
             if mesh is None or t_camera_cad is None:
                 log.warning(
@@ -1327,8 +1357,9 @@ class DataSource:
                     "error RS-CAD (mm)",
                 ],
             )
-            plt.show()
+            
             self.draw_point_clouds(item)
+            plt.show()
 
         return item
 

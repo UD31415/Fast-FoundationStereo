@@ -31,16 +31,18 @@ import cv2
 from torch.utils.data import Dataset, DataLoader, random_split
 from core.utils.utils import InputPadder
 import Utils as U
-from scripts.data_manager_pickle_new import DataSource
+from scripts.data_manager_pickle import DataSource
 
 
 # ── constants ────────────────────────────────────────────────────────────────
 
 PICKLE_DIR    = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/pickle_datasets/pickle_basic_objects'
+
+# adiroha machine
 PICKLE_DIR    = (
-    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
-    r"\yg_pickle\2026-06-18--10-01-03\Pickle_Scene_Capture_336222073841"
-    r"\data path.xlsx"
+    r"/mnt/validation/VIDB/IQ_AUTO/IQLab0/2026_06"
+    r"/yg_pickle/2026-06-18--10-01-03/Pickle_Scene_Capture_336222073841"
+    r"/data path.xlsx"
 )
 # MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 # OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415.pth'
@@ -51,10 +53,10 @@ OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle.pth'
 # BF         = 49.8624*385.73  # D435 - focal_px * baseline_mm (calibrated from camera)  # D435 - focal_px * baseline_mm (calibrated from camera)
 #BF         = 50.102706998586 * 385.509887695312 # new data 2
 #BF         = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18
-EPOCHS     = 50
-LR         = 2e-5
-ITERS      = 8          # GRU iterations (same as inference)
-GAMMA      = 0.9        # sequence loss weight decay
+EPOCHS      = 50
+LR          = 2e-5
+ITERS       = 8          # GRU iterations (same as inference)
+GAMMA       = 0.9        # sequence loss weight decay
 TRAIN_RATIO = 0.75
 SPLIT_SEED  = 0
 
@@ -167,17 +169,19 @@ class PickleDataset(Dataset):
         return self.source.__len__()
 
     def __getitem__(self, idx):
-        data  = self.source.get_item(idx)  # 2026-04
+        #data  = self.source.get_item(idx)  # 2026-04
+        data  = self.source.get_item_projected(idx) 
         #data  = self.source.get_item_transformed_and_projected(idx)  # 2026-05-18 with plane fitting
         left  = data['ir_left_img']
         right = data['ir_right_img']
-        depth = data['depth_gt_img']   # 
+        depth = data['depth_img']   #
         bf    = data['bf']                 # float32, mm*px
 
-        # Resize Zivid depth to match RealSense stereo image resolution
+        # Resize depth to match RealSense stereo image resolution
         h, w  = left.shape[:2]
         if depth.shape != (h, w):
-            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+            #depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+            raise ValueError(f"Depth shape {depth.shape} does not match left image shape {(h, w)}.")
 
         # IR uint8 → float [0, 255], replicate to 3-channel pseudo-RGB
         left  = np.clip(left.astype(np.float32),  0, 255)
