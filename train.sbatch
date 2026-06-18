@@ -12,4 +12,4 @@
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate ffs
-srun python3 scripts/finetune_inbolt_data_0518.py
+srun python3 scripts/finetune_isaac.py

@@ -98,7 +98,7 @@ DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_isaac_fs_rs'
 
 # ISAC dataset filtering (see data_manager_isaac.KNOWN_VIEWS = front/overhead/side/wrist)
 DEFAULT_VIEWS: Tuple[str, ...] = ('wrist',) #('front', 'overhead', 'side', 'wrist')
-DEFAULT_EPISODES: Tuple[str, ...] = ('episode_12','episode_16',)      # empty == all episodes
+DEFAULT_EPISODES: Tuple[str, ...] = ('episode_12','episode_16','episode_18',)      # empty == all episodes
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {DEVICE}")
