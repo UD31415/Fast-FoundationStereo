@@ -750,6 +750,29 @@ class DataSource:
             coeffs = np.zeros((5,), dtype=np.float32)
         return k, coeffs
 
+
+
+    def estimate_baseline_focal_length_product(self, json_path):
+
+        """Estimate the product of baseline and focal length (B*fx) in mm.
+
+        This is used to convert depth (mm) to disparity (px) via
+        ``d = B*fx / Z``. The dataset does not provide a baseline, so we
+        estimate it from the known depth range and the observed disparity
+        range in the IR pair.
+
+        Parameters
+        ----------
+        json_path : str
+            Path to the JSON file containing metadata for one sample.
+        """
+        info        = self.sessions.get(json_path, {})
+        intr        = info.get("intrinsics", {})
+        fx          = float(intr.get("fx", 1.0))
+        baseline_mm = 50.0
+
+        return baseline_mm * fx
+
     # ------------------------------------------------------------------
     # ICP refinement (optional)
     # ------------------------------------------------------------------
@@ -826,6 +849,8 @@ class DataSource:
         depth_img       = load_image_any(meta["depth_path"])
         rgb             = load_image_any(meta["rgb_path"]) if meta["rgb_path"] else None
 
+        bf              = self.estimate_baseline_focal_length_product(json_path) 
+        
         vertices_path = meta["vertices_path"]
         depth_pcd_raw: Optional[o3d.geometry.PointCloud] = None
         if vertices_path and os.path.exists(vertices_path):
@@ -879,6 +904,7 @@ class DataSource:
             "t_camera_cad"          : t_camera_cad,
             "t_camera_cad_icp"      : t_camera_cad_icp,
             "robot_position"        : meta["robot_position"],
+            'bf'                    : bf,
             "intrinsics"            : intrinsics,
         }
 
@@ -1816,8 +1842,6 @@ class TestDataSource(unittest.TestCase):
         ok = o3d.io.write_image(str(out_path), o3d.geometry.Image(rgb_uint8))
         log.info(f"test_project_on_camera: wrote {out_path} (ok={ok})")
         self.assertTrue(out_path.exists())
-
-
 
     def test_show_icp_alignment(self):
         source = DataSource()

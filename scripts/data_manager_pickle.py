@@ -1,58 +1,104 @@
-"""
-Dataset management for Pickle scene capture dataset.
+"""Dataset management for the ISAC (Pickle) scene-capture dataset.
 
-Refactored to class style (similar to data_manager_inbolt.py):
-- `DataSource.init_directory(...)` loads scene JSON and preloads all captures.
-- `DataSource.get_item(index)` returns one sample.
-- Includes unittest test functions and a small RunTest helper.
+This module is compatible with the data layout consumed by
+``scripts/Uri_26_06_17.py``:
+
+* A top-level Excel manifest (``data path.xlsx``) lists every artefact
+  produced by a capture session. Relevant columns:
+
+      - ``Label``: ``"raw data (json file)"``, ``"ICP"``, ...
+      - ``STL name``: e.g. ``"cube_100x100x100"`` (used to filter captures).
+      - ``Data Path``: path to a per-session JSON or ICP CSV.
+
+* Each JSON file describes one capture session and contains:
+
+      - ``cad_path``           — STL of the scanned object (mm).
+      - ``t_camera_tooltip``   — hand-eye calibration (camera ← tooltip).
+      - ``intrinsics``         — ``{fx, fy, ppx, ppy, [coeffs]}``.
+      - ``captures[]``         — list of frames, each with:
+            ``images``         — list of ``{image_type, path}`` entries
+                                 (``Vertices``, ``Depth``, ``IR``, ``RightIR``,
+                                 ``RGB8``).
+            ``robot_position`` — ``{x, y, z, rx, ry, rz}`` (mm / degrees).
+
+  ``t_camera_cad`` is reconstructed from the robot pose using two
+  dataset-level calibration constants (``T_CAD_TO_USER``, ``T_USER_TO_BASE``)
+  via the chain ``T_tooltip_camera @ T_base_to_tool @ T_user_to_base @
+  T_cad_to_user`` — see :func:`compose_t_camera_cad`.
+
+* Each ICP CSV row corresponds to a capture index and provides
+  ``t_camera_cad`` and ``icp_matrix`` so a refined ``t_camera_cad`` can be
+  built as ``icp_matrix @ t_camera_cad``.
+
+The :class:`DataSource` mirrors the API used by the other ``data_manager_*``
+scripts in this repo:
+
+* :meth:`DataSource.init_directory` indexes the manifest and caches per-
+  session metadata.
+* :meth:`DataSource.get_item` returns one fully loaded sample (IR pair,
+  depth, back-projected point cloud, CAD aligned to the camera frame).
+* :meth:`DataSource.get_item_with_icp` returns the same item with the
+  ICP-refined CAD alignment populated when an ICP CSV is available.
+* :class:`TestDataSource` provides ``unittest`` smoke tests.
 """
 
 from __future__ import annotations
 
 import ast
-import ast
 import copy
 import json
 import logging as log
-import matplotlib.pyplot as plt
+import os
 import re
 import unittest
 from pathlib import Path
-from typing import Any, Optional, Union
-import os
+from typing import Any, Optional, Sequence
+
+import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import open3d as o3d
-import cv2
 import pandas as pd
-#from rosbags import image
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 
 
 log.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=log.INFO)
 
-#%% Helper functions for loading and processing data items.
 
-def compose_t_camera_cad(
-    t_camera_tooltip: np.ndarray,
-    t_tooltip_cad_raw: np.ndarray,
-) -> np.ndarray:
-    """Build camera→CAD transform from camera→tooltip and tooltip→CAD.
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
 
-    Recompose tooltip→CAD as translate-then-rotate to preserve the intended
-    offset behavior before applying rotation.
-    """
-    t_rot = np.eye(4, dtype=np.float64)
-    t_rot[:3, :3] = t_tooltip_cad_raw[:3, :3]
-    t_trans = np.eye(4, dtype=np.float64)
-    t_trans[:3, 3] = t_tooltip_cad_raw[:3, 3]
+DEFAULT_EXCEL = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
+    r"\yg_pickle\2026-06-16--15-12-54\Pickle_Scene_Capture_336222073841"
+    r"\data path.xlsx"
+)
+DEFAULT_STL_NAME = "cube_100x100x100"
 
-    t_tooltip_cad = t_rot @ t_trans
-    #t_camera_cad = t_camera_tooltip @ t_tooltip_cad
-    t_camera_cad = t_camera_tooltip @ t_tooltip_cad
-    return t_camera_cad
+LABEL_RAW = "raw data (json file)"
+LABEL_ICP = "ICP"
+
+# Image type strings used inside the per-session JSON.
+IMG_TYPE_VERTICES = "Vertices"
+IMG_TYPE_DEPTH = "Depth"
+IMG_TYPE_IR_LEFT = "IR"
+IMG_TYPE_IR_RIGHT = "RightIR"
+IMG_TYPE_RGB = "RGB8"
+MAX_Z_DISTANCE_MM = 1200  # max z to show
+
+
+# ---------------------------------------------------------------------------
+# File-format helpers
+# ---------------------------------------------------------------------------
+
+_RES_RE = re.compile(r"(\d+)x(\d+)")
+
 
 def parse_resolution(filename: str) -> tuple[int, int]:
-    """Return (width, height) extracted from a name like `..._1280x720_...`."""
-    match = re.search(r"(\d+)x(\d+)", filename)
+    """Return ``(width, height)`` parsed from a ``..._1280x720_...`` filename."""
+    match = _RES_RE.search(filename)
     if not match:
         raise ValueError(
             f"Cannot parse resolution from filename: {filename!r}. "
@@ -60,8 +106,9 @@ def parse_resolution(filename: str) -> tuple[int, int]:
         )
     return int(match.group(1)), int(match.group(2))
 
+
 def load_vertices_to_pcd(path: Path) -> o3d.geometry.PointCloud:
-    """Load Vertices `.bin` and convert valid XYZ points into Open3D point cloud."""
+    """Load a ``Vertices`` ``.bin`` file and return an Open3D point cloud (m)."""
     width, height = parse_resolution(path.name)
     pixel_data_bytes = width * height * 3 * 4  # float32 xyz
 
@@ -72,88 +119,213 @@ def load_vertices_to_pcd(path: Path) -> o3d.geometry.PointCloud:
             f"for {width}x{height} vertices, got {len(raw)}."
         )
 
-    xyz_flat    = np.frombuffer(raw[:pixel_data_bytes], dtype=np.float32).copy()
-    xyz         = xyz_flat.reshape(height * width, 3)
+    xyz_flat = np.frombuffer(raw[:pixel_data_bytes], dtype=np.float32).copy()
+    xyz = xyz_flat.reshape(height * width, 3)
 
-    valid       = xyz[:, 2] != 0.0
-    xyz         = xyz[valid] * 0.001  # mm -> m
+    valid = (xyz[:, 2] != 0.0) & (xyz[:, 2] < MAX_Z_DISTANCE_MM)
+    xyz = xyz[valid] * 0.001  # mm -> m
 
-    # Match previous convention used by this script.
-    #xyz[:, 1] *= -1
-    #xyz[:, 2] *= -1
-
-    pcd             = o3d.geometry.PointCloud()
-    pcd.points      = o3d.utility.Vector3dVector(xyz.astype(np.float64))
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64))
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
     )
     return pcd
 
-def read_bin_file_with_metadata_from_stav(path: str, fsize: tuple[int, int], fbpp: int) -> tuple[np.ndarray, dict[str, Any]]:
-    """Read binary image file with metadata appended after pixel data."""
+
+def read_bin_image_with_metadata(
+    path: str, fsize: tuple[int, int], fbpp: int
+) -> tuple[Optional[np.ndarray], bytes]:
+    """Read a raw ``.bin`` image with optional trailing metadata bytes."""
     pixel_count = fsize[0] * fsize[1]
     pixel_data_bytes = pixel_count * (fbpp // 8)
 
     raw = Path(path).read_bytes()
     if len(raw) < pixel_data_bytes:
-        raise ValueError(
-            f"File too small: expected at least {pixel_data_bytes} bytes "
-            f"for {fsize[0]}x{fsize[1]} image with {fbpp} bpp, got {len(raw)}."
+        log.warning(
+            f"BIN file too small: expected {pixel_data_bytes} bytes for "
+            f"{fsize[0]}x{fsize[1]} image with {fbpp} bpp, got {len(raw)}."
         )
+        return None, b""
 
-    img = np.frombuffer(raw[:pixel_data_bytes], dtype=np.uint16 if fbpp == 16 else np.uint8)
-    img = img.reshape(fsize[1], fsize[0])  # height x width
-
-    metadata_raw = raw[pixel_data_bytes:]
-    metadata_str = metadata_raw.decode('utf-8', errors='ignore')
-    metadata = json.loads(metadata_str) if metadata_str else {}
-
-    return img, metadata
-
-def read_bin_file_with_metadata(fname, Size=(640, 480), bpp=16):
-    """Reads a binary file and returns it as a NumPy array.
-
-    Args:
-        fname (str): The name of the file to read.
-        Size (tuple): The size of the image (width, height).
-        bpp (int): The number of bits per pixel.
-
-    Returns:
-        np.ndarray: The image data as a NumPy array.
-        np.ndarray: The meta data as a NumPy array uint8.
-    """
-
-    try:
-        f = open(fname, 'rb')
-    except IOError:
-        print("Error: Could not open file", fname)
-        return None, None
-
-    if bpp > 32:
-        dtype = np.uint64
-    elif bpp > 16:
-        dtype = np.uint32
-    elif bpp > 8:
+    if fbpp == 16:
         dtype = np.uint16
+    elif fbpp == 24:
+        dtype = np.uint8
     else:
         dtype = np.uint8
 
+    img_flat = np.frombuffer(raw[:pixel_data_bytes], dtype=dtype).copy()
+    if fbpp == 24:
+        img = img_flat.reshape(fsize[1], fsize[0], 3)
+    else:
+        img = img_flat.reshape(fsize[1], fsize[0])
+    return img, raw[pixel_data_bytes:]
+
+
+def _decode_bin_layout(path: str) -> tuple[tuple[int, int], int]:
+    """Heuristically decode ``(width, height)`` and ``bpp`` from a bin path."""
+    name = os.path.basename(path)
     try:
-        A = np.fromfile(f, dtype=dtype, count=Size[0] * Size[1]).reshape(Size[::-1])
-        H = np.fromfile(f, dtype=np.uint8, count=2500)
-    except Exception as e:
-        print(f"Error reading file {fname}: {e}")
-        return None,None
+        fsize = parse_resolution(name)
+    except ValueError:
+        fsize = (640, 480)
 
-    if bpp > 8:
-        A = np.bitwise_and(A, 2**bpp - 1)
+    upper = name
+    if "Depth" in upper:
+        fbpp = 16
+    elif "RightIR" in upper or "IR" in upper:
+        fbpp = 8
+    elif "RGB" in upper:
+        fbpp = 24
+    else:
+        fbpp = 8
+        log.warning(f"Cannot determine image bpp from filename: {path}")
+    return fsize, fbpp
 
-    f.close()
-    string_meta = [chr(i) for i in H]
-    meta_data   = ''.join(string_meta)
-    #print(meta_data)
 
-    return A,H
+def load_image_any(path: str) -> Optional[np.ndarray]:
+    """Read an image given a ``.png``/``.jpg``/``.bin`` path."""
+    if not path or not os.path.exists(path):
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".png", ".jpg", ".jpeg", ".bmp", ".tiff"):
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            log.warning(f"cv2.imread returned None for: {path}")
+        return img
+    if ext == ".bin":
+        fsize, fbpp = _decode_bin_layout(path)
+        img, _ = read_bin_image_with_metadata(path, fsize, fbpp)
+        return img
+    log.warning(f"Unsupported image format: {path}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pose helpers (mirroring the convention used by ``Uri_26_06_17.py``)
+# ---------------------------------------------------------------------------
+
+# Dataset-level calibration constants from ``Uri_26_06_17.py``. They describe
+# the CAD-frame placement on the calibration target (``T_CAD_TO_USER``) and
+# the rigid transform from the user (calibration) frame to the robot base
+# (``T_USER_TO_BASE``). They are constant across every capture session in the
+# 2026-06-16 dataset.
+T_CAD_TO_USER = np.array(
+    [
+        [9.99999959e-01,  9.09367280e-05, -2.72211424e-04,  4.26479000e-01],
+        [9.07571176e-05, -9.99999778e-01, -6.59759117e-04, -5.75152000e-01],
+        [-2.72271360e-04, 6.59734385e-04, -9.99999745e-01,  4.60300000e-03],
+        [0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  1.00000000e+00],
+    ],
+    dtype=np.float64,
+)
+
+T_USER_TO_BASE = np.array(
+    [
+        [9.99943033e-01,  5.68845315e-03,  9.03171840e-03,  4.52634000e-01],
+        [5.68252948e-03, -9.99983622e-01,  6.81399922e-04, -5.87378000e-01],
+        [9.03544659e-03, -6.30038099e-04, -9.99958981e-01, -4.18047000e-01],
+        [0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  1.00000000e+00],
+    ],
+    dtype=np.float64,
+)
+
+
+def _invert_rigid(t: np.ndarray) -> np.ndarray:
+    """Return the inverse of a 4x4 rigid transform."""
+    r = t[:3, :3]
+    p = t[:3, 3]
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = r.T
+    out[:3, 3] = -r.T @ p
+    return out
+
+
+def build_t_tool_to_base(robot_position: dict[str, Any]) -> np.ndarray:
+    """Build ``T_tool_to_base`` from a ``robot_position`` dict.
+
+    Reproduces the construction from ``Uri_26_06_17.py``:
+
+    * ``x, y, z`` are in millimetres and are converted to metres.
+    * ``rx, ry, rz`` are extrinsic Euler angles in degrees and the rotation
+      is composed as ``R = Rz @ Ry @ Rx``.
+    """
+    t_be = np.array(
+        [
+            float(robot_position.get("x", 0.0)),
+            float(robot_position.get("y", 0.0)),
+            float(robot_position.get("z", 0.0)),
+        ],
+        dtype=np.float64,
+    ) / 1000.0
+
+    rx = np.deg2rad(float(robot_position.get("rx", 0.0)))
+    ry = np.deg2rad(float(robot_position.get("ry", 0.0)))
+    rz = np.deg2rad(float(robot_position.get("rz", 0.0)))
+
+    r_x = np.array(
+        [
+            [1.0, 0.0,        0.0       ],
+            [0.0, np.cos(rx), -np.sin(rx)],
+            [0.0, np.sin(rx),  np.cos(rx)],
+        ],
+        dtype=np.float64,
+    )
+    r_y = np.array(
+        [
+            [ np.cos(ry), 0.0, np.sin(ry)],
+            [ 0.0,        1.0, 0.0       ],
+            [-np.sin(ry), 0.0, np.cos(ry)],
+        ],
+        dtype=np.float64,
+    )
+    r_z = np.array(
+        [
+            [np.cos(rz), -np.sin(rz), 0.0],
+            [np.sin(rz),  np.cos(rz), 0.0],
+            [0.0,         0.0,        1.0],
+        ],
+        dtype=np.float64,
+    )
+    r_be = r_z @ r_y @ r_x
+
+    t_tool_to_base = np.eye(4, dtype=np.float64)
+    t_tool_to_base[:3, :3] = r_be
+    t_tool_to_base[:3, 3] = t_be
+    return t_tool_to_base
+
+
+def compose_t_camera_cad(
+    t_camera_tooltip: np.ndarray,
+    robot_position: dict[str, Any],
+    t_cad_to_user: np.ndarray = T_CAD_TO_USER,
+    t_user_to_base: np.ndarray = T_USER_TO_BASE,
+) -> np.ndarray:
+    """Build ``T_camera_cad`` exactly like ``Uri_26_06_17.py``.
+
+    The chain is:
+
+        T_camera_cad = T_tooltip_camera
+                       @ T_base_to_tool
+                       @ T_user_to_base
+                       @ T_cad_to_user
+
+    where ``T_tooltip_camera`` is the inverse of the hand-eye calibration
+    (``t_camera_tooltip``) and ``T_base_to_tool`` is the inverse of
+    :func:`build_t_tool_to_base` applied to the robot pose.
+    """
+    t_tooltip_camera = _invert_rigid(
+        np.asarray(t_camera_tooltip, dtype=np.float64)
+    )
+    t_tool_to_base = build_t_tool_to_base(robot_position)
+    t_base_to_tool = _invert_rigid(t_tool_to_base)
+    return (
+        t_tooltip_camera
+        @ t_base_to_tool
+        @ np.asarray(t_user_to_base, dtype=np.float64)
+        @ np.asarray(t_cad_to_user, dtype=np.float64)
+    )
 
 def interpolate_points_to_grid(
     u: np.ndarray,
@@ -211,398 +383,716 @@ def interpolate_points_to_grid(
     )
     return grid_z.astype(np.float32)
 
-def interp_splat_close(u, v, z, image_size, kernel=3):
-    h, w = image_size
-    img = np.zeros((h, w), np.float32)
-    lin = v.astype(np.int32) * w + u.astype(np.int32)
-    buf = np.full(h * w, np.inf, np.float32)
-    np.minimum.at(buf, lin, z.astype(np.float32))
-    img = np.where(np.isfinite(buf), buf, 0).reshape(h, w)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel, kernel))
-    return cv2.morphologyEx(img, cv2.MORPH_CLOSE, k)
 
-def mesh_to_depth_o3d(mesh: o3d.geometry.TriangleMesh,
-                      cam_matrix: np.ndarray,
-                      image_size: tuple[int, int],
-                      extrinsic: np.ndarray = np.eye(4)) -> np.ndarray:
-    h, w = image_size
-    fx, fy = cam_matrix[0, 0], cam_matrix[1, 1]
-    cx, cy = cam_matrix[0, 2], cam_matrix[1, 2]
+# ---------------------------------------------------------------------------
+# Generic depth / mask helpers (kept from the previous version of this file)
+# ---------------------------------------------------------------------------
 
-    scene = o3d.t.geometry.RaycastingScene()
-    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+def depth_to_point_cloud(
+    depth_mm: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    color_img: Optional[np.ndarray] = None,
+    depth_scale_m: float = 1.0e-3,
+    z_min_m: float = 0.05,
+    z_max_m: float = 10.0,
+) -> o3d.geometry.PointCloud:
+    """Back-project a uint16/float depth image (mm) to an Open3D point cloud."""
+    if depth_mm.ndim != 2:
+        raise ValueError(f"depth_mm must be 2D, got shape {depth_mm.shape}")
 
-    rays = scene.create_rays_pinhole(
-        intrinsic_matrix=o3d.core.Tensor(cam_matrix, o3d.core.Dtype.Float64),
-        extrinsic_matrix=o3d.core.Tensor(extrinsic,  o3d.core.Dtype.Float64),
-        width_px=w, height_px=h,
+    h, w = depth_mm.shape
+    z = depth_mm.astype(np.float32) * float(depth_scale_m)
+
+    valid = (z > z_min_m) & (z < z_max_m) & np.isfinite(z)
+    if not np.any(valid):
+        return o3d.geometry.PointCloud()
+
+    vs, us = np.nonzero(valid)
+    zs = z[vs, us]
+    xs = (us.astype(np.float32) - cx) * zs / fx
+    ys = (vs.astype(np.float32) - cy) * zs / fy
+    xyz = np.stack([xs, ys, zs], axis=1).astype(np.float64)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+
+    if (
+        color_img is not None
+        and color_img.ndim == 3
+        and color_img.shape[:2] == (h, w)
+    ):
+        rgb = cv2.cvtColor(color_img, cv2.COLOR_BGR2RGB)
+        colors = rgb[vs, us].astype(np.float64) / 255.0
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    return pcd
+
+def estimate_normals_from_depth_map(depth_map: np.ndarray) -> np.ndarray:
+    """Per-pixel surface normals from a depth map via the Sobel gradient."""
+    if depth_map.dtype != np.float32:
+        depth_map = depth_map.astype(np.float32)
+
+    depth_map = cv2.GaussianBlur(depth_map, (5, 5), 0)
+
+    ksize = 1
+    grad_x = cv2.Sobel(depth_map, cv2.CV_32F, 1, 0, ksize=ksize)
+    grad_y = cv2.Sobel(depth_map, cv2.CV_32F, 0, 1, ksize=ksize)
+
+    grad_x = grad_x[:, :, np.newaxis]
+    grad_y = grad_y[:, :, np.newaxis]
+    z_component = np.ones_like(grad_x)
+
+    direction = np.concatenate((-grad_x, -grad_y, z_component), axis=2)
+    magnitude = np.linalg.norm(direction, axis=2, keepdims=True)
+    return np.divide(
+        direction,
+        magnitude,
+        out=np.zeros_like(direction),
+        where=magnitude != 0,
     )
-    ans = scene.cast_rays(rays)
-    depth = ans["t_hit"].numpy()                # distance along ray
-    depth[~np.isfinite(depth)] = 0.0
-    # convert ray distance to z-depth
-    dirs = rays.numpy()[..., 3:6]
-    depth = depth * dirs[..., 2] / np.linalg.norm(dirs, axis=-1)
-    return depth.astype(np.float32)
 
-#%% Main DataSource class definition.
+def create_object_mask(
+    depth_gt: np.ndarray,
+    gradient_threshold: float = 10.0,
+    min_depth: float = 1.0,
+    max_depth: Optional[float] = None,
+    min_object_size: int = 0,
+    connectivity: int = 4,
+) -> np.ndarray:
+    """Segment a depth image into objects using normal-based gradients."""
+    if depth_gt.ndim != 2:
+        raise ValueError(f"depth_gt must be 2D, got shape {depth_gt.shape}")
+    if connectivity not in (4, 8):
+        raise ValueError(f"connectivity must be 4 or 8, got {connectivity}")
+
+    h, w = depth_gt.shape
+    depth = depth_gt.astype(np.float32)
+
+    valid = depth >= float(min_depth)
+    if max_depth is not None:
+        valid &= depth <= float(max_depth)
+
+    normals = estimate_normals_from_depth_map(depth)
+    n = h * w
+
+    def _edges(off_y: int, off_x: int) -> tuple[np.ndarray, np.ndarray]:
+        a = normals[: h - off_y if off_y else None, : w - off_x if off_x else None]
+        b = normals[off_y:, off_x:]
+        va = valid[: h - off_y if off_y else None, : w - off_x if off_x else None]
+        vb = valid[off_y:, off_x:]
+        align = np.einsum("ijk,ijk->ij", a, b)
+        keep = va & vb & (align >= np.cos(np.deg2rad(gradient_threshold)))
+        ys, xs = np.nonzero(keep)
+        rows = ys * w + xs
+        cols = (ys + off_y) * w + (xs + off_x)
+        return rows, cols
+
+    rows_list: list[np.ndarray] = []
+    cols_list: list[np.ndarray] = []
+
+    r, c = _edges(0, 1); rows_list.append(r); cols_list.append(c)
+    r, c = _edges(1, 0); rows_list.append(r); cols_list.append(c)
+
+    if connectivity == 8:
+        r, c = _edges(1, 1); rows_list.append(r); cols_list.append(c)
+        a = normals[:-1, 1:]
+        b = normals[1:, :-1]
+        va = valid[:-1, 1:]
+        vb = valid[1:, :-1]
+        align = np.einsum("ijk,ijk->ij", a, b)
+        keep = va & vb & (align >= np.cos(np.deg2rad(gradient_threshold)))
+        ys, xs = np.nonzero(keep)
+        rows_list.append(ys * w + (xs + 1))
+        cols_list.append((ys + 1) * w + xs)
+
+    rows = np.concatenate(rows_list).astype(np.int32, copy=False)
+    cols = np.concatenate(cols_list).astype(np.int32, copy=False)
+    data = np.ones(rows.size, dtype=np.uint8)
+
+    graph = csr_matrix((data, (rows, cols)), shape=(n, n))
+    _, raw_labels = connected_components(graph, directed=False)
+    raw_labels = raw_labels.reshape(h, w)
+
+    out = np.zeros((h, w), dtype=np.int32)
+    valid_labels = raw_labels[valid]
+    if valid_labels.size > 0:
+        _, inverse = np.unique(valid_labels, return_inverse=True)
+        out[valid] = inverse.astype(np.int32) + 1
+
+    if min_object_size > 0 and out.max() > 0:
+        counts = np.bincount(out.ravel())
+        keep_mask = counts >= int(min_object_size)
+        keep_mask[0] = True
+        remap = np.zeros(counts.size, dtype=np.int32)
+        new_id = 1
+        for old_id in range(1, counts.size):
+            if keep_mask[old_id]:
+                remap[old_id] = new_id
+                new_id += 1
+        out = remap[out]
+
+    return out
+
+def colorize_label_mask(labels: np.ndarray, seed: int = 0) -> np.ndarray:
+    """Map an integer label image to a deterministic RGB colour image."""
+    if labels.ndim != 2:
+        raise ValueError(f"labels must be 2D, got shape {labels.shape}")
+    max_label = int(labels.max())
+    rng = np.random.default_rng(seed)
+    palette = rng.integers(0, 255, size=(max_label + 1, 3), dtype=np.uint8)
+    palette[0] = (0, 0, 0)
+    return palette[labels]
+
+
+# ---------------------------------------------------------------------------
+# DataSource
+# ---------------------------------------------------------------------------
 
 class DataSource:
-    """Class-based loader for scene captures and CAD alignment data."""
+    """Loader for the ISAC / Pickle Excel-driven capture dataset."""
 
-    def __init__(self):
-        self.scene_json_path: Optional[Path] = None
-        self.scene_data: dict[str, Any] = {}
-        self.captures: list[dict[str, Any]] = []
-        self.items: list[Optional[dict[str, Any]]] = []
+    def __init__(self) -> None:
+        self.excel_path: Optional[Path] = None
+        self.stl_name: Optional[str] = None
+        self.manifest_df: Optional[pd.DataFrame] = None
 
-        self.cad_path: Optional[str] = None
-        self.t_camera_tooltip: Optional[np.ndarray] = None
-        self.cad_pcd: Optional[o3d.geometry.PointCloud] = None
-        self.df: Optional[pd.DataFrame] = None   # csv file with icp results, loaded on demand
+        # Per-session metadata, keyed by JSON path.
+        self.sessions: dict[str, dict[str, Any]] = {}
+        # Cached CAD point clouds keyed by cad_path.
+        self._cad_cache: dict[str, o3d.geometry.PointCloud] = {}
+        # Cached CAD triangle meshes (in metres) keyed by cad_path.
+        self._cad_mesh_cache: dict[str, o3d.geometry.TriangleMesh] = {}
+
+        # Flat per-capture index. Each entry has at least:
+        #   ``json_path``, ``capture_idx``, plus eager copies of useful fields.
+        self.items: list[dict[str, Any]] = []
+
+        # Lazily loaded ICP refinements: ``capture_uid -> 4x4 matrix``.
+        self.icp_table: Optional[pd.DataFrame] = None
+        self.icp_path: Optional[Path] = None
 
         log.info("Pickle DataSource is defined")
 
     def __len__(self) -> int:
-        return len(self.captures)
-    
-    def scene_json_load(self, scene_type = 1):
-        if scene_type == 1:
-            json_path = Path(__file__).with_name("scene.json")
-        elif scene_type == 2:
-            json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_05\yg_pickle\2026-05-27--12-24-21\Pickle_Scene_Capture_336222073841\scene.json")
-        elif scene_type == 3:
-            json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_05\yg_pickle\2026-05-27--13-50-40\Pickle_Scene_Capture_336222073841\scene.json")
-        elif scene_type == 4:
-            json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06\yg_pickle\2026-06-04--11-24-34\Pickle_Scene_Capture_336222073841\scene.json")
-         
-        elif scene_type == 5: # metal
-            json_path = Path(r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06\yg_pickle\2026-06-04--12-23-55\Pickle_Scene_Capture_336222073841\scene.json")
- 
-        
+        return len(self.items)
+
+    # ------------------------------------------------------------------
+    # Discovery / indexing
+    # ------------------------------------------------------------------
+
+    def init_directory(
+        self,
+        excel_path: str | os.PathLike[str] = DEFAULT_EXCEL,
+        stl_name: Optional[str] = DEFAULT_STL_NAME,
+        json_paths: Optional[Sequence[str]] = None,
+    ) -> int:
+        """Index every capture across all matching session JSONs.
+
+        Parameters
+        ----------
+        excel_path : path to the dataset manifest (``data_14_6_26.xlsx``).
+        stl_name : optional filter on the ``STL name`` column.
+        json_paths : explicit list of JSONs to use instead of the manifest.
+
+        Returns
+        -------
+        int : the number of indexed capture items.
+        """
+        self.items.clear()
+        self.sessions.clear()
+        self._cad_cache.clear()
+        self._cad_mesh_cache.clear()
+
+        if json_paths is not None:
+            session_jsons: list[str] = [str(p) for p in json_paths]
+            self.excel_path = None
+            self.manifest_df = None
         else:
-            raise ValueError(f"Unsupported scene type: {scene_type}")
-        
-        #json_path = Path(json_path)
+            self.excel_path = Path(excel_path)
+            if not self.excel_path.exists():
+                log.error(f"Manifest Excel does not exist: {self.excel_path}")
+                return 0
 
-        return json_path
+            df = pd.read_excel(self.excel_path)
+            self.manifest_df = df
+            mask = df["Label"].astype(str) == LABEL_RAW
+            if stl_name is not None:
+                mask &= df["STL name"].astype(str) == str(stl_name)
+            session_jsons = [str(p) for p in df.loc[mask, "Data Path"].tolist()]
 
+        self.stl_name = stl_name
 
+        for json_path in session_jsons:
+            self.index_session(json_path)
 
-    def init_directory(self, scene_type:int = 1) -> int:
-        """Load scene metadata and optionally preload all captures into memory."""
+        log.info(
+            f"DataSource: indexed {len(self.items)} captures across "
+            f"{len(self.sessions)} sessions"
+        )
+        return len(self.items)
 
-        json_path           = self.scene_json_load(scene_type)
+    def index_session(self, json_path: str) -> None:
+        """Load one session JSON and append its captures to ``self.items``."""
+        path = Path(json_path)
+        if not path.exists():
+            log.warning(f"Session JSON missing, skipping: {path}")
+            return
 
-        # if len(scene_json_path) < 3:
-        #     json_path = Path(__file__).with_name("scene.json")
-        # else:
-        #     json_path = Path(scene_json_path)
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                scene = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"Failed to read JSON {path}: {exc}")
+            return
 
-        if not json_path.exists():
-            log.error(f"Scene JSON file not found: {json_path}")
-            return 0
+        captures = list(scene.get("captures", []))
+        if not captures:
+            log.warning(f"Session has no captures: {path}")
+            return
 
-        self.scene_json_path = json_path
-        with json_path.open("r", encoding="utf-8") as f:
-            self.scene_data = json.load(f)
-
-        self.cad_path = self.scene_data["cad_path"]
-        self.cad_pcd  = self.load_cad_pcd(self.cad_path)        
-        # self.t_camera_tooltip = np.array(self.scene_data["t_camera_tooltip"], dtype=np.float64)
-
-
-        self.captures = list(self.scene_data.get("captures", []))
-        self.items    = [None] * len(self.captures)
-        for idx in range(len(self.captures)):
-            self.items[idx] = self.load_capture_item(idx)
-
-        log.info(f"DataSource: found {len(self.captures)} captures in {json_path}")
-        return len(self.captures)
-
-    def load_cad_pcd(self, cad_path: str) -> o3d.geometry.PointCloud:
-        """Load CAD mesh and sample point cloud once (shared for all captures)."""
-        cad_mesh = o3d.io.read_triangle_mesh(cad_path)
-        if cad_mesh.is_empty():
-            raise ValueError(f"Failed to load CAD mesh from: {cad_path}")
-
-        # STL units are mm.
-        cad_mesh.scale(0.001, center=(0, 0, 0))
-
-        if not cad_mesh.has_vertex_normals():
-            cad_mesh.compute_vertex_normals()
-
-        num_samples     = 80000
-        cad_pcd         = cad_mesh.sample_points_poisson_disk(number_of_points=num_samples,  use_triangle_normal=True)  
-
-        # 2. Sample densely spaced points on the mesh surface
-        # Increase 'number_of_points' to make the projection look completely solid
-        #cad_pcd         = cad_mesh.sample_points_uniformly(number_of_points=num_samples)     
-        return cad_pcd
-
-    def get_vertices_path(self, capture: dict[str, Any]) -> str:
-        """Extract vertices binary path for one capture."""
-        for img in capture.get("images", []):
-            if img.get("image_type") == "Vertices":
-                path = img.get("path", "")
-                if len(path) >= 3:
-                    return path
-                break
-        raise ValueError("Capture does not contain a valid Vertices image path")
-
-    def load_image_path(self, capture: dict[str, Any]) -> str:
-        """Extract vertices binary path for one capture."""
-        output_str = {"left_path": "", "right_path": "", "depth_path": "",  "rgb": "", "vertices_path": "",
-                      "t_tooltip_cad": None, "device_configuration": None}
-        
-        t_tooltip_cad        = np.array(capture["t_tooltip_cad"], dtype=np.float64)
-        device_configuration = capture.get("device_configuration", {})        
-
-        for img in capture.get("images", []):
-
-            if img.get("image_type") == "Depth":
-                output_str["depth_path"] = img.get("path", "")
-            elif img.get("image_type") == "IR":
-                output_str["left_path"] = img.get("path", "")
-            elif img.get("image_type") == "RightIR":
-                output_str["right_path"] = img.get("path", "")
-            elif img.get("image_type") == "RGB8":
-                output_str["rgb_path"] = img.get("path", "")
-            elif img.get("image_type") == "Vertices":                
-                output_str["vertices_path"] = img.get("path", "")
-
-        output_str["t_tooltip_cad"] = t_tooltip_cad
-        output_str["device_configuration"] = device_configuration
-
-        return output_str
-
-    def load_capture_item(self, index: int) -> dict[str, Any]:
-        """Create path to the data item for one capture index."""
-        if len(self.captures) == 0:
-            raise RuntimeError("DataSource was not initialized. Call init_directory first.")
-
-        capture               = self.captures[index]
-        output_str            = self.load_image_path(capture)
-        return output_str
-    
-    def decode_fsize_bpp(self, path: str) -> tuple[int, int, int]:
-        """Decode image size and bits-per-pixel from the filename."""
-
-        if path.find("1280") != -1:
-            fsize               = (1280,720)
-        else:
-            fsize               = (640,480)
-        
-        if path.find("Depth") != -1:
-            fbpp                = 16
-        elif path.find("IR") != -1 or path.find("RightIR") != -1:
-            fbpp                = 8
-        elif path.find("RGB") != -1:
-            fsize               = (fsize[0],fsize[1],3)  # >>1 bug
-            fsize               = (640,480,3)
-            fbpp                = 8            
-        else:
-            fbpp               = 8
-            log.error(f"Cannot determine image type from filename: {path}")
-
-        return fsize, fbpp
-    
-    def load_image_data(self, path: str) -> Optional[np.ndarray]:
-        """Load an image from the given path, returning None if it fails."""
-        if not path or not os.path.exists(path):
-            log.warning(f"Image path is invalid or does not exist: {path}")
-            return None
-        name, ext = os.path.splitext(path)
-        if ext.lower() in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']:
-            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        elif ext.lower() in ['.bin']:
-            "get an infrared depth frame from bin file"
-            fsize, fbpp         = self.decode_fsize_bpp(path)
-            img, img_metadata   = read_bin_file_with_metadata(path,fsize,fbpp)
-
-        else:
-            log.warning(f"Unsupported image format for path: {path}")
-            return None            
-        return img
-
-    def load_item_data(self, index: int, use_aligned :bool = False) -> dict[str, Any]:
-        """Create full data item for one capture index."""
-
-        output_str          = self.items[index]
-        left_img            = self.load_image_data(output_str['left_path'])
-        right_img           = self.load_image_data(output_str['right_path'])
-        depth_rs_img        = self.load_image_data(output_str['depth_path'])
-        rgb_img             = self.load_image_data(output_str['rgb_path'])
+        cad_name = scene.get("cad_name", "")
+        cad_path = scene.get("cad_path", "")
+        t_camera_tooltip = np.array(scene.get("t_camera_tooltip", np.eye(4)), dtype=np.float64)
+        intrinsics = scene.get("intrinsics", {}) or {}
+        baseline_mm = scene.get("baseline", 0.05) * 1000.0
+        bf         = baseline_mm * intrinsics.get("fx", 660.0)
 
 
-        if left_img is None or right_img is None or depth_rs_img is None:
-            log.warning(f"Failed to load sample {index}: {output_str}")
-            return output_str        
-
-        capture             = self.captures[index]
-        vertices_path       = self.get_vertices_path(capture)
-        t_camera_tooltip    = np.array(self.scene_data["t_camera_tooltip"], dtype=np.float64)
-        t_tooltip_cad       = np.array(capture["t_tooltip_cad"], dtype=np.float64)
-        #t_tooltip_cad       = np.linalg.inv(t_tooltip_cad)
-        t_camera_cad        = compose_t_camera_cad(t_camera_tooltip, t_tooltip_cad)
-        depth_pcd_raw       = load_vertices_to_pcd(Path(vertices_path))
-        cad_pcd_aligned     = copy.deepcopy(self.cad_pcd)
-        if use_aligned:
-            cad_pcd_aligned.transform(t_camera_cad)
-
-        return {
-            "index": index,
-            "capture": capture,
-            "camera_vertices_path": vertices_path,
+        baseline_mm = scene.get("baseline", 0.05) * 1000.0
+        self.sessions[str(path)] = {
+            "scene"         : scene,
+            "cad_path"      : cad_path,
+            "cad_name"      : cad_name,
             "t_camera_tooltip": t_camera_tooltip,
-            "t_tooltip_cad": t_tooltip_cad,
-            "t_camera_cad": t_camera_cad,
-            "cad_pcd": self.cad_pcd,
-            "cad_pcd_aligned": cad_pcd_aligned,
-            "depth_pcd_raw": depth_pcd_raw,
-            "left_img": left_img,
-            "right_img": right_img,
-            "depth_rs_img": depth_rs_img,
-            "rgb_img": rgb_img,
-            "cad_img_projected": None, # cad projection data can be added later when needed
+            "intrinsics"    : intrinsics,
+            "bf"            : bf,
+            "baseline_mm"   : baseline_mm,
         }
 
-    def get_item(self, index: int, debug: bool = False) -> dict[str, Any]:
-        """Return one loaded capture item by index."""
-        if index < 0 or index >= len(self.captures):
-            raise IndexError(f"Capture index out of range: {index}")
+        for ci, capture in enumerate(captures):
+            paths = self._extract_capture_paths(capture)
+            self.items.append(
+                {
+                    "json_path": str(path),  # session address
+                    "capture_idx": ci,
+                    **paths,
+                    "robot_position": capture.get("robot_position", {}),
+                }
+            )
 
-        item = self.load_item_data(index)
-        if item is None:
-            raise RuntimeError(f"Failed to build item at index {index}")
+    @staticmethod
+    def _extract_capture_paths(capture: dict[str, Any]) -> dict[str, str]:
+        """Pull the well-known image paths out of one capture entry."""
+        out = {
+            "ir_left_path": "",
+            "ir_right_path": "",
+            "depth_path": "",
+            "rgb_path": "",
+            "vertices_path": "",
+        }
+        for img in capture.get("images", []) or []:
+            kind = img.get("image_type", "")
+            p = img.get("path", "") or ""
+            if kind == IMG_TYPE_IR_LEFT:
+                out["ir_left_path"] = p
+            elif kind == IMG_TYPE_IR_RIGHT:
+                out["ir_right_path"] = p
+            elif kind == IMG_TYPE_DEPTH:
+                out["depth_path"] = p
+            elif kind == IMG_TYPE_RGB:
+                out["rgb_path"] = p
+            elif kind == IMG_TYPE_VERTICES:
+                out["vertices_path"] = p
+        return out
 
-        if debug:
-            cad_pcd             = copy.deepcopy(item["cad_pcd"])
-            cad_pcd_aligned     = copy.deepcopy(item["cad_pcd_aligned"])
-            depth_pcd_raw = copy.deepcopy(item["depth_pcd_raw"])
+    # ------------------------------------------------------------------
+    # CAD / intrinsics helpers
+    # ------------------------------------------------------------------
+    def render_points_from_mesh(self, mesh_t: o3d.t.geometry.TriangleMesh) -> o3d.geometry.PointCloud:
 
-            cad_pcd.paint_uniform_color([0.5, 0.5, 0.5])
-            cad_pcd_aligned.paint_uniform_color([0.0, 0.0, 1.0])
-            depth_pcd_raw.paint_uniform_color([1.0, 0.0, 0.0])
+        # 1. Load legacy mesh and convert to Tensor API
+        # mesh_legacy = o3d.geometry.TriangleMesh.create_sphere(radius=1.0)
+        # mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh_legacy)
 
-            o3d.visualization.draw([cad_pcd, cad_pcd_aligned, depth_pcd_raw])
+        # 2. Build the Raycasting Scene
+        scene = o3d.t.geometry.RaycastingScene()
+        _ = scene.add_triangles(mesh_t)
 
-        return item
-    
-    def load_csv_with_icp_results(self, index: int) -> dict[int, dict[str, Any]]:
-        """Load ICP results from a CSV file into a dictionary keyed by capture index."""
+        # 3. Create a 3D coordinate grid matrix
+        # Adjust bounds and grid spacing based on your mesh dimensions
+        grid_spacing = 0.1
+        bbox = mesh_t.get_axis_aligned_bounding_box()
+        x = np.arange(bbox.min_bound[0], bbox.max_bound[0], grid_spacing)
+        y = np.arange(bbox.min_bound[1], bbox.max_bound[1], grid_spacing)
+        z = np.arange(bbox.min_bound[2], bbox.max_bound[2], grid_spacing)
 
-        csv_path = r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\Pickle\DeepCrunch_Results\a2991ebf-20ab-4887-a22d-cd84492517ef\icp_transformation_result.csv"
-        if not os.path.exists(csv_path):
-            log.warning(f"CSV file not found: {csv_path}")
-            return {}
-        
-        # is it loaded already?
-        if self.df is None:
-            self.df      = pd.read_csv(csv_path)
+        grid_x, grid_y, grid_z = np.meshgrid(x, y, z, indexing='ij')
+        grid_points = np.stack([grid_x, grid_y, grid_z], axis=-1).astype(np.float32)
 
-        T_camera_cad_icp = np.array(ast.literal_eval(self.df.loc[index, 't_camera_cad_corrected']), dtype=np.float64)
-        # icp_results = {}
-        # for _, row in self.df.iterrows():
-        #     try:
-        #         index = int(row['index'])
-        #         t_camera_cad_corrected = np.array(ast.literal_eval(row['t_camera_cad_corrected']), dtype=np.float64)
-        #         icp_results[index] = {'t_camera_cad_corrected': t_camera_cad_corrected,       }
-        #     except Exception as e:
-        #         log.error(f"Error parsing row in CSV: {e}")
-        return T_camera_cad_icp
-    
-    def load_csv_with_camera_tooltip_results(self, index: int) -> dict[int, dict[str, Any]]:
-        """Load Camera Tooltip corrected results from a CSV file into a dictionary keyed by capture index."""
+        # 4. Filter grid coordinates near the shell boundary
+        # Only project grid coordinates within 1 voxel size of the mesh surface
+        distances = scene.compute_distance(grid_points).numpy()
+        surface_mask = distances <= grid_spacing
+        candidate_grid_points = grid_points[surface_mask]
 
-        csv_path = r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\Pickle\DeepCrunch_Results\a2991ebf-20ab-4887-a22d-cd84492517ef\icp_transformation_result.csv"
-        if not os.path.exists(csv_path):
-            log.warning(f"CSV file not found: {csv_path}")
-            return {}
-        
-        # is it loaded already?
-        if self.df is None:
-            self.df      = pd.read_csv(csv_path)
+        # 5. Snap the remaining grid coordinates directly onto the outer surface
+        ans = scene.compute_closest_point(candidate_grid_points)
+        surface_snapped_points = ans['points'].numpy()
 
-        T_camera_tooltip = np.array(ast.literal_eval(self.df.loc[index, 't_camera_tooltip']), dtype=np.float64)
+        # 6. Save out to a legacy PointCloud container
+        sampled_pcd = o3d.geometry.PointCloud()
+        sampled_pcd.points = o3d.utility.Vector3dVector(surface_snapped_points)
 
-        return T_camera_tooltip    
-    
-    def get_item_with_icp(self, index: int, debug: bool = False) -> dict[str, Any]:
-        """Return one loaded capture item by index."""
-        if index < 0 or index >= len(self.captures):
-            raise IndexError(f"Capture index out of range: {index}")
+        # Optional visualization
+        o3d.visualization.draw_geometries([sampled_pcd])
 
-        item                = self.load_item_data(index)
-        if item is None:
-            raise RuntimeError(f"Failed to build item at index {index}")
-        
-        # load help files that have icp results for visualization, but do not return them in the item dict since they are not needed for training or evaluation.
-        if not debug:
-            return item
-        
-        cad_pcd             = item["cad_pcd"]
-        cad_pcd_aligned     = item["cad_pcd_aligned"]
-        depth_pcd_raw       = item["depth_pcd_raw"]
+        return sampled_pcd
 
-    
-        T_camera_cad_icp    = self.load_csv_with_icp_results(index)
-        cad_pcd_aligned_icp = o3d.geometry.PointCloud(cad_pcd)
-        cad_pcd_aligned_icp.transform(T_camera_cad_icp)
+    def load_cad_pcd(self, cad_path: str) -> Optional[o3d.geometry.PointCloud]:
+        """Load and cache the sampled CAD point cloud (in metres)."""
+        if not cad_path:
+            return None
+        if cad_path in self._cad_cache:
+            return self._cad_cache[cad_path]
 
-        camera_axis_pcd = o3d.geometry.TriangleMesh.create_coordinate_frame(size=float(0.1))
-        #camera_axis.transform(t_camera_tooltip)
-        camera_axis_pcd.transform(T_camera_cad_icp)        
+        if not os.path.exists(cad_path):
+            log.warning(f"CAD path missing: {cad_path}")
+            return None
 
+        mesh = o3d.io.read_triangle_mesh(cad_path)
+        if mesh.is_empty():
+            log.warning(f"Failed to load CAD mesh: {cad_path}")
+            return None
 
-        cad_pcd.paint_uniform_color([0.5, 0.5, 0.5]) # gray
-        cad_pcd_aligned.paint_uniform_color([0, 0, 1]) # blue
-        depth_pcd_raw.paint_uniform_color([1, 0, 0]) # red
-        cad_pcd_aligned_icp.paint_uniform_color([0, 0, 0])#black            
+        # STL units are millimetres; convert to metres.
+        mesh.scale(0.001, center=(0.0, 0.0, 0.0))
+        if not mesh.has_vertex_normals():
+            mesh.compute_vertex_normals()
 
-        o3d.visualization.draw([cad_pcd, cad_pcd_aligned, depth_pcd_raw, cad_pcd_aligned_icp, camera_axis_pcd])
-
-        return item    
-
-    def get_camera_intrinsics_and_distortion(self) -> tuple[np.ndarray, np.ndarray]:
-        """Read camera intrinsics/distortion from scene JSON."""
-        intrinsics = self.scene_data.get("intrinsics", {})
-        fx = float(intrinsics.get("fx", 1.0))
-        fy = float(intrinsics.get("fy", 1.0))
-        cx = float(intrinsics.get("ppx", 0.0))
-        cy = float(intrinsics.get("ppy", 0.0))
-
-        cam_matrix = np.array(
-            [
-                [fx, 0.0, cx],
-                [0.0, fy, cy],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
+        cad_pcd = mesh.sample_points_poisson_disk(
+            number_of_points=150000,
+            use_triangle_normal=True,
         )
 
-        coeffs = intrinsics.get("coeffs", [0.0, 0.0, 0.0, 0.0, 0.0])
-        dist_coeffs = np.asarray(coeffs, dtype=np.float32).reshape(-1)
-        if dist_coeffs.size == 0:
-            dist_coeffs = np.zeros((5,), dtype=np.float32)
-        return cam_matrix, dist_coeffs
+        # # Define your grid reference step size (voxel size)
+        # voxel_size = 0.0001 
 
-    def project_3d_to_camera_depth(self, points_3d_m: np.ndarray, cam_matrix: np.ndarray,  dist_coeffs: np.ndarray,
-        frame_size: tuple[int, int],    ) -> np.ndarray:
-        """Project 3D camera-frame points to a depth image (mm) using z-buffering."""
+        # # Simplify the mesh using vertex clustering based on the grid size
+        # # Contraction option determines how points pool together (e.g., Average)
+        # simplified_mesh = mesh.simplify_vertex_clustering(
+        #     voxel_size=voxel_size,
+        #     contraction=o3d.geometry.SimplificationContraction.Average
+        # )
+
+        #simplified_mesh = mesh.subdivide_loop(number_of_iterations=10)
+
+        # # Extract the remaining grid-aligned points
+        # cad_pcd = o3d.geometry.PointCloud()
+        # cad_pcd.points = simplified_mesh.vertices
+
+        #cad_pcd = self.render_points_from_mesh(mesh)
+
+        self._cad_cache[cad_path] = cad_pcd
+        # Also cache the metres-scaled mesh for raycast rendering.
+        self._cad_mesh_cache[cad_path] = mesh
+        return cad_pcd
+
+    def load_cad_mesh(self, cad_path: str) -> Optional[o3d.geometry.TriangleMesh]:
+        """Load and cache the CAD mesh, scaled to metres."""
+        if not cad_path:
+            return None
+        if cad_path in self._cad_mesh_cache:
+            return self._cad_mesh_cache[cad_path]
+
+        if not os.path.exists(cad_path):
+            log.warning(f"CAD path missing: {cad_path}")
+            return None
+
+        mesh = o3d.io.read_triangle_mesh(cad_path)
+        if mesh.is_empty():
+            log.warning(f"Failed to load CAD mesh: {cad_path}")
+            return None
+
+        mesh.scale(0.001, center=(0.0, 0.0, 0.0))  # mm -> m
+        if not mesh.has_vertex_normals():
+            mesh.compute_vertex_normals()
+        self._cad_mesh_cache[cad_path] = mesh
+        return mesh
+
+    def get_intrinsics_matrix(self, json_path: str) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(K, dist_coeffs)`` for one session."""
+        info = self.sessions.get(json_path, {})
+        intr = info.get("intrinsics", {})
+        fx = float(intr.get("fx", 1.0))
+        fy = float(intr.get("fy", 1.0))
+        cx = float(intr.get("ppx", 0.0))
+        cy = float(intr.get("ppy", 0.0))
+        k = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        coeffs = np.asarray(intr.get("coeffs", [0.0] * 5), dtype=np.float32).reshape(-1)
+        if coeffs.size == 0:
+            coeffs = np.zeros((5,), dtype=np.float32)
+        return k, coeffs
+
+    # ------------------------------------------------------------------
+    # ICP refinement (optional)
+    # ------------------------------------------------------------------
+
+    def load_icp_csv(
+        self,
+        icp_csv_path: Optional[str | os.PathLike[str]] = None,
+    ) -> bool:
+        """Load an ICP CSV (with ``icp_matrix`` and ``t_camera_cad`` columns).
+
+        If no path is supplied, the function tries to read it from the Excel
+        manifest by selecting rows where ``Label == 'ICP'`` (and matching
+        ``stl_name`` when available).
+        """
+        if icp_csv_path is None:
+            if self.manifest_df is None:
+                log.warning(
+                    "Cannot infer ICP CSV path: no manifest was loaded. "
+                    "Pass icp_csv_path explicitly."
+                )
+                return False
+            df = self.manifest_df
+            mask = df["Label"].astype(str) == LABEL_ICP
+            if self.stl_name is not None:
+                mask &= df["STL name"].astype(str) == str(self.stl_name)
+            paths = df.loc[mask, "Data Path"].tolist()
+            if not paths:
+                log.warning("No ICP rows found in manifest.")
+                return False
+            icp_csv_path = paths[0]
+
+        path = Path(str(icp_csv_path))
+        if not path.exists():
+            log.warning(f"ICP CSV not found: {path}")
+            return False
+
+        self.icp_table = pd.read_csv(path)
+        self.icp_path = path
+        log.info(f"Loaded ICP table with {len(self.icp_table)} rows from {path}")
+        return True
+
+    def load_icp_t_camera_cad(self, capture_idx: int) -> Optional[np.ndarray]:
+        """Return the ICP-refined ``t_camera_cad`` for a capture, if any."""
+        if self.icp_table is None:
+            return None
+        if capture_idx < 0 or capture_idx >= len(self.icp_table):
+            return None
+        row = self.icp_table.iloc[capture_idx]
+        try:
+            t_icp = np.array(ast.literal_eval(row["icp_matrix"]), dtype=np.float64)
+            t_base = np.array(ast.literal_eval(row["t_camera_cad"]), dtype=np.float64)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"Failed to parse ICP row {capture_idx}: {exc}")
+            return None
+        return t_icp @ t_base
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
+
+    def get_item(self, index: int, debug: bool = False) -> dict[str, Any]:
+        """Load one fully populated capture sample by global index."""
+        if index < 0 or index >= len(self.items):
+            raise IndexError(f"Sample index out of range: {index}")
+
+        meta            = self.items[index]
+        json_path       = meta["json_path"]
+        session         = self.sessions[json_path]
+        scene           = session["scene"]
+        #capture         = scene["captures"][meta["capture_idx"]]
+        bf              = session["bf"]
+
+        ir_left         = load_image_any(meta["ir_left_path"])
+        ir_right        = load_image_any(meta["ir_right_path"])
+        depth_img       = load_image_any(meta["depth_path"])
+        rgb             = load_image_any(meta["rgb_path"]) if meta["rgb_path"] else None
+
+        
+        
+        vertices_path   = meta["vertices_path"]
+        depth_pcd_raw: Optional[o3d.geometry.PointCloud] = None
+        if vertices_path and os.path.exists(vertices_path):
+            try:
+                depth_pcd_raw = load_vertices_to_pcd(Path(vertices_path))
+            except Exception as exc:  # noqa: BLE001
+                log.warning(f"Failed to load vertices {vertices_path}: {exc}")
+
+        # Pose composition: camera <- CAD using Uri_26_06_17.py's convention.
+        t_camera_tooltip    = session["t_camera_tooltip"]
+        robot_position      = meta["robot_position"]
+        t_tool_to_base      = build_t_tool_to_base(robot_position)
+        t_camera_cad        = compose_t_camera_cad(t_camera_tooltip, robot_position)
+
+        cad_pcd             = self.load_cad_pcd(session["cad_path"])
+        cad_pcd_aligned: Optional[o3d.geometry.PointCloud] = None
+        if cad_pcd is not None:
+            cad_pcd_aligned = copy.deepcopy(cad_pcd)
+            cad_pcd_aligned.transform(t_camera_cad)
+
+        # ICP-refined alignment, when available.
+        t_camera_cad_icp    = self.load_icp_t_camera_cad(meta["capture_idx"])
+        cad_pcd_aligned_icp: Optional[o3d.geometry.PointCloud] = None
+        if cad_pcd is not None and t_camera_cad_icp is not None:
+            cad_pcd_aligned_icp = copy.deepcopy(cad_pcd)
+            cad_pcd_aligned_icp.transform(t_camera_cad_icp)
+
+        intrinsics           = session["intrinsics"]
+        item: dict[str, Any] = {
+            "index"                 : index,
+            "json_path"             : json_path,
+            "capture_idx"           : meta["capture_idx"],
+            # paths
+            "ir_left_path"          : meta["ir_left_path"],
+            "ir_right_path"         : meta["ir_right_path"],
+            "depth_path"            : meta["depth_path"],
+            "rgb_path"              : meta["rgb_path"],
+            "vertices_path"         : vertices_path,
+            "cad_path"              : session["cad_path"],
+            # images / clouds
+            "ir_left_img"           : ir_left,
+            "ir_right_img"          : ir_right,
+            "depth_img"             : depth_img,
+            "rgb_img"               : rgb,
+            "depth_pcd_raw"         : depth_pcd_raw,
+            "cad_pcd"               : cad_pcd,
+            "cad_pcd_aligned"       : cad_pcd_aligned,
+            "cad_pcd_aligned_icp"   : cad_pcd_aligned_icp,
+            # transforms / metadata
+            "t_camera_tooltip"      : t_camera_tooltip,
+            "t_tool_to_base"        : t_tool_to_base,
+            "t_user_to_base"        : T_USER_TO_BASE,
+            "t_cad_to_user"         : T_CAD_TO_USER,
+            "t_camera_cad"          : t_camera_cad,
+            "t_camera_cad_icp"      : t_camera_cad_icp,
+            "robot_position"        : robot_position,
+            'bf'                    : bf,
+            "intrinsics"            : intrinsics,
+        }
+
+        if debug:
+            self.draw_point_clouds(item)
+
+        return item
+
+    def get_item_with_icp(self, index: int, debug: bool = False) -> dict[str, Any]:
+        """Like :meth:`get_item` but ensures the ICP table has been loaded."""
+        if self.icp_table is None:
+            self.load_icp_csv()
+        return self.get_item(index, debug=debug)
+
+    # ------------------------------------------------------------------
+    # CAD -> camera-image projection
+    # ------------------------------------------------------------------
+
+    def project_mesh_on_camera(self, mesh, cam_matrix, cam_dist_coeffs, cam_extrinsics, frame_size=(720, 1280)):
+        # NOTE: Open3D's ``OffscreenRenderer`` (Filament backend) is not
+        # supported on Windows wheels (it requires EGL headless). On Windows
+        # we use a hidden ``Visualizer`` window + ``capture_screen_float_buffer``
+        # to render a mesh to an RGB image with explicit pinhole intrinsics.
+
+        image_height, image_width = frame_size
+
+        # Build pinhole intrinsics from a vertical FOV of 60 deg.
+        # fov_deg = 60.0
+        # fy = image_height / (2.0 * np.tan(np.deg2rad(fov_deg) / 2.0))
+        # fx = fy
+        # cx = image_width / 2.0
+        # cy = image_height / 2.0
+        fx, fy, cx, cy = cam_matrix[0, 0], cam_matrix[1, 1], cam_matrix[0, 2], cam_matrix[1, 2]
+        intrinsic = o3d.camera.PinholeCameraIntrinsic(image_width, image_height, fx, fy, cx, cy)
+
+        # Mesh to render.
+        mesh = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
+        mesh.compute_vertex_normals()
+
+        # # Look-at extrinsic: camera at (2, 2, 2), looking at origin, +Z up.
+        # eye = np.array([2.0, 2.0, 2.0], dtype=np.float64)
+        # center = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        # up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        # f = (center - eye)
+        # f /= np.linalg.norm(f)
+        # s = np.cross(f, up)
+        # s /= np.linalg.norm(s)
+        # u = np.cross(s, f)
+        # # Open3D's pinhole convention: +Z forward, +Y down.
+        # # Build R such that R @ world = camera; rows are camera basis vectors.
+        # rotation = np.stack([s, -u, f], axis=0)
+        # translation = -rotation @ eye
+        # extrinsic = np.eye(4, dtype=np.float64)
+        # extrinsic[:3, :3] = rotation
+        # extrinsic[:3, 3] = translation
+
+        extrinsic = cam_extrinsics
+
+        vis = o3d.visualization.Visualizer()
+        created = vis.create_window(
+            visible=False, width=image_width, height=image_height
+        )
+        if not created:
+            self.skipTest("Could not create Open3D window for offscreen render")
+
+        try:
+            vis.add_geometry(mesh)
+
+            ctr             = vis.get_view_control()
+            params          = ctr.convert_to_pinhole_camera_parameters()
+            params.intrinsic = intrinsic
+            params.extrinsic = extrinsic
+            ctr.convert_from_pinhole_camera_parameters( params, allow_arbitrary=True)
+
+            vis.poll_events()
+            vis.update_renderer()
+            float_img       = vis.capture_screen_float_buffer(do_render=True)
+        finally:
+            vis.destroy_window()
+
+        image_ndarray = np.asarray(float_img)
+        self.assertEqual(image_ndarray.shape, (image_height, image_width, 3))
+
+        # Save out the rendered RGB frame for inspection.
+        rgb_uint8 = np.ascontiguousarray(
+            (np.clip(image_ndarray, 0.0, 1.0) * 255.0).astype(np.uint8)
+        )
+        return rgb_uint8
+
+    @staticmethod
+    def project_3d_to_camera_depth(
+        points_3d_m: np.ndarray,
+        cam_matrix: np.ndarray,
+        dist_coeffs: np.ndarray,
+        frame_size: tuple[int, int],
+    ) -> np.ndarray:
+        """Project 3D camera-frame points (metres) to a depth image (mm).
+
+        Mirrors ``DataSource.project_3d_to_camera_depth`` in
+        ``data_manager_pickle.py``: uses ``cv2.projectPoints`` and a z-buffer
+        (``np.minimum.at``) so the nearest depth wins per pixel.
+
+        Returns an ``(H, W)`` ``float32`` image; invalid pixels are ``0``.
+        """
         if points_3d_m.ndim != 2 or points_3d_m.shape[1] != 3:
-            raise ValueError("Input points_3d_m must have shape (N, 3)")
+            raise ValueError("points_3d_m must have shape (N, 3)")
 
         h, w = frame_size
         valid = np.isfinite(points_3d_m).all(axis=1) & (points_3d_m[:, 2] > 1e-6)
         if not np.any(valid):
-            log.error("No valid 3D points to project.")
+            log.warning("No valid 3D points to project.")
             return np.zeros((h, w), dtype=np.float32)
-        
-        # transfer to mm
-        points_3d_mm = points_3d_m * 1000.0
 
-        pts = points_3d_mm[valid].astype(np.float32)
+        # metres -> millimetres (depth image convention)
+        points_3d_mm = (points_3d_m * 1000.0).astype(np.float32)
+        pts = points_3d_mm[valid]
+
         projected_pts, _ = cv2.projectPoints(
             pts.reshape(-1, 1, 3),
             np.zeros(3, dtype=np.float32),
@@ -611,7 +1101,7 @@ class DataSource:
             dist_coeffs.astype(np.float32),
         )
 
-        uv    = projected_pts.reshape(-1, 2)
+        uv = projected_pts.reshape(-1, 2)
         u_idx = np.rint(uv[:, 0]).astype(np.int32)
         v_idx = np.rint(uv[:, 1]).astype(np.int32)
 
@@ -619,189 +1109,440 @@ class DataSource:
         if not np.any(in_bounds):
             return np.zeros((h, w), dtype=np.float32)
 
-        u_idx       = u_idx[in_bounds]
-        v_idx       = v_idx[in_bounds]
-        z_vals_mm   = (pts[in_bounds, 2]).astype(np.float32)
+        u_idx = u_idx[in_bounds]
+        v_idx = v_idx[in_bounds]
+        z_vals_mm = pts[in_bounds, 2].astype(np.float32)
 
-        # old way
-        # interpolate depth values into the image using z-buffering
-        # use regular grid indices for u and v to handle duplicates and out-of-order points correctly.        
-        lin          = v_idx * w + u_idx
+        lin = v_idx * w + u_idx
         depth_buffer = np.full(h * w, np.inf, dtype=np.float32)
         np.minimum.at(depth_buffer, lin, z_vals_mm)
         depth_projected = depth_buffer.reshape(h, w)
         depth_projected[~np.isfinite(depth_projected)] = 0.0
 
-        # # do linear interpolation of depth values for points that project to the same pixel, taking the minimum (closest) depth.
-        # depth_projected = interpolate_points_to_grid(u_idx, v_idx, z_vals_mm, image_size=(h, w))
-
-        # depth_projected = interp_splat_close(u_idx, v_idx, z_vals_mm, image_size=(h, w), kernel=3)
-
+        #depth_projected_2 = interpolate_points_to_grid(u_idx, v_idx, z_vals_mm, image_size=(h, w))
 
         return depth_projected
 
-    def get_item_projected(self, index: int, debug: bool = False) -> dict[str, Any]:
-        """Return one sample with CAD depth projected onto the camera image plane."""
-        #item = self.get_item(index, debug=False)
+    @staticmethod
+    def render_mesh_depth(
+        mesh: o3d.geometry.TriangleMesh,
+        cam_matrix: np.ndarray,
+        frame_size: tuple[int, int],
+        extrinsic: Optional[np.ndarray] = None,
+        output_units: str = "mm",
+    ) -> np.ndarray:
+        """Rasterize a ``TriangleMesh`` into a dense depth image via ray casting.
 
-        item                = self.load_item_data(index)
-        if item is None:
-            raise RuntimeError(f"Failed to build item at index {index}")     
+        Uses :class:`open3d.t.geometry.RaycastingScene` to cast one ray per
+        pixel through a pinhole camera. Unlike
+        :meth:`project_3d_to_camera_depth`, this produces a fully dense
+        silhouette (no holes between samples).
 
-        cad_pcd             = item["cad_pcd"]
-        #cad_pcd_aligned     = item["cad_pcd_aligned"]
-        depth_pcd_raw       = item["depth_pcd_raw"]
-        t_tooltip_cad       = item["t_tooltip_cad"]
-        depth_rs            = np.asarray(item["depth_rs_img"], dtype=np.float32)
-        h, w                = depth_rs.shape[:2]  
+        Parameters
+        ----------
+        mesh : ``TriangleMesh`` whose vertices are in the *camera* frame
+            (or supply ``extrinsic`` to transform from world to camera).
+        cam_matrix : 3x3 pinhole intrinsic ``K`` (pixels). The mesh must be
+            in metres for ``K`` to be interpreted correctly.
+        frame_size : ``(H, W)``.
+        extrinsic : optional 4x4 world->camera transform; defaults to
+            identity (i.e. mesh already in the camera frame).
+        output_units : ``"mm"`` (default) or ``"m"``.
 
-        # use Camera Tooltip results
-        #T_camera_tooltip        = self.load_csv_with_camera_tooltip_results(index)
-        T_camera_tooltip2       = np.array([[0, -1, 0, 0], #degenerated tooltip to camera (assuming the target was formed relative to camera)
-                                            [1, 0, 0, 0],
-                                            [0, 0, 1, 0],
-                                            [0, 0, 0, 1]])
+        Returns
+        -------
+        ``(H, W)`` ``float32`` depth image. Pixels where the ray missed the
+        mesh are ``0``.
 
+        Notes
+        -----
+        Pinhole only — undistort the input image first if your camera has
+        non-trivial distortion coefficients.
+        """
+        h, w = frame_size
+        if mesh is None or mesh.is_empty():
+            return np.zeros((h, w), dtype=np.float32)
 
-        #T_camera_cad = compose_t_camera_cad(t_camera_tooltip, t_tooltip_cad)        
-        # create 180degree rotation around x axis to flip the CAD model since the Camera Tooltip results are based on flipped CAD model, and we want to visualize the effect of Camera Tooltip correction on the original CAD model.  
-        T_flip_z_direction       = np.eye(4, dtype=np.float64)
-        T_flip_z_direction[1, 1] = -1; T_flip_z_direction[2, 2] = -1
+        if extrinsic is None:
+            extrinsic = np.eye(4, dtype=np.float64)
 
-        T_camera_cad            = compose_t_camera_cad(T_camera_tooltip2, t_tooltip_cad)
-        T_camera_cad            = T_flip_z_direction @ T_camera_cad
-        T_camera_cad_icp        = T_camera_cad 
-        cad_pcd_aligned         = o3d.geometry.PointCloud(cad_pcd)
-        cad_pcd_aligned.transform(T_camera_cad_icp)        # T_cam_cad                 
+        mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(mesh_t)
 
+        K_t = o3d.core.Tensor(np.asarray(cam_matrix, dtype=np.float64))
+        E_t = o3d.core.Tensor(np.asarray(extrinsic, dtype=np.float64))
 
-        # CAD points already transformed into camera frame by t_camera_cad.
-        cad_points_cam          = np.asarray(cad_pcd_aligned.points, dtype=np.float32)
-        cam_matrix, dist_coeffs = self.get_camera_intrinsics_and_distortion()
+        rays = scene.create_rays_pinhole(
+            intrinsic_matrix=K_t,
+            extrinsic_matrix=E_t,
+            width_px=w,
+            height_px=h,
+        )
+        ans = scene.cast_rays(rays)
 
-        projected_path = item["camera_vertices_path"].replace(".bin", "_cad_projected.png")
-        if os.path.exists(projected_path):
-            depth_cad_projected = cv2.imread(projected_path, cv2.IMREAD_UNCHANGED)
-            
-        else:
-            depth_cad_projected = self.project_3d_to_camera_depth( cad_points_cam,  cam_matrix,  dist_coeffs,  frame_size=(h, w))
-            # cv2.imwrite(
-            #     projected_path,
-            #     depth_cad_projected.astype(np.uint16),
-            #     [cv2.IMWRITE_PNG_COMPRESSION, 0],
-            # )
+        t_hit = ans["t_hit"].numpy()        # (H, W) ray length to first hit
+        rays_np = rays.numpy()              # (H, W, 6): [ox,oy,oz, dx,dy,dz]
+        dz = rays_np[..., 5]
+        depth = t_hit * dz                  # camera-Z depth, in mesh units (m)
+        depth[~np.isfinite(depth)] = 0.0
 
+        if output_units == "mm":
+            depth = depth * 1000.0
+        elif output_units != "m":
+            raise ValueError("output_units must be 'mm' or 'm'")
+        return depth.astype(np.float32)
 
-        depth_cad_projected         = depth_cad_projected.astype(np.float32)
-        item["cad_img_projected"]   = depth_cad_projected
+    def get_item_projected(
+        self,
+        index: int,
+        debug: bool = False,
+        use_icp: bool = False,
+        method: str = "splat",
+    ) -> dict[str, Any]:
+        """Return one sample with the CAD geometry projected to a depth image.
+
+        Adds two fields to the item returned by :meth:`get_item`:
+
+        * ``"depth_cad_projected"`` — ``(H, W)`` ``float32`` depth in mm.
+        * ``"cad_img_projected"``   — alias kept for compatibility with the
+          legacy ``data_manager_pickle.py``.
+
+        Parameters
+        ----------
+        method : ``"splat"`` (default) projects the sampled CAD point cloud
+            with ``cv2.projectPoints`` and a z-buffer (sparse, distortion-
+            aware). ``"raycast"`` rasterizes the CAD *mesh* with
+            :meth:`render_mesh_depth` (dense, pinhole-only).
+        use_icp : when ``True`` the ICP-refined CAD alignment is used
+            (calls :meth:`load_icp_csv` if necessary).
+        """
+        if method not in ("splat", "raycast","open3d"):
+            raise ValueError(f"Unknown projection method: {method!r}")
+
+        if use_icp and self.icp_table is None:
+            self.load_icp_csv()
+
+        item        = self.get_item(index, debug=False)
+
+        depth_img   = item.get("depth_img")
+        if depth_img is None:
+            raise RuntimeError(
+                f"Item {index}: depth_img is missing; cannot derive frame size."
+            )
+        h, w        = depth_img.shape[:2]
+        cam_matrix, cam_dist_coeffs = self.get_intrinsics_matrix(item["json_path"])
+
+        if method == "splat":
+            cad_cloud = (
+                item.get("cad_pcd_aligned_icp") if use_icp else item.get("cad_pcd_aligned")
+            )
+            if cad_cloud is None or len(cad_cloud.points) == 0:
+                log.warning(
+                    f"Item {index}: no aligned CAD cloud available; "
+                    "depth_cad_projected will be zeros."
+                )
+                depth_cad_projected = np.zeros((h, w), dtype=np.float32)
+            else:
+                cad_points_cam      = np.asarray(cad_cloud.points, dtype=np.float32)
+                depth_cad_projected = self.project_3d_to_camera_depth(
+                    cad_points_cam, cam_matrix, cam_dist_coeffs, frame_size=(h, w)
+                )
+        elif method == "raycast":
+            t_camera_cad = (
+                item.get("t_camera_cad_icp") if use_icp else item.get("t_camera_cad")
+            )
+            mesh = self.load_cad_mesh(item["cad_path"])
+            if mesh is None or t_camera_cad is None:
+                log.warning(
+                    f"Item {index}: no mesh or pose for raycast; "
+                    "depth_cad_projected will be zeros."
+                )
+                depth_cad_projected = np.zeros((h, w), dtype=np.float32)
+            else:
+                if np.linalg.norm(np.asarray(cam_dist_coeffs).ravel()) > 1e-3:
+                    log.warning(
+                        "render_mesh_depth assumes a pinhole camera; "
+                        "non-zero distortion coefficients will be ignored."
+                    )
+                mesh_cam            = copy.deepcopy(mesh)
+                mesh_cam.transform(np.asarray(t_camera_cad, dtype=np.float64))
+                depth_cad_projected = self.render_mesh_depth(
+                    mesh_cam, cam_matrix, frame_size=(h, w), output_units="mm"
+                )
+
+        else: # method == "open3d"
+            t_camera_cad = (
+                item.get("t_camera_cad_icp") if use_icp else item.get("t_camera_cad")
+            )
+            mesh = self.load_cad_mesh(item["cad_path"])
+            if mesh is None or t_camera_cad is None:
+                log.warning(
+                    f"Item {index}: no mesh or pose for raycast; "
+                    "depth_cad_projected will be zeros."
+                )
+                depth_cad_projected = np.zeros((h, w), dtype=np.float32)
+            else:
+                if np.linalg.norm(np.asarray(cam_dist_coeffs).ravel()) > 1e-3:
+                    log.warning(
+                        "render_mesh_depth assumes a pinhole camera; "
+                        "non-zero distortion coefficients will be ignored."
+                    )
+                depth_cad_projected = self.project_mesh_on_camera(
+                    mesh, cam_matrix, cam_dist_coeffs, t_camera_cad, frame_size=(h, w)
+                )
+                # Convert the rendered RGB back to a depth image by taking the red channel.
+                depth_cad_projected = depth_cad_projected[..., 0].astype(np.float32)
+
+        item["depth_cad_projected"] = depth_cad_projected
+        item["cad_img_projected"] = depth_cad_projected  # legacy alias
+        item["projection_method"] = method
 
         if debug:
-            err = np.zeros_like(depth_rs, dtype=np.float32)
-            valid = (depth_rs > 0) & (depth_cad_projected > 0)
-            err[valid] = depth_rs[valid] - depth_cad_projected[valid]
+            depth_rs            = depth_img.astype(np.float32)
+            err                 = np.zeros_like(depth_rs, dtype=np.float32)
+            valid               = (depth_rs > 0) & (depth_cad_projected > 0)
+            err[valid]          = depth_rs[valid] - depth_cad_projected[valid]
             self.show_subset(
-                [item["left_img"], item["right_img"], depth_rs, depth_cad_projected, err],
-                ["left (RS)", "right (RS)", "depth RS (mm)", "depth CAD projected (mm)", "error RS-CAD (mm)"],vmax = 500,
+                [
+                    item.get("ir_left_img"),
+                    item.get("ir_right_img"),
+                    depth_rs,
+                    depth_cad_projected,
+                    err,
+                ],
+                [
+                    "left (RS)",
+                    "right (RS)",
+                    "depth RS (mm)",
+                    f"depth CAD ({method}) (mm)",
+                    "error RS-CAD (mm)",
+                ],
             )
             plt.show()
-
-        if debug:
-            camera_axis_pcd = o3d.geometry.TriangleMesh.create_coordinate_frame(size=float(0.1))
-            #camera_axis_pcd.transform(T_flip_z_direction)        
-
-            cad_pcd.paint_uniform_color([0.5, 0.5, 0.5]) # gray
-            depth_pcd_raw.paint_uniform_color([1, 0, 0]) # red
-            cad_pcd_aligned.paint_uniform_color([0, 0, 0])#black            
-
-            o3d.visualization.draw([cad_pcd, depth_pcd_raw, cad_pcd_aligned, camera_axis_pcd])
+            self.draw_point_clouds(item)
 
         return item
 
-    def get_item_icp_projected(self, index: int, debug: bool = False) -> dict[str, Any]:
-        """Return one sample with CAD depth after ICP alignment projected onto the camera image plane."""
+    # ------------------------------------------------------------------
+    # Display helpers
+    # ------------------------------------------------------------------
 
-        item                = self.load_item_data(index, use_aligned=True)
-        if item is None:
-            raise RuntimeError(f"Failed to build item at index {index}")
-    
-        
-        cad_pcd             = item["cad_pcd"]
-        cad_pcd_aligned     = item["cad_pcd_aligned"]
-        depth_pcd_raw       = item["depth_pcd_raw"]
-        depth_rs            = np.asarray(item["depth_rs_img"], dtype=np.float32)
-        h, w                = depth_rs.shape[:2]
+    def show_subset(
+        self,
+        img_list: list[Optional[np.ndarray]],
+        ttl_list: list[str],
+        suptitle: str = "",
+    ) -> None:
+        """Display a list of images in a 2-column grid."""
+        img_num = len(img_list)
+        col_num = min(img_num, 3)
+        row_num = int(np.ceil(img_num / col_num))
+        fig, axes = plt.subplots(row_num, col_num, sharey=True, sharex=True)
+        axes = np.array(axes).reshape(row_num, col_num)
+        for k in range(img_num):
+            ri, ci = k // col_num, k % col_num
+            img = img_list[k]
+            if img is None:
+                axes[ri, ci].axis("off")
+                axes[ri, ci].set_title(ttl_list[k] + " (missing)")
+                continue
+            if img.ndim == 3 and img.shape[2] == 3:
+                disp = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                axes[ri, ci].imshow(disp)
+            else:
+                if 'ir' in ttl_list[k].lower():
+                    vmax = 200
+                elif 'depth' in ttl_list[k].lower():
+                    vmax = 1000
+                else:
+                    vmax = np.percentile(img, 95) #if img.dtype == np.uint8 else 1000
+                #vmax = 600 if k == 3 else vmax
+                axes[ri, ci].imshow(img, cmap="gray" if img.ndim == 2 and img.dtype == np.uint8 else None, vmax = vmax )
+            axes[ri, ci].set_title(ttl_list[k])
+        # for k in range(img_num, row_num * col_num):
+        #     axes[k // col_num, k % col_num].axis("off")
+        if suptitle:
+            fig.suptitle(suptitle)
+        plt.show(block=False)
 
-        # use ICP results
-        T_camera_cad_icp        = self.load_csv_with_icp_results(index)
-        # create 180degree rotation around x axis to flip the CAD model since the ICP results are based on flipped CAD model, and we want to visualize the effect of ICP correction on the original CAD model.  
-        T_flip_z_direction       = np.eye(4, dtype=np.float64)
-        T_flip_z_direction[1, 1] = -1; T_flip_z_direction[2, 2] = -1
-        T_camera_cad_icp        = T_camera_cad_icp #@ T_flip_z_direction
-        #T_camera_cad_icp    = np.linalg.inv(T_camera_cad_icp) # apply ICP correction to the original camera-cad transform
-        cad_pcd_aligned_icp     = o3d.geometry.PointCloud(cad_pcd)
-        cad_pcd_aligned_icp.transform(T_camera_cad_icp)        # T_cam_cad
+    def show_item(self, item: dict[str, Any]) -> None:
+        """Show IR-left, IR-right, depth and RGB for a loaded item."""
+        suptitle = (
+            f"{Path(item['json_path']).parent.name} / capture {item['capture_idx']:04d}"
+        )
+        self.show_subset( [ item.get("ir_left_img"),  item.get("ir_right_img"),    item.get("depth_img"),  item.get("rgb_img"),  ],
+            ["IR left", "IR right", "Depth [mm]", "RGB"],
+            suptitle=suptitle,
+        )
 
-        # CAD points already transformed into camera frame by t_camera_cad.
-        cad_points_cam          = np.asarray(cad_pcd_aligned_icp.points, dtype=np.float32)
-        cam_matrix, dist_coeffs = self.get_camera_intrinsics_and_distortion()
+    def draw_point_clouds(self, item: dict[str, Any]) -> None:
+        """Open an Open3D viewer with the depth + CAD clouds."""
+        clouds                  = []
+        depth_pcd               = item.get("depth_pcd_raw")
+        cad_pcd                 = item.get("cad_pcd")
+        cad_pcd_aligned         = item.get("cad_pcd_aligned")
+        cad_pcd_aligned_icp     = item.get("cad_pcd_aligned_icp")
 
-        projected_path = item["camera_vertices_path"].replace(".bin", "_cad_projected.png")
-        if os.path.exists(projected_path):
-            depth_cad_projected = cv2.imread(projected_path, cv2.IMREAD_UNCHANGED)
-            
-        else:
-            depth_cad_projected = self.project_3d_to_camera_depth(cad_points_cam, cam_matrix, dist_coeffs, frame_size=(h, w))
-            
-            #depth_cad_projected = mesh_to_depth_o3d(cad_pcd,cam_matrix, image_size=(h, w))
+        if depth_pcd is not None and len(depth_pcd.points) > 0:
+            depth_pcd = copy.deepcopy(depth_pcd)
+            depth_pcd.paint_uniform_color([1.0, 0.0, 0.0])  # red
+            clouds.append(depth_pcd)
 
-            # cv2.imwrite(
-            #     projected_path,
-            #     depth_cad_projected.astype(np.uint16),
-            #     [cv2.IMWRITE_PNG_COMPRESSION, 0],
-            # )
+        if cad_pcd is not None:
+            cad_pcd = copy.deepcopy(cad_pcd)
+            cad_pcd.paint_uniform_color([0.5, 0.5, 0.5])  # gray (CAD origin)
+            clouds.append(cad_pcd)
 
-        depth_cad_projected         = depth_cad_projected.astype(np.float32)
-        item["cad_img_projected"]   = depth_cad_projected
+        if cad_pcd_aligned is not None:
+            cad_pcd_aligned = copy.deepcopy(cad_pcd_aligned)
+            cad_pcd_aligned.paint_uniform_color([0.0, 0.0, 1.0])  # blue
+            clouds.append(cad_pcd_aligned)
 
-        if debug:
-            err = np.zeros_like(depth_rs, dtype=np.float32)
-            valid = (depth_rs > 0) & (depth_cad_projected > 0)
-            err[valid] = depth_rs[valid] - depth_cad_projected[valid]
-            self.show_subset(
-                [item["left_img"], item["right_img"], depth_rs, depth_cad_projected, err],
-                ["left (RS)", "right (RS)", "depth RS (mm)", "depth CAD projected (mm)", "error RS-CAD (mm)"],vmax = 500,
-            )
-            plt.show()
+        if cad_pcd_aligned_icp is not None:
+            cad_pcd_aligned_icp = copy.deepcopy(cad_pcd_aligned_icp)
+            cad_pcd_aligned_icp.paint_uniform_color([0.0, 0.0, 0.0])  # black
+            clouds.append(cad_pcd_aligned_icp)
 
-        if debug:
-            camera_axis_pcd = o3d.geometry.TriangleMesh.create_coordinate_frame(size=float(0.1))
-            #camera_axis_pcd.transform(T_flip_z_direction)        
+        if not clouds:
+            log.warning("No point clouds to display.")
+            return
 
-            cad_pcd.paint_uniform_color([0.5, 0.5, 0.5]) # gray
-            cad_pcd_aligned.paint_uniform_color([0, 0, 1]) # blue
-            depth_pcd_raw.paint_uniform_color([1, 0, 0]) # red
-            cad_pcd_aligned_icp.paint_uniform_color([0, 0, 0])#black            
+        # Camera frustum (in the camera frame, so identity extrinsic).
+        json_path = item.get("json_path")
+        depth_img = item.get("depth_img")
+        if json_path and depth_img is not None:
+            try:
+                K, _ = self.get_intrinsics_matrix(json_path)
+                h, w = depth_img.shape[:2]
+                frustum = self.make_camera_frustum(
+                    K, frame_size=(h, w), scale=0.1, color=(1.0, 0.5, 0.0)
+                )
+                clouds.append(frustum)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(f"Could not build camera frustum: {exc}")
 
-            o3d.visualization.draw([cad_pcd, cad_pcd_aligned, depth_pcd_raw, cad_pcd_aligned_icp, camera_axis_pcd])
+        axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+        clouds.append(axis)
+        o3d.visualization.draw(clouds)
 
+    @staticmethod
+    def make_camera_frustum(
+        cam_matrix: np.ndarray,
+        frame_size: tuple[int, int],
+        scale: float = 0.1,
+        extrinsic: Optional[np.ndarray] = None,
+        color: tuple[float, float, float] = (1.0, 0.5, 0.0),
+    ) -> o3d.geometry.LineSet:
+        """Build an Open3D ``LineSet`` representing a pinhole camera frustum.
 
-        return item
+        The frustum has its apex at the camera centre and a rectangular base
+        sitting at ``z = scale`` (in the camera's coordinate system). Image
+        corners are back-projected through ``cam_matrix`` so the frustum's
+        aspect ratio and field-of-view match the actual camera intrinsics.
 
-# ----------------------------------
-# Recover camera pose.
-# ----------------------------------
+        Parameters
+        ----------
+        cam_matrix : 3x3 pinhole intrinsic ``K`` (pixels).
+        frame_size : ``(H, W)`` of the image.
+        scale : depth (in mesh units, typically metres) at which the base
+            plane is drawn. Larger values yield a larger frustum.
+        extrinsic : optional 4x4 ``world_T_camera`` transform. Defaults to
+            identity, i.e. the frustum is drawn in the camera frame.
+        color : RGB tuple in ``[0, 1]`` applied to every line.
 
-    def get_grid_coordinates(self, img_left, debug:bool=False) -> np.ndarray:
-        """Estimate camera pose using ICP between CAD and depth point clouds."""
-        # 1. Load the image
+        Returns
+        -------
+        ``open3d.geometry.LineSet`` — pass it to ``draw_geometries`` /
+        ``draw`` along with your point clouds.
+        """
+        h, w = frame_size
+        K = np.asarray(cam_matrix, dtype=np.float64).reshape(3, 3)
+        K_inv = np.linalg.inv(K)
+
+        # Image corners (u, v, 1): TL, TR, BR, BL.
+        corners_uv = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [w - 1, 0.0, 1.0],
+                [w - 1, h - 1, 1.0],
+                [0.0, h - 1, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        # Back-project to rays and place each corner at depth = scale (z = scale).
+        rays = (K_inv @ corners_uv.T).T          # (4, 3)
+        rays /= rays[:, 2:3]                     # normalise so z == 1
+        far_corners = rays * scale               # (4, 3) at z = scale
+
+        # Vertices: 0 = camera centre, 1..4 = far-plane corners.
+        verts = np.zeros((5, 3), dtype=np.float64)
+        verts[1:] = far_corners
+
+        if extrinsic is not None:
+            E = np.asarray(extrinsic, dtype=np.float64).reshape(4, 4)
+            verts_h = np.hstack([verts, np.ones((5, 1))])
+            verts = (E @ verts_h.T).T[:, :3]
+
+        # Edges: apex -> 4 corners + the rectangular base + a small "up" tick.
+        lines = [
+            [0, 1], [0, 2], [0, 3], [0, 4],   # apex to corners
+            [1, 2], [2, 3], [3, 4], [4, 1],   # base rectangle
+        ]
+
+        # "Up" indicator: tick from the midpoint of the top edge upward.
+        top_mid = 0.5 * (verts[1] + verts[2])
+        # Direction perpendicular to top edge, pointing away from base centre.
+        base_centre = verts[1:].mean(axis=0)
+        up_dir = top_mid - base_centre
+        up_norm = np.linalg.norm(up_dir)
+        if up_norm > 1e-9:
+            up_dir = up_dir / up_norm * (0.15 * scale)
+            verts = np.vstack([verts, top_mid + up_dir])
+            lines.append([1, len(verts) - 1])
+            lines.append([2, len(verts) - 1])
+
+        ls = o3d.geometry.LineSet()
+        ls.points = o3d.utility.Vector3dVector(verts)
+        ls.lines = o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32))
+        ls.colors = o3d.utility.Vector3dVector(
+            np.tile(np.asarray(color, dtype=np.float64), (len(lines), 1))
+        )
+        return ls
+
+    # ------------------------------------------------------------------
+    # Grid-detection / pose recovery (ported from data_manager_pickle.py)
+    # ------------------------------------------------------------------
+
+    def get_grid_coordinates(
+        self,
+        img_left: np.ndarray,
+        debug: bool = False,
+    ) -> list[tuple[int, int]]:
+        """Detect grid-of-dots peak coordinates in the centre of an IR image.
+
+        Ported from ``DataSource.get_grid_coordinates`` in
+        ``data_manager_pickle.py``: a Difference-of-Gaussians filter on a
+        400x400 centre crop, then non-maximum suppression with a maximum
+        filter and connected-component labelling.
+
+        Returns a list of ``(x, y)`` peaks in the original image's pixel
+        coordinates.
+        """
         from scipy.ndimage import maximum_filter, label
 
-        # crop 400x400 center region for better blob detection
+        if img_left is None or img_left.size == 0:
+            return []
+        if img_left.ndim == 3:
+            img_left = cv2.cvtColor(img_left, cv2.COLOR_BGR2GRAY)
+
         h, w = img_left.shape[:2]
         center_h, center_w = h // 2, w // 2
         crop_size = 200
-        img_gray = img_left[center_h - crop_size:center_h + crop_size, center_w - crop_size:center_w + crop_size].astype(np.float32) 
-
+        img_gray = img_left[
+            center_h - crop_size:center_h + crop_size,
+            center_w - crop_size:center_w + crop_size,
+        ].astype(np.float32)
 
         sigma1 = 2.0
         sigma2 = sigma1 * 1.6
@@ -809,176 +1550,152 @@ class DataSource:
         blur2 = cv2.GaussianBlur(img_gray, (0, 0), sigmaX=sigma2)
         img_dog = -(blur1 - blur2)
 
-        # 2. find_local_maxima(filtered_image, neighborhood_size=5, threshold=0.1):
-        """
-        Finds local maxima in the filtered image within a specified neighborhood.
-        """
-        # 1. Apply a maximum filter in a local neighborhood
         neighborhood_size = 37
         local_max = maximum_filter(img_dog, size=neighborhood_size) == img_dog
-        
-        # 2. Filter out background noise by ensuring peaks are above a certain intensity
+
         threshold = 0.1
-        background = (img_dog < threshold)
-        erased_background = local_max.copy()
-        erased_background[background] = False
-        
-        # 3. Label the unique peaks and get their coordinates
-        labeled, num_features = label(erased_background)
-    
-        # Find the center of mass (coordinates) for each labeled maximum
-        # scipy's label coordinates are returned as (y, x)
-        peaks = []; 
+        background = img_dog < threshold
+        erased = local_max.copy()
+        erased[background] = False
+
+        labeled, num_features = label(erased)
+
+        peaks: list[tuple[int, int]] = []
         for i in range(1, num_features + 1):
-            mask = (labeled == i)
-            y, x = np.where(mask)
-            peaks.append((int(np.mean(x)), int(np.mean(y)))) # Store as (x, y)
-            
+            ys, xs = np.where(labeled == i)
+            if xs.size == 0:
+                continue
+            peaks.append((int(np.mean(xs)), int(np.mean(ys))))
 
-        # 6. Extract and print the (x, y) coordinates
-        print(f"Total dots found: {len(peaks)}")
-        print("-" * 30)
-        print("Index |   X-Coord  |   Y-Coord")
-        print("-" * 30)
+        log.info(f"get_grid_coordinates: {len(peaks)} dots found")
 
-        coordinates = []
-        for i, kp in enumerate(peaks):
-            x, y = kp
-            coordinates.append((x+center_w-crop_size, y+center_h-crop_size))
-            print(f"{i+1:5d} | {x:10.2f} | {y:10.2f}")
+        coordinates: list[tuple[int, int]] = [
+            (x + center_w - crop_size, y + center_h - crop_size) for (x, y) in peaks
+        ]
 
-        if not debug:
-            return coordinates
+        if debug:
+            keypoints = [
+                cv2.KeyPoint(x=float(x), y=float(y), size=1) for (x, y) in peaks
+            ]
+            img_with_kp = cv2.drawKeypoints(
+                img_gray.astype(np.uint8),
+                keypoints,
+                np.array([]),
+                (0, 0, 255),
+                cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS,
+            )
+            plt.figure(figsize=(8, 6))
+            plt.imshow(img_with_kp)
+            plt.title(f"DoG peaks ({len(peaks)})")
+            plt.show(block=False)
 
-
-        # 7. Optional: Visualize the results
-        keypoints = []
-        for i, kp in enumerate(peaks):
-            x, y = kp
-            keypoints.append(cv2.KeyPoint(x=float(x), y=float(y), size=1))
-
-        # Draw detected blobs as red circles
-        img_with_keypoints = cv2.drawKeypoints(
-            img_gray.astype(np.uint8), 
-            keypoints, 
-            np.array([]), 
-            (0, 0, 255), 
-            cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS
-        )
-
-        # Save and show the output image
-        #cv2.imwrite('detected_dots.png', img_with_keypoints)
-        plt.figure(figsize=(8, 6))
-        plt.imshow(img_with_keypoints)
-        plt.show(block=False)
         return coordinates
 
-    def match_grid_to_cad(self, img_left:np.ndarray) -> np.ndarray:
-        """Match detected grid points to CAD model points to estimate camera pose."""
-        # This is a placeholder for the actual matching logic, which could involve:
-        # 1. Generating a synthetic depth image from the CAD model using the current pose estimate.
-        # 2. Detecting the same grid pattern in the synthetic depth image.
-        # 3. Using a RANSAC-based approach to find the best transformation that aligns the detected grid points with the corresponding CAD points.
+    def match_grid_to_cad(
+        self,
+        img_left: np.ndarray,
+        json_path: str,
+        debug: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Estimate camera->CAD pose by matching detected grid dots to a CAD grid.
+
+        Ported from ``DataSource.match_grid_to_cad`` in
+        ``data_manager_pickle.py``. Uses iterative Hungarian matching +
+        ``cv2.solvePnPRansac`` against a synthetic 30x30 CAD grid (25 mm
+        spacing). Returns ``(rvec, tvec)`` in mm.
+
+        Parameters
+        ----------
+        img_left : grayscale IR image used for dot detection.
+        json_path : the session JSON path; used to fetch the camera
+            intrinsics (``K``, distortion).
+        """
         from scipy.spatial.distance import cdist
         from scipy.optimize import linear_sum_assignment
 
-        # For demonstration, we will return an identity matrix as a placeholder.
-        # crearte 2D grid
-        grid_spacing_mm     = 25.0
-        grid_size           = (30,30) # 30x30 grid
-        grid_points_3d      = []
-        for x in range(-grid_size[0]//2, grid_size[0]//2 + 1):
-            for y in range(-grid_size[1]//2, grid_size[1]//2 + 1):
-                grid_points_3d.append((x * grid_spacing_mm, y * grid_spacing_mm, 0))
-        
-        grid_points_3d   = np.array(grid_points_3d, dtype=np.float32) # (N, 3)
-        cad_points      = grid_points_3d[:,:2] # only x,y
-        dist_points     = np.sum(np.abs(cad_points), axis=1) # center the cad points
-        cad_index_center = np.argmin(dist_points) # 
+        # Synthetic CAD grid in mm.
+        grid_spacing_mm = 25.0
+        grid_size = (30, 30)
+        grid_points_3d = np.array(
+            [
+                (x * grid_spacing_mm, y * grid_spacing_mm, 0.0)
+                for x in range(-grid_size[0] // 2, grid_size[0] // 2 + 1)
+                for y in range(-grid_size[1] // 2, grid_size[1] // 2 + 1)
+            ],
+            dtype=np.float32,
+        )
+        cad_points = grid_points_3d[:, :2]
 
-        # image points
-        img_points      = self.get_grid_coordinates(img_left, debug=True)
-        img_points      = np.asarray(img_points, dtype=np.float32)
+        # Detect dots in the image.
+        img_points_list = self.get_grid_coordinates(img_left, debug=debug)
+        if len(img_points_list) < 4:
+            log.warning(
+                "match_grid_to_cad: too few image points "
+                f"({len(img_points_list)}) for a robust pose estimate"
+            )
+            return np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
 
-        # decide about the center of coordinates for image points. Most close point to mean
-        dist_points     = np.sum(np.abs(img_points - np.mean(img_points, axis=0)), axis=1) # center the image points
+        img_points = np.asarray(img_points_list, dtype=np.float32)
 
-        # the closest point to the center of the image points will be the origin of the grid, and we will assume it corresponds to the origin of the CAD model for simplicity. In practice, you would need a more robust method to determine the correct correspondences between image points and CAD points.
-        img_index_center = np.argmin(dist_points) #
-        img_center_pixel = img_points[img_index_center].copy()  # save original pixel offset for later PnP
-        img_points_center= img_points - img_center_pixel  # center the image points
+        # Centre of detected points -> origin assumption.
+        dist_to_mean = np.sum(np.abs(img_points - np.mean(img_points, axis=0)), axis=1)
+        img_index_center = int(np.argmin(dist_to_mean))
+        img_center_pixel = img_points[img_index_center].copy()
+        img_points_centered = img_points - img_center_pixel
 
-        # srarting from the img_point center define a radius and start matching points in the radius to the cad points around cad_center, 
-        # and find the best matching transformation using RANSAC or a similar method. 
-        # Using the best match estimate the camera pose relative to the CAD model.
-        # Increase the radius iteratively until a sufficient number of matches are found or a maximum radius is reached.
-        # Improve matches gradually by refining the pose estimate and re-projecting the CAD points to the image plane, then re-matching with the detected image points, and iterating until convergence.
+        cam_matrix, dist_coeffs = self.get_intrinsics_matrix(json_path)
 
-        
-        cam_matrix, dist_coeffs = self.get_camera_intrinsics_and_distortion()
-
-        # --- 1. Initial scale (pixels per mm) from smallest non-zero radii ---
-        img_radii       = np.linalg.norm(img_points_center, axis=1)
-        cad_radii       = np.linalg.norm(cad_points, axis=1)
+        img_radii = np.linalg.norm(img_points_centered, axis=1)
+        cad_radii = np.linalg.norm(cad_points, axis=1)
         img_index_sorted = np.argsort(img_radii)
         cad_index_sorted = np.argsort(cad_radii)
 
-        # start from the closest points to the center 
-        n_match_points   = 7
-        rvec           = np.zeros(3, dtype=np.float64)
-        tvec           = np.zeros(3, dtype=np.float64)
-        tvec[2]        = 500.0 # initial depth guess in mm
+        n_match_points = 7
+        rvec = np.zeros(3, dtype=np.float64)
+        tvec = np.zeros(3, dtype=np.float64)
+        tvec[2] = 500.0  # initial depth guess in mm
 
-        is_matched      = False
-        while not is_matched:
-
-            # protect
-            if n_match_points >= len(img_points) or n_match_points >= len(cad_points):
-                log.warning("match_grid_to_cad: not enough points to match")
+        success_any = False
+        while True:
+            if (
+                n_match_points >= len(img_points)
+                or n_match_points >= len(cad_points)
+            ):
+                log.warning("match_grid_to_cad: exhausted available points")
                 break
 
-            # points in the current radius
-            img_points_current = img_points[img_index_sorted[:n_match_points]] 
-            cad_points_current = grid_points_3d[cad_index_sorted[:n_match_points],:]
+            img_pts_cur = img_points[img_index_sorted[:n_match_points]]
+            cad_pts_cur = grid_points_3d[cad_index_sorted[:n_match_points], :]
 
-            # project cad on image using current estimate of scale and rotation, and find the best matches between projected cad points and detected image points using nearest neighbor search within a certain radius.
-            cad_points_projected = cv2.projectPoints(
-                cad_points_current.reshape(-1, 1, 3), rvec, tvec, 
-                cam_matrix, dist_coeffs )[0].reshape(-1, 2)
-            
-            # try to match using minimal distance and a reasonable threshold based on the current scale estimate (e.g., 5 pixels)
-            # create a distance matrix between the points and find the best matches
-            # Hungarian algorithm: globally optimal one-to-one assignment that minimizes total reprojection distance.
-            distance_matrix = cdist(img_points_current, cad_points_projected, metric='euclidean')
+            cad_pts_proj = cv2.projectPoints(
+                cad_pts_cur.reshape(-1, 1, 3),
+                rvec, tvec, cam_matrix, dist_coeffs,
+            )[0].reshape(-1, 2)
 
-            # Gate by a distance threshold so impossible pairs cannot be forced into the assignment.
-            # Use a generous tolerance early (when the pose is rough) and tighten it as more points are matched.
+            distance_matrix = cdist(img_pts_cur, cad_pts_proj, metric="euclidean")
             gate_pix = max(grid_spacing_mm * 0.5, 50.0 / max(1.0, np.sqrt(n_match_points)))
             cost_matrix = distance_matrix.copy()
-            cost_matrix[cost_matrix > gate_pix] = 1e6  # large penalty for pairs beyond the gate
+            cost_matrix[cost_matrix > gate_pix] = 1e6
 
             row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
-            # Keep only assignments whose original distance is within the gate (drop the penalized ones).
             valid_pair_mask = distance_matrix[row_ind, col_ind] <= gate_pix
             if int(valid_pair_mask.sum()) < 4:
                 log.warning(
-                    f"match_grid_to_cad: hungarian found only {int(valid_pair_mask.sum())} valid pairs "
+                    f"match_grid_to_cad: only {int(valid_pair_mask.sum())} valid pairs "
                     f"at radius={n_match_points}, gate={gate_pix:.1f}px"
                 )
                 n_match_points = n_match_points * 2 + 3
                 continue
 
-            row_ind             = row_ind[valid_pair_mask]
-            col_ind             = col_ind[valid_pair_mask]
+            row_ind = row_ind[valid_pair_mask]
+            col_ind = col_ind[valid_pair_mask]
 
-            img_points_pnp     = img_points_current[row_ind].astype(np.float32)
-            cad_points_matched = cad_points_current[col_ind].astype(np.float32)
-            # use the best matches to estimate a new transformation using RANSAC or a similar method
-            # PnP estimation with RANSAC to find the best pose that aligns the matched points, and count the number of inliers based on a reprojection error threshold (e.g., 5 pixels).
+            img_pnp = img_pts_cur[row_ind].astype(np.float32)
+            cad_pnp = cad_pts_cur[col_ind].astype(np.float32)
+
             success, rvec, tvec, inlier_mask = cv2.solvePnPRansac(
-                cad_points_matched,
-                img_points_pnp,
+                cad_pnp,
+                img_pnp,
                 cam_matrix,
                 dist_coeffs,
                 rvec,
@@ -987,211 +1704,98 @@ class DataSource:
                 flags=cv2.SOLVEPNP_ITERATIVE,
                 reprojectionError=10.0,
                 iterationsCount=100,
-                confidence=0.95
+                confidence=0.95,
             )
             if not success:
-                log.warning(f"match_grid_to_cad: solvePnP failed radius={n_match_points}")
+                log.warning(
+                    f"match_grid_to_cad: solvePnP failed at radius={n_match_points}"
+                )
                 break
 
-            # find the best match with the most inliers, and if the number of inliers is sufficient (e.g., at least 4), consider it a successful match and use the estimated transformation as the initial pose estimate for further refinement.
-            num_inliers = inlier_mask.size if success else 0
-            log.info(f"match_grid_to_cad: radius={n_match_points}, inliers={num_inliers}")
+            success_any = True
+            num_inliers = inlier_mask.size if inlier_mask is not None else 0
+            log.info(
+                f"match_grid_to_cad: radius={n_match_points}, inliers={num_inliers}"
+            )
 
-            mask_index  = inlier_mask.flatten()
+            if debug:
+                plt.figure(figsize=(8, 6))
+                plt.imshow(img_left, cmap="gray")
+                plt.scatter(
+                    img_pts_cur[:, 0], img_pts_cur[:, 1],
+                    c="blue", label="Detected",
+                )
+                plt.scatter(
+                    cad_pts_proj[:, 0], cad_pts_proj[:, 1],
+                    c="red", label="Projected CAD",
+                )
+                plt.legend()
+                plt.title(f"Radius={n_match_points}, Inliers={num_inliers}")
+                plt.show(block=False)
 
-            plt.figure(figsize=(8, 6))
-            plt.imshow(img_left, cmap='gray')
-            plt.scatter(img_points_current[:, 0], img_points_current[:, 1], c='blue', label='Detected Points')
-            plt.scatter(cad_points_projected[:, 0], cad_points_projected[:, 1], c='red', label='Projected CAD Points')
-            #plt.scatter(cad_points_matched[mask_index, 0], cad_points_matched[mask_index, 1], marker='o', c='green', label='Inlier Points')
-            plt.legend()
-            plt.title(f"Radius={n_match_points}, Inliers={num_inliers}")
-            plt.show(block=False)
+            n_match_points = n_match_points * 2 + 3
 
-            n_match_points = n_match_points*2 + 3 # increase the radius to include more points in the next iteration
+        if not success_any:
+            log.warning("match_grid_to_cad: no successful PnP iteration")
+        return rvec.reshape(3), tvec.reshape(3)
 
-        return rvec, tvec
 
-# ----------------------------------
-# Visualization helpers.
-# ----------------------------------
-
-    def create_camera_frustum_lineset(
-        self,
-        image_size: tuple[int, int],
-        frustum_depth_m: float = 0.15,
-        camera_transform: Optional[np.ndarray] = None,
-        color: tuple[float, float, float] = (1.0, 1.0, 0.0),
-    ) -> o3d.geometry.LineSet:
-        """Create a wireframe camera frustum (polygon + rays) as an Open3D LineSet."""
-        intrinsics = self.scene_data.get("intrinsics", {})
-        fx = float(intrinsics.get("fx", 1.0))
-        fy = float(intrinsics.get("fy", 1.0))
-        cx = float(intrinsics.get("ppx", image_size[0] * 0.5))
-        cy = float(intrinsics.get("ppy", image_size[1] * 0.5))
-
-        width, height = image_size
-        if width <= 1 or height <= 1:
-            width, height = 1280, 720
-
-        # Frustum points in camera coordinates.
-        z = float(frustum_depth_m)
-        corners_px = np.array(
-            [
-                [0.0, 0.0],
-                [width - 1.0, 0.0],
-                [width - 1.0, height - 1.0],
-                [0.0, height - 1.0],
-            ],
-            dtype=np.float64,
-        )
-        corners = np.zeros((4, 3), dtype=np.float64)
-        corners[:, 0] = (corners_px[:, 0] - cx) / max(fx, 1e-9) * z
-        corners[:, 1] = (corners_px[:, 1] - cy) / max(fy, 1e-9) * z
-        corners[:, 2] = z
-
-        points = np.vstack([np.zeros((1, 3), dtype=np.float64), corners])
-        lines = [
-            [0, 1], [0, 2], [0, 3], [0, 4],  # rays
-            [1, 2], [2, 3], [3, 4], [4, 1],  # image-plane polygon
-        ]
-
-        # Optional world transform.
-        if camera_transform is not None:
-            t = np.asarray(camera_transform, dtype=np.float64).reshape(4, 4)
-            p_h = np.hstack([points, np.ones((points.shape[0], 1), dtype=np.float64)])
-            points = (p_h @ t.T)[:, :3]
-
-        line_set = o3d.geometry.LineSet()
-        line_set.points = o3d.utility.Vector3dVector(points)
-        line_set.lines = o3d.utility.Vector2iVector(lines)
-        line_set.paint_uniform_color(color)
-        return line_set
-
-    def draw_scene(
-        self,
-        item_or_index: Union[int, dict[str, Any]],
-        show_depth_cloud: bool = False,
-        axis_size_m: float = 0.08,
-        frustum_depth_m: float = 0.12,
-    ) -> None:
-        """Draw scene with object cloud, camera polygon(frustrum) and both RGB axes.
-
-        - Object cloud: CAD point cloud transformed by `t_tooltip_cad` (gray)
-        - Camera polygon: frustum wireframe (yellow)
-        - Object axis: transformed by `t_tooltip_cad` (RGB)
-        - Camera axis: transformed by `t_camera_tooltip` (RGB)
-        """
-        item = self.get_item(item_or_index, debug=False) if isinstance(item_or_index, int) else item_or_index
-
-        t_tooltip_cad    = np.asarray(item["t_tooltip_cad"], dtype=np.float64)
-        t_camera_tooltip = np.asarray(item["t_camera_tooltip"],  dtype=np.float64)
-        t_camera_cad     = np.asarray(item["t_camera_cad"], dtype=np.float64)
-
-        # object to be manipulated, in the world coordinate system (same as camera), transformed by tooltip→CAD
-        object_pcd       = copy.deepcopy(item["cad_pcd"])
-        #object_pcd.transform(t_tooltip_cad)
-        object_pcd.paint_uniform_color([0.6, 0.6, 0.6])
-
-        # Infer image size from vertices filename when available.
-        image_size = (1280, 720)
-        cam_vertices_path = item.get("camera_vertices_path", "")
-        if isinstance(cam_vertices_path, str) and len(cam_vertices_path) > 0:
-            try:
-                image_size = parse_resolution(Path(cam_vertices_path).name)
-            except Exception:
-                pass
-
-        camera_axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=float(axis_size_m))
-        #camera_axis.transform(t_camera_tooltip)
-        camera_axis.transform(t_camera_cad)
-
-        object_axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=float(axis_size_m))
-        #object_axis.transform(t_tooltip_cad)
-
-        frustum = self.create_camera_frustum_lineset(
-            image_size=image_size,
-            frustum_depth_m=frustum_depth_m,
-            camera_transform=t_camera_cad, #t_camera_tooltip,
-            color=(1.0, 1.0, 0.0),
-        )
-
-        geometries: list[o3d.geometry.Geometry] = [object_pcd, frustum, camera_axis, object_axis]
-
-        if show_depth_cloud and "depth_pcd_raw" in item and item["depth_pcd_raw"] is not None:
-            depth_pcd = copy.deepcopy(item["depth_pcd_raw"])
-            depth_pcd.paint_uniform_color([1.0, 0.0, 1.0])
-            geometries.append(depth_pcd)
-
-        o3d.visualization.draw(geometries)
-    
-    def show_subset(self, img_list, ttl_list, vmin=None, vmax=None, save_path='', fig_name=''):
-        """Display a list of images in a grid."""
-        img_num = len(img_list)
-        col_num = min(img_num, 3)
-        row_num = int(np.ceil(img_num / col_num))
-        fig, axes = plt.subplots(row_num, col_num, sharey=True, sharex=True)
-        axes = np.array(axes).reshape(row_num, col_num)
-        for k in range(img_num):
-            ri, ci = k // col_num, k % col_num
-            if img_list[k] is None: continue
-            vmax = 50 if k in [0,1] else vmax
-            axes[ri, ci].imshow(img_list[k], vmin=vmin, vmax=vmax)
-            axes[ri, ci].set_title(ttl_list[k])
-        for k in range(img_num, row_num * col_num):
-            axes[k // col_num, k % col_num].axis('on')
-        if save_path and os.path.exists(save_path):
-            fig.savefig(os.path.join(save_path, fig_name + ".png"))
-        plt.show(block=False)    
-    
-    def save_to_ply(self, points: np.ndarray, filename: str):
-        """Save a point cloud to a PLY file for visualization."""
-        if not self.save_point_cloud:
-            return
-        with open(filename, 'w') as f:
-            f.write('ply\n')
-            f.write('format ascii 1.0\n')
-            f.write(f'element vertex {len(points)}\n')
-            f.write('property float x\n')
-            f.write('property float y\n')
-            f.write('property float z\n')
-            f.write('end_header\n')
-            for x, y, z in points:
-                f.write(f'{x} {y} {z}\n')
-        log.info(f"Saved point cloud to {filename}")    
-
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
 class TestDataSource(unittest.TestCase):
-    """Basic tests for class-based scene data manager."""
+    """Tests mirroring ``data_manager_pickle.py`` but using the xls manifest.
+
+    Mapping between the legacy class and this class:
+
+      * ``init_directory(scene_id)``         -> ``init_directory()`` (xls)
+      * ``out["left_img"]``                  -> ``out["ir_left_img"]``
+      * ``out["right_img"]``                 -> ``out["ir_right_img"]``
+      * ``out["depth_rs_img"]``              -> ``out["depth_img"]``
+      * ``draw_scene(item, ...)``            -> ``draw_point_clouds(item)``
+      * ``load_csv_with_icp_results(idx)``   -> ``load_icp_csv()`` + ``_icp_t_camera_cad(idx)``
+
+    Tests for methods that have no equivalent in the xls-based DataSource
+    (``get_item_projected``, ``get_item_icp_projected``, ``get_grid_coordinates``,
+    ``match_grid_to_cad``) are kept under the same names but ``skipTest`` so
+    the test list stays consistent across both modules.
+    """
 
     def test_init_directory(self):
         source = DataSource()
         count = source.init_directory()
+        log.info(f"Indexed {count} captures")
         self.assertTrue(count > 0)
+        first = source.items[0]
+        self.assertIn("json_path", first)
+        self.assertIn("capture_idx", first)
+        self.assertIn("vertices_path", first)
 
     def test_get_item(self):
         source = DataSource()
         count = source.init_directory()
         self.assertTrue(count > 0)
 
-        out = source.get_item(4, debug=True)
+        out = source.get_item(min(4, count - 1), debug=True)
         self.assertIn("depth_pcd_raw", out)
         self.assertIn("cad_pcd_aligned", out)
         self.assertEqual(out["t_camera_cad"].shape, (4, 4))
-        self.assertTrue(len(out["depth_pcd_raw"].points) > 0)
+        self.assertTrue(out["depth_pcd_raw"] is not None and len(out["depth_pcd_raw"].points) > 0)
 
     def test_show_images(self):
-        p       = DataSource()
+        p = DataSource()
         img_num = p.init_directory()
         if img_num == 0:
             log.warning("No images found.")
             return
         for k in np.random.randint(0, img_num, size=min(2, img_num)):
             out = p.get_item(int(k), debug=False)
-            self.assertTrue(len(out["left_img"]) > 0)
-            p.show_subset([out["left_img"], out["right_img"],  out["depth_rs_img"]],
-                          ['left (RS)', 'right (RS)', 'depth RS (mm)'])
-
+            self.assertTrue(out["ir_left_img"] is not None and out["ir_left_img"].size > 0)
+            p.show_subset(
+                [out["ir_left_img"], out["ir_right_img"], out["depth_img"]],
+                ["left (RS)", "right (RS)", "depth RS (mm)"],
+            )
         plt.show()
 
     def test_draw_scene(self):
@@ -1199,80 +1803,192 @@ class TestDataSource(unittest.TestCase):
         count = source.init_directory()
         self.assertTrue(count > 0)
         item = source.get_item(0, debug=False)
-        source.draw_scene(item, show_depth_cloud=False)
+        # New API: draw_point_clouds is the equivalent of draw_scene.
+        source.draw_point_clouds(item)
 
     def test_get_item_projected(self):
         source = DataSource()
-        scene_id, item_id = 5, 4
-        count = source.init_directory(scene_id)
+        count = source.init_directory()
         self.assertTrue(count > 0)
+        item_id = np.random.randint(0, count)
         out = source.get_item_projected(item_id, debug=True)
         self.assertIn("depth_cad_projected", out)
-        self.assertEqual(out["depth_cad_projected"].shape, out["depth_rs_img"].shape)
+        self.assertEqual(out["depth_cad_projected"].shape, out["depth_img"].shape)
+
+    def test_get_item_projected_raycast(self):
+        source = DataSource()
+        count = source.init_directory()
+        self.assertTrue(count > 0)
+        item_id = np.random.randint(0, count)
+        out = source.get_item_projected(item_id, debug=True, method="raycast")
+        self.assertIn("depth_cad_projected", out)
+        self.assertEqual(out["projection_method"], "raycast")
+        self.assertEqual(out["depth_cad_projected"].shape, out["depth_img"].shape)
+        # Raycast produces a fully dense silhouette: at least one pixel hit.
+        self.assertGreater(int(np.count_nonzero(out["depth_cad_projected"])), 0)
+
+    def test_get_item_projected_open3d(self):
+        source          = DataSource()
+        count           = source.init_directory()
+        self.assertTrue(count > 0)
+        item_id         = np.random.randint(0, count)
+        out = source.get_item_projected(item_id, debug=True, method="open3d")
+        self.assertIn("depth_cad_projected", out)
+        self.assertEqual(out["projection_method"], "open3d  ")
+        self.assertEqual(out["depth_cad_projected"].shape, out["depth_img"].shape)
+        # Open3D produces a fully dense silhouette: at least one pixel hit.
+        self.assertGreater(int(np.count_nonzero(out["depth_cad_projected"])), 0)
+
+    def test_project_on_camera(self):
+        # NOTE: Open3D's ``OffscreenRenderer`` (Filament backend) is not
+        # supported on Windows wheels (it requires EGL headless). On Windows
+        # we use a hidden ``Visualizer`` window + ``capture_screen_float_buffer``
+        # to render a mesh to an RGB image with explicit pinhole intrinsics.
+
+        image_width, image_height = 640, 480
+
+        # Build pinhole intrinsics from a vertical FOV of 60 deg.
+        fov_deg = 60.0
+        fy = image_height / (2.0 * np.tan(np.deg2rad(fov_deg) / 2.0))
+        fx = fy
+        cx = image_width / 2.0
+        cy = image_height / 2.0
+        intrinsic = o3d.camera.PinholeCameraIntrinsic(
+            image_width, image_height, fx, fy, cx, cy
+        )
+
+        # Mesh to render.
+        mesh = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
+        mesh.compute_vertex_normals()
+
+        # Look-at extrinsic: camera at (2, 2, 2), looking at origin, +Z up.
+        eye = np.array([2.0, 2.0, 2.0], dtype=np.float64)
+        center = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        f = (center - eye)
+        f /= np.linalg.norm(f)
+        s = np.cross(f, up)
+        s /= np.linalg.norm(s)
+        u = np.cross(s, f)
+        # Open3D's pinhole convention: +Z forward, +Y down.
+        # Build R such that R @ world = camera; rows are camera basis vectors.
+        rotation = np.stack([s, -u, f], axis=0)
+        translation = -rotation @ eye
+        extrinsic = np.eye(4, dtype=np.float64)
+        extrinsic[:3, :3] = rotation
+        extrinsic[:3, 3] = translation
+
+        vis = o3d.visualization.Visualizer()
+        created = vis.create_window(
+            visible=False, width=image_width, height=image_height
+        )
+        if not created:
+            self.skipTest("Could not create Open3D window for offscreen render")
+
+        try:
+            vis.add_geometry(mesh)
+
+            ctr = vis.get_view_control()
+            params = ctr.convert_to_pinhole_camera_parameters()
+            params.intrinsic = intrinsic
+            params.extrinsic = extrinsic
+            ctr.convert_from_pinhole_camera_parameters( params, allow_arbitrary=True)
+
+            vis.poll_events()
+            vis.update_renderer()
+            float_img = vis.capture_screen_float_buffer(do_render=True)
+        finally:
+            vis.destroy_window()
+
+        image_ndarray = np.asarray(float_img)
+        self.assertEqual(image_ndarray.shape, (image_height, image_width, 3))
+
+        # Save out the rendered RGB frame for inspection.
+        rgb_uint8 = np.ascontiguousarray(
+            (np.clip(image_ndarray, 0.0, 1.0) * 255.0).astype(np.uint8)
+        )
+        out_path = Path("projected_mesh_output.png").resolve()
+        ok = o3d.io.write_image(str(out_path), o3d.geometry.Image(rgb_uint8))
+        log.info(f"test_project_on_camera: wrote {out_path} (ok={ok})")
+        self.assertTrue(out_path.exists())
 
     def test_show_icp_alignment(self):
         source = DataSource()
-        scene_id, item_id = 3, 95
-        count = source.init_directory(scene_id)
+        count = source.init_directory()
         self.assertTrue(count > 0)
-        item = source.get_item_with_icp(item_id, debug=True)
+        loaded = source.load_icp_csv()
+        if not loaded:
+            self.skipTest("No ICP CSV available in the manifest")
+        item = source.get_item_with_icp(min(7, count - 1), debug=True)
+        self.assertIsNotNone(item.get("t_camera_cad_icp"))
 
     def test_get_item_icp_projected(self):
         source = DataSource()
-        scene_id, item_id = 4, 12 # 42, 55-ok
-        count = source.init_directory(scene_id)
+        count = source.init_directory()
         self.assertTrue(count > 0)
-        out = source.get_item_icp_projected(item_id, debug=True)
+        loaded = source.load_icp_csv()
+        if not loaded:
+            self.skipTest("No ICP CSV available in the manifest")
+        item_id = min(4, count - 1)
+        out = source.get_item_projected(item_id, debug=True, use_icp=True)
         self.assertIn("depth_cad_projected", out)
-        self.assertEqual(out["depth_cad_projected"].shape, out["depth_rs_img"].shape)        
+        self.assertEqual(out["depth_cad_projected"].shape, out["depth_img"].shape)
 
     def test_get_grid_coordinates(self):
         source = DataSource()
-        scene_id, item_id = 4, 3
-        count = source.init_directory(scene_id)
+        count = source.init_directory()
         self.assertTrue(count > 0)
+        item_id = min(3, count - 1)
         item = source.get_item(item_id, debug=False)
-        coordinates = source.get_grid_coordinates(item["left_img"])
+        coordinates = source.get_grid_coordinates(item["ir_left_img"], debug=True)
+        plt.show()
         self.assertTrue(len(coordinates) > 0)
 
     def test_match_grid_to_cad(self):
         source = DataSource()
-        scene_id, item_id = 4, 2
-        count                   = source.init_directory(scene_id)
+        count = source.init_directory()
         self.assertTrue(count > 0)
-        item                    = source.get_item(item_id, debug=False)
-        rvec, tvec              = source.match_grid_to_cad(item["left_img"])
-        # transfrom rvec tvec to T_camera_cad homogenious transformation matrix
-        R, _                    = cv2.Rodrigues(rvec)
-        T_camera_cad = np.eye(4, dtype=np.float64)
-        T_camera_cad[:3, :3]    = R
-        T_camera_cad[:3, 3]     = tvec/1000.0 # convert mm to m
+        item_id = min(2, count - 1)
+        item = source.get_item(item_id, debug=False)
 
-        # use ICP results
-        T_camera_cad_icp        = source.load_csv_with_icp_results(item_id)
-        T_camera_cad_icp        = T_camera_cad_icp #@ T_flip_z_direction
+        rvec, tvec = source.match_grid_to_cad(
+            item["ir_left_img"], item["json_path"], debug=True
+        )
+        # Build T_camera_cad from rvec/tvec (mm) for inspection.
+        R, _ = cv2.Rodrigues(rvec)
+        t_camera_cad = np.eye(4, dtype=np.float64)
+        t_camera_cad[:3, :3] = R
+        t_camera_cad[:3, 3] = tvec / 1000.0  # mm -> m
 
-        print("Estimated T_camera_cad from grid matching:"  )
-        print(T_camera_cad)
-        print("ICP refined T_camera_cad:"  )
-        print(T_camera_cad_icp)
-
+        # Optionally compare with the ICP-refined pose if available.
+        if source.load_icp_csv():
+            t_camera_cad_icp = source._icp_t_camera_cad(item["capture_idx"])
+            log.info(f"Estimated T_camera_cad (grid):\n{t_camera_cad}")
+            log.info(f"ICP T_camera_cad:\n{t_camera_cad_icp}")
+        else:
+            log.info(f"Estimated T_camera_cad (grid):\n{t_camera_cad}")
 
         plt.show()
         self.assertEqual(rvec.shape, (3,))
         self.assertEqual(tvec.shape, (3,))
 
-def RunTest():
-    tst = TestDataSource()
-    #tst.test_init_directory()
-    #tst.test_get_item()
-    #tst.test_show_images()
-    #tst.test_draw_scene() # ok
-    #tst.test_get_item_projected()
-    #tst.test_show_icp_alignment()
-    #tst.test_get_item_icp_projected()
-    #tst.test_get_grid_coordinates()
-    tst.test_match_grid_to_cad()
 
-if __name__ == '__main__':
+def RunTest() -> None:
+    tst = TestDataSource()
+    # tst.test_init_directory()
+    # tst.test_get_item() # ok
+    # tst.test_show_images() # ok
+    #tst.test_draw_scene() # ok
+    #tst.test_get_item_projected() # ok
+    #tst.test_get_item_projected_raycast() # ok
+    tst.test_get_item_projected_open3d()
+    #tst.test_project_on_camera()
+    # tst.test_show_icp_alignment()
+    #tst.test_get_item_icp_projected()
+    # tst.test_get_grid_coordinates()
+    # tst.test_match_grid_to_cad()
+
+
+if __name__ == "__main__":
     RunTest()
