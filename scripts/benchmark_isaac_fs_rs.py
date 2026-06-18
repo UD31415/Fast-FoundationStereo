@@ -86,24 +86,26 @@ from report import ReportGenerator
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-ISAC_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/reflective_test'
+#ISAC_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/reflective_test'
+ISAAC_DIR    = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/isaac_basic_objects'
 ORIGINAL_PATH  = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 #FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
 #FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_data_0518_bf_epoch_071.pth'
-FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_0518_epoch_067.pth'
+#FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_0518_epoch_067.pth'
+FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_epoch_018.pth'
 #FINETUNED_PATH = f'{code_dir}/../weights/20-30-48/model_finetuned_faro_kitchen_epoch_006_epoch_013.pth'
 DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_isaac_fs_rs'
 
 # ISAC dataset filtering (see data_manager_isaac.KNOWN_VIEWS = front/overhead/side/wrist)
 DEFAULT_VIEWS: Tuple[str, ...] = ('wrist',) #('front', 'overhead', 'side', 'wrist')
-DEFAULT_EPISODES: Tuple[str, ...] = ('episode_02',)      # empty == all episodes
+DEFAULT_EPISODES: Tuple[str, ...] = ('episode_12','episode_16','episode_18',)      # empty == all episodes
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {DEVICE}")
 
-D435_FX_PX       = 674.4 #642.72 #388.462
-D435_BASELINE_MM = 49.95
-BF               = D435_FX_PX * D435_BASELINE_MM   # focal_px * baseline_mm
+# D435_FX_PX       = 674.4 #642.72 #388.462
+# D435_BASELINE_MM = 49.95
+#BF               = D435_FX_PX * D435_BASELINE_MM   # focal_px * baseline_mm
 #BF     = 32339.97067817836 # D435i 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
 ITERS           = 8          # GRU update iterations
 N_VIZ           = 12         # frames saved for visual comparison in the report
@@ -123,10 +125,10 @@ BIN_LABELS_MM  = ["0–100 mm", "100–200 mm", "200–500 mm", "500–1000 mm",
 BIN_CENTERS_MM = [50.0, 150.0, 350.0, 750.0, 1250.0]
 
 METHODS: Dict[str, Dict[str, str]] = {
-    "original":  {"label": "FFS Original",                "color": "#2980b9"},
-    "finetuned": {"label": "FFS Fine-tuned (INBOLT)",     "color": "#e74c3c"},
+    "original":  {"label": "FFS Original",               "color": "#2980b9"},
+    "finetuned": {"label": "FFS Fine-tuned (ISAAC)",     "color": "#e74c3c"},
     "depth_rs":  {"label": "RealSense Hardware Depth",    "color": "#f39c12"},
-    "isaac_gt":  {"label": "ISAC GT (depth_left)",        "color": "#27ae60"},
+    "isaac_gt":  {"label": "ISAAC GT (depth_left)",       "color": "#27ae60"},
 }
 GT_NAME = "isaac_gt"
 RS_NAME = "depth_rs"   # pre-recorded RealSense active-stereo depth from the dataset
@@ -160,7 +162,7 @@ def _preprocess_ir(left: np.ndarray, right: np.ndarray):
 
 
 @torch.no_grad()
-def infer_depth_mm(model, left: np.ndarray, right: np.ndarray) -> np.ndarray:
+def infer_depth_mm(model, left: np.ndarray, right: np.ndarray, bf: float) -> np.ndarray:
     """Run stereo inference on an IR pair; return depth map in mm (H×W float32).
 
     BF = focal_px × baseline_mm, so  depth_mm = BF / disparity_px.
@@ -178,7 +180,7 @@ def infer_depth_mm(model, left: np.ndarray, right: np.ndarray) -> np.ndarray:
 
     depth_mm = np.zeros_like(disp_np)
     valid = disp_np > 0
-    depth_mm[valid] = BF / disp_np[valid]   # disparity → mm  (BF already in focal·mm)
+    depth_mm[valid] = bf / disp_np[valid]   # disparity → mm  (BF already in focal·mm)
     return depth_mm
 
 
@@ -327,6 +329,7 @@ class ReportGeneratorMM(ReportGenerator):
         ax.set_xlabel("Distance range", fontsize=10)
         ax.set_ylabel("Mean Absolute Error (mm)", fontsize=10)
         ax.set_title("Depth Error vs Distance", fontsize=12)
+        ax.set_ylim(0, 100) # mm
         ax.legend(fontsize=9)
         ax.grid(alpha=0.3)
         fig.tight_layout()
@@ -459,7 +462,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--out_dir',   default=DEFAULT_OUT,    help='Output directory for the report')
-    parser.add_argument('--isaac_dir', default=ISAC_DIR,       help='Path to ISAC reflective_test dataset root')
+    parser.add_argument('--isaac_dir', default=ISAAC_DIR,      help='Path to ISAAC reflective_test dataset root')
     parser.add_argument('--original',  default=ORIGINAL_PATH,  help='Path to original model weights')
     parser.add_argument('--finetuned', default=FINETUNED_PATH, help='Path to fine-tuned model weights')
     parser.add_argument('--n_viz', type=int, default=N_VIZ,    help='Frames saved for visual comparison')
@@ -486,7 +489,7 @@ def main():
     active_methods = [GT_NAME, RS_NAME] + list(models.keys())
 
     # ── dataset ───────────────────────────────────────────────────────────────
-    source = DataSource()
+    source = DataSource(train_mode=False)
     views_tuple    = tuple(args.views) if args.views else None
     episodes_tuple = tuple(args.episodes) if args.episodes else None
     n = source.init_directory(
@@ -514,6 +517,7 @@ def main():
         right = data['ir_right_img']
         gt_mm = data['depth_gt_img'].astype(np.float32)   # ISAC GT — already in mm
         rs_mm = data['depth_rs_img'].astype(np.float32)   # RealSense hardware — already in mm
+        bf    = data['bf'] #if 'bf' in data else BF
 
         if H is None:
             H, W = gt_mm.shape[:2]
@@ -524,7 +528,7 @@ def main():
         frame_depths = {GT_NAME: gt_mm, RS_NAME: rs_mm}
         for mname, model in models.items():
             t0 = time.monotonic()
-            frame_depths[mname] = infer_depth_mm(model, left, right)
+            frame_depths[mname] = infer_depth_mm(model, left, right, bf)
             timing_ms_raw[mname].append((time.monotonic() - t0) * 1000.0)
 
         # ── per-frame metrics (all values in mm) ──────────────────────────────

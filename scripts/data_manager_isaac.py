@@ -331,13 +331,14 @@ def colorize_label_mask(labels: np.ndarray, seed: int = 0) -> np.ndarray:
 class DataSource:
     """Class-based loader for the ISAC reflective_test dataset."""
 
-    def __init__(self) -> None:
+    def __init__(self, train_mode = False) -> None:
         self.root: Optional[Path] = None
         #self.depth_kind: str = DEFAULT_DEPTH_KIND
         # Each entry describes one (episode, view, frame) sample.
         self.items: list[dict[str, Any]] = []
         # Per-episode camera parameters loaded from <episode>/camera_params.json.
         self.episode_camera_params: dict[str, dict[str, Any]] = {}
+        self.train_mode = train_mode
         log.info("ISAAC DataSource is defined")
 
     def __len__(self) -> int:
@@ -459,10 +460,17 @@ class DataSource:
             log.error(f"ISAC dataset root does not exist: {self.root}")
             return 0
 
-        episode_dirs = sorted(
-            p for p in self.root.iterdir()
-            if p.is_dir() and (episodes is None or p.name in episodes)
-        )
+        if self.train_mode:
+            episode_dirs = sorted(
+                p for p in self.root.iterdir()
+                if p.is_dir() and (episodes is None or p.name not in episodes)
+            )
+        else:
+            episode_dirs = sorted(
+                p for p in self.root.iterdir()
+                if p.is_dir() and (episodes is None or p.name  in episodes)
+            )
+
         view_names = views if views is not None else KNOWN_VIEWS
 
         for ep_dir in episode_dirs:

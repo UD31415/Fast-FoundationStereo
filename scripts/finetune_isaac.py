@@ -16,6 +16,11 @@ Strategy:
 Usage:
   cd /path/to/Fast-FoundationStereo
   python scripts/finetune_inbolt.py
+
+Cluster:
+    ssh urid@vtg-ptk-dsk07.realsenseai.com
+    cd ~/dev/Fast-FoundationStereo
+    sbatch train.sbatch  
 """
 
 import os, sys, logging
@@ -154,7 +159,7 @@ def extract_patches(left, right, depth, valid, patch_size=512, min_valid_ratio=0
 
 class IsaacDataset(Dataset):
     def __init__(self, root,train_mode=True):
-        self.source = DataSource()
+        self.source = DataSource(train_mode=train_mode)
         n = self.source.init_directory(root = root)
         logging.info(f"DataSource found {n} samples in {root}")
 
