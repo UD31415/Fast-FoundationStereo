@@ -513,7 +513,7 @@ def main():
     H = W = None
 
     for idx in range(n):
-        data  = source.get_item_projected(idx, method=args.projection)
+        data  = source.get_item_and_scene_projected(idx)
         left  = data['ir_left_img']
         right = data['ir_right_img']
         gt_mm = data['depth_cad_projected'].astype(np.float32)   # Pickle CAD-rendered GT (mm)
