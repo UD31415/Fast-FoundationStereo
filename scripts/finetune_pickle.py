@@ -44,6 +44,8 @@ PICKLE_DIR    = (
     r"/yg_pickle/2026-06-18--10-01-03/Pickle_Scene_Capture_336222073841"
     r"/data path.xlsx"
 )
+
+
 # MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 # OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415.pth'
 MODEL_PATH = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
@@ -170,8 +172,8 @@ class PickleDataset(Dataset):
 
     def __getitem__(self, idx):
         #data  = self.source.get_item(idx)  # 2026-04
-        data  = self.source.get_item_projected(idx) 
-        #data  = self.source.get_item_transformed_and_projected(idx)  # 2026-05-18 with plane fitting
+        #data  = self.source.get_item_projected(idx) 
+        data  = self.source.get_item_and_scene_projected(idx)  # 2026-05-18 with plane fitting
         left  = data['ir_left_img']
         right = data['ir_right_img']
         depth = data['depth_img']   #

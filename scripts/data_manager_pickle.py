@@ -1021,7 +1021,7 @@ class DataSource:
         if index < 0 or index >= len(self.items):
             raise IndexError(f"Sample index out of range: {index}")
 
-        log.info(f"Loading item {index}/{len(self.items)}...")
+        #log.info(f"Loading item {index}/{len(self.items)}...")
         meta            = self.items[index]
         json_path       = meta["json_path"]
         session         = self.sessions[json_path]
