@@ -158,7 +158,7 @@ def extract_patches(left, right, depth, valid, patch_size=512, min_valid_ratio=0
 # ── dataset ──────────────────────────────────────────────────────────────────
 
 class IsaacDataset(Dataset):
-    def __init__(self, root,train_mode=True):
+    def __init__(self, root, train_mode=True):
         self.source = DataSource(train_mode=train_mode)
         n = self.source.init_directory(root = root)
         logging.info(f"DataSource found {n} samples in {root}")

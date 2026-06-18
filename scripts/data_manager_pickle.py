@@ -69,12 +69,20 @@ log.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=log.INF
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-
+# set 1 - with aligned data
 DEFAULT_EXCEL = (
     r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
     r"\yg_pickle\2026-06-16--15-12-54\Pickle_Scene_Capture_336222073841"
     r"\data path.xlsx"
 )
+# here you have additional data with stronger angles and translations. Tell me if the alignment holds even here
+DEFAULT_EXCEL = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
+    r"\yg_pickle\2026-06-18--10-01-03\Pickle_Scene_Capture_336222073841"
+    r"\data path.xlsx"
+)
+
+
 DEFAULT_STL_NAME = "cube_100x100x100"
 
 LABEL_RAW = "raw data (json file)"
@@ -554,7 +562,7 @@ def colorize_label_mask(labels: np.ndarray, seed: int = 0) -> np.ndarray:
 class DataSource:
     """Loader for the ISAC / Pickle Excel-driven capture dataset."""
 
-    def __init__(self) -> None:
+    def __init__(self,train_mode = False) -> None:
         self.excel_path: Optional[Path] = None
         self.stl_name: Optional[str] = None
         self.manifest_df: Optional[pd.DataFrame] = None
@@ -573,6 +581,7 @@ class DataSource:
         # Lazily loaded ICP refinements: ``capture_uid -> 4x4 matrix``.
         self.icp_table: Optional[pd.DataFrame] = None
         self.icp_path: Optional[Path] = None
+        self.train_mode = train_mode
 
         log.info("Pickle DataSource is defined")
 
@@ -586,7 +595,6 @@ class DataSource:
     def init_directory(
         self,
         excel_path: str | os.PathLike[str] = DEFAULT_EXCEL,
-        stl_name: Optional[str] = DEFAULT_STL_NAME,
         json_paths: Optional[Sequence[str]] = None,
     ) -> int:
         """Index every capture across all matching session JSONs.
@@ -619,11 +627,11 @@ class DataSource:
             df = pd.read_excel(self.excel_path)
             self.manifest_df = df
             mask = df["Label"].astype(str) == LABEL_RAW
-            if stl_name is not None:
-                mask &= df["STL name"].astype(str) == str(stl_name)
+            # if stl_name is not None:
+            #     mask &= df["STL name"].astype(str) == str(stl_name)
             session_jsons = [str(p) for p in df.loc[mask, "Data Path"].tolist()]
 
-        self.stl_name = stl_name
+        #self.stl_name = stl_name
 
         for json_path in session_jsons:
             self.index_session(json_path)
@@ -1980,9 +1988,9 @@ def RunTest() -> None:
     # tst.test_get_item() # ok
     # tst.test_show_images() # ok
     #tst.test_draw_scene() # ok
-    #tst.test_get_item_projected() # ok
+    tst.test_get_item_projected() # ok
     #tst.test_get_item_projected_raycast() # ok
-    tst.test_get_item_projected_open3d()
+    #tst.test_get_item_projected_open3d()
     #tst.test_project_on_camera()
     # tst.test_show_icp_alignment()
     #tst.test_get_item_icp_projected()

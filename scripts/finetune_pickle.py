@@ -37,6 +37,11 @@ from scripts.data_manager_pickle_new import DataSource
 # ── constants ────────────────────────────────────────────────────────────────
 
 PICKLE_DIR    = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/pickle_datasets/pickle_basic_objects'
+PICKLE_DIR    = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
+    r"\yg_pickle\2026-06-18--10-01-03\Pickle_Scene_Capture_336222073841"
+    r"\data path.xlsx"
+)
 # MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 # OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415.pth'
 MODEL_PATH = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
@@ -153,9 +158,9 @@ def extract_patches(left, right, depth, valid, patch_size=512, min_valid_ratio=0
 # ── dataset ──────────────────────────────────────────────────────────────────
 
 class PickleDataset(Dataset):
-    def __init__(self, root,train_mode=True):
-        self.source = DataSource()
-        n = self.source.init_directory(root = root)
+    def __init__(self, root, train_mode=True):
+        self.source = DataSource(train_mode=train_mode)
+        n = self.source.init_directory(excel_path = root)
         logging.info(f"DataSource found {n} samples in {root}")
 
     def __len__(self):
@@ -166,7 +171,7 @@ class PickleDataset(Dataset):
         #data  = self.source.get_item_transformed_and_projected(idx)  # 2026-05-18 with plane fitting
         left  = data['ir_left_img']
         right = data['ir_right_img']
-        depth = data['depth_gt_img']   # float32, mm  (Zivid resolution)
+        depth = data['depth_gt_img']   # 
         bf    = data['bf']                 # float32, mm*px
 
         # Resize Zivid depth to match RealSense stereo image resolution
