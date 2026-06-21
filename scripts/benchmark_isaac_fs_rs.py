@@ -92,7 +92,7 @@ ORIGINAL_PATH  = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 #FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
 #FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_data_0518_bf_epoch_071.pth'
 #FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt_0518_epoch_067.pth'
-FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_epoch_018.pth'
+FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_epoch_037.pth'
 #FINETUNED_PATH = f'{code_dir}/../weights/20-30-48/model_finetuned_faro_kitchen_epoch_006_epoch_013.pth'
 DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_isaac_fs_rs'
 
