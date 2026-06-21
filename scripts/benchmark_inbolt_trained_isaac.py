@@ -76,7 +76,7 @@ from report import ReportGenerator
 DATA_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260415T084601Z-3-001/Data Collection'
 ORIGINAL_PATH  = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
-ISAACTUNED_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_epoch_037.pth'
+ISAACTUNED_PATH= f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_epoch_037.pth'
 DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_inbolt_trained_isaac'
 N_VIZ          = 5
 
