@@ -557,7 +557,7 @@ class DataSource:
             depth_zivid_projected = cv2.imread(zivid_projected_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
         else:
             depth_zivid_projected  = self.project_depth_zivid_to_rs(depth_zivid, depth_rs, finx = index)
-            cv2.imwrite(zivid_projected_path, depth_zivid_projected.astype(np.uint16), [cv2.IMWRITE_PNG_COMPRESSION, 0])  # save projected depth for visualization  
+            #cv2.imwrite(zivid_projected_path, depth_zivid_projected.astype(np.uint16), [cv2.IMWRITE_PNG_COMPRESSION, 0])  # save projected depth for visualization  
 
         metadata_rs = None
         if entry.get('metadata_rs') is not None:

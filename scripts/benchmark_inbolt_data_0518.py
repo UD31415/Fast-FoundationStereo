@@ -162,7 +162,9 @@ class ReportGeneratorInbolt(ReportGenerator):
 # ── constants ────────────────────────────────────────────────────────────────
 
 #DATA_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260415T084601Z-3-001/Data Collection'
-DATA_DIR       =  r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260518-03' 
+#BF              = 50.102706998586 * 385.509887695312  #49470.45   # focal_px * baseline_mm  (calibrated from camera)
+DATA_DIR       =  r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260518-03'
+BF              = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18 
 
 ORIGINAL_PATH  = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 # FINETUNED_PATH  = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415_epoch_030.pth'
@@ -270,8 +272,8 @@ def main():
     depth_accs = {k: DepthBinAccumulator() for k in depth_acc_keys}
 
     for idx in range(n):
-        #data = source.get_item_projected(idx)
-        data  = source.get_item_transformed_and_projected(idx)  # 2026-05-18 with plane fitting
+        data = source.get_item_projected(idx)
+        #data  = source.get_item_transformed_and_projected(idx)  # 2026-05-18 with plane fitting
         left = data['left']
         right = data['right']
         gt_mm = data['depth_zivid'].astype(np.float32)
@@ -293,7 +295,7 @@ def main():
         frame_depths = {GT_NAME: gt_m, RS_NAME: rs_m}
         for mname, model in models.items():
             t0 = time.monotonic()
-            frame_depths[mname] = infer_depth_m(model, left, right)
+            frame_depths[mname] = infer_depth_m(model, left, right, bf=BF)
             # save raw data to p.g images 16 bit PNGs for later analysis if needed
             #cv2.imwrite(str(out_dir / f'{mname}_{idx:03d}.png'), (frame_depths[mname] * 1000.0).astype(np.uint16))
             timing_ms_raw[mname].append((time.monotonic() - t0) * 1000.0)
