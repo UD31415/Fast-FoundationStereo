@@ -58,8 +58,8 @@ DEFAULT_OUT     = f'{code_dir}/../reports/inbolt_benchmark'
 # FINETUNED_PATH = f'{code_dir}/../weights/20-30-48/model_finetuned_faro.pth'
 # DEFAULT_OUT    = f'{code_dir}/../reports/faro_benchmark'
 
-#BF              = 50.102706998586 * 385.509887695312  #49470.45   # focal_px * baseline_mm  (calibrated from camera)
-BF              = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18
+BF              = 50.102706998586 * 385.509887695312  #49470.45   # focal_px * baseline_mm  (calibrated from camera)
+#BF              = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18
 ITERS           = 8          # GRU iterations
 N_VIZ           = 8         # number of frames saved for visual comparison in report
 
@@ -408,9 +408,10 @@ def _preprocess_ir(left: np.ndarray, right: np.ndarray):
     return left_t, right_t
 
 @torch.no_grad()
-def infer_depth_m(model, left: np.ndarray, right: np.ndarray) -> np.ndarray:
+def infer_depth_m(model, left: np.ndarray, right: np.ndarray, bf: float = None) -> np.ndarray:
     """Run stereo inference on an IR pair; return depth map in metres (H×W float32)."""
     left_t, right_t = _preprocess_ir(left, right)
+    bf = BF if bf is None else bf
     padder = InputPadder(left_t.shape, divis_by=32, force_square=False)
     left_t, right_t = padder.pad(left_t, right_t)
 
@@ -422,7 +423,7 @@ def infer_depth_m(model, left: np.ndarray, right: np.ndarray) -> np.ndarray:
 
     depth_m = np.zeros_like(disp_np)
     valid = disp_np > 0
-    depth_m[valid] = (BF / disp_np[valid]) / 1000.0   # disparity → mm → m
+    depth_m[valid] = (bf / disp_np[valid]) / 1000.0   # disparity → mm → m
     return depth_m
 
 def load_model(path: str):

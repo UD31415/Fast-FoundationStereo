@@ -37,17 +37,6 @@ import Utils as U
 from core.utils.utils import InputPadder
 
 # Must be imported before torch.load so the depthrs models can be unpickled
-from scripts.finetune_inbolt_depthrs import (    # noqa: F401
-    FastFoundationStereoDepthRS,
-    DepthEncoder,
-    DepthFusionModule,
-    DepthInitBlend,
-)
-from scripts.finetune_inbolt_depthrs_2 import (  # noqa: F401
-    FastFoundationStereoDepthRS_v2,
-    DepthInitBlend as DepthInitBlend_v2,
-    DepthOutputBlend,
-)
 
 from benchmark_inbolt import (
     DepthBinAccumulator,
@@ -55,7 +44,6 @@ from benchmark_inbolt import (
     infer_depth_m,
     load_model,
     plot_depth_vs_distance,
-    BF,
     ITERS,
 )
 from benchmark_inbolt_fs import ReportGeneratorInbolt, resolve_finetuned_model_path
@@ -74,6 +62,10 @@ from report import ReportGenerator
 # ── constants ────────────────────────────────────────────────────────────────
 
 DATA_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260415T084601Z-3-001/Data Collection'
+BF              = 50.102706998586 * 385.509887695312  #49470.45   # focal_px * baseline_mm  (calibrated from camera)
+#DATA_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260518-03' 
+#BF              = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18
+
 ORIGINAL_PATH  = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
 ISAACTUNED_PATH= f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_epoch_037.pth'
@@ -83,7 +75,7 @@ N_VIZ          = 5
 METHODS: Dict[str, Dict[str, str]] = {
     'original':          {'label': 'FFS Original',                         'color': '#2980b9'},
     'finetuned':         {'label': 'FFS Fine-tuned (Inbolt)',              'color': '#e74c3c'},
-    'finetuned_isaac':   {'label': 'FFS fine-tuned (ISAAC)',               'color': '#8e44ad'},
+    'isaactuned':        {'label': 'FFS fine-tuned (ISAAC)',               'color': '#8e44ad'},
     'depth_rs':          {'label': 'RealSense Hardware Depth',             'color': '#f39c12'},
     'zivid_gt':          {'label': 'Zivid GT (projected to RS)',           'color': '#27ae60'},
 }
@@ -117,60 +109,6 @@ def resolve_depthrs_model_path(preferred_path: str) -> Optional[str]:
 
     return None
 
-
-def resolve_depthrs_v2_model_path(preferred_path: str) -> Optional[str]:
-    """Return an existing depthrs v2 checkpoint path, or None if not found."""
-    preferred = Path(preferred_path)
-    if preferred.exists():
-        return str(preferred)
-
-    weights_dir = Path(code_dir) / '..' / 'weights'
-    candidates = sorted(weights_dir.glob('**/model_finetuned_inbolt_depthrs_v2_epoch_*.pth'))
-    if candidates:
-        chosen = candidates[-1]
-        logging.warning(f'Preferred depthrs_v2 model not found at {preferred}. Using {chosen}')
-        return str(chosen)
-
-    return None
-
-
-@torch.no_grad()
-def infer_depth_m_depthrs(
-    model,
-    left: np.ndarray,
-    right: np.ndarray,
-    depth_rs_mm: np.ndarray,
-) -> np.ndarray:
-    """
-    Run depth-fusion inference; return depth map in metres (H×W float32).
-
-    depth_rs_mm: (H, W) float32, RealSense depth in millimetres.
-    """
-    left_t, right_t = _preprocess_ir(left, right)
-    # debug - make depth zero
-    depth_rs_mm = depth_rs_mm*0
-    depth_rs_t = torch.as_tensor(depth_rs_mm.astype(np.float32))[None, None].cuda()  # (1,1,H,W)
-
-    padder = InputPadder(left_t.shape, divis_by=32, force_square=False)
-    left_t, right_t, depth_rs_t = padder.pad(left_t, right_t, depth_rs_t)
-
-    with torch.amp.autocast('cuda', enabled=True, dtype=U.AMP_DTYPE):
-        disp = model.forward(
-            left_t, right_t,
-            depth_rs_mm=depth_rs_t,
-            iters=ITERS,
-            test_mode=True,
-        )
-
-    disp    = padder.unpad(disp.float())
-    disp_np = disp.cpu().numpy().reshape(left.shape[:2]).clip(0, None)
-
-    depth_m        = np.zeros_like(disp_np)
-    valid          = disp_np > 0
-    depth_m[valid] = (BF / disp_np[valid]) / 1000.0   # disparity → mm → m
-    return depth_m
-
-
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -192,7 +130,6 @@ def main():
 
     # ── load models ───────────────────────────────────────────────────────────
     models          = {}   # name → model  (stereo-only interface)
-    depthrs_models  = {} # name → model  (depth-fusion interface)
 
     finetuned_path = resolve_finetuned_model_path(args.finetuned)
     if finetuned_path is not None:
@@ -200,13 +137,13 @@ def main():
     else:
         logging.warning(f'Stereo fine-tuned model not found at {args.finetuned} — skipping')
 
-    models['original'] = load_model(args.original)
-
-    depthrs_path = resolve_depthrs_model_path(args.isaactuned)
-    if depthrs_path is not None:
-        depthrs_models['isaactuned'] = load_depthrs_model(depthrs_path)
+    isaactuned_path = resolve_finetuned_model_path(args.isaactuned)
+    if isaactuned_path is not None:
+        models['isaactuned'] = load_model(isaactuned_path)
     else:
         logging.warning(f'Depth-fusion v1 model not found at {args.isaactuned} — skipping')
+
+    models['original'] = load_model(args.original)        
 
     # depthrs_v2_path = resolve_depthrs_v2_model_path(args.depthrs_v2)
     # if depthrs_v2_path is not None:
@@ -214,7 +151,7 @@ def main():
     # else:
     #     logging.warning(f'Depth-fusion v2 model not found at {args.depthrs_v2} — skipping')
 
-    all_model_names = list(models.keys()) + list(depthrs_models.keys())
+    all_model_names = list(models.keys()) # + list(depthrs_models.keys())
     active_methods  = [GT_NAME, RS_NAME] + all_model_names
 
     # ── dataset ───────────────────────────────────────────────────────────────
@@ -262,14 +199,9 @@ def main():
         # stereo-only models
         for mname, model in models.items():
             t0 = time.monotonic()
-            frame_depths[mname] = infer_depth_m(model, left, right)
+            frame_depths[mname] = infer_depth_m(model, left, right, bf = BF)
             timing_ms_raw[mname].append((time.monotonic() - t0) * 1000.0)
 
-        # depth-fusion models
-        for mname, model in depthrs_models.items():
-            t0 = time.monotonic()
-            frame_depths[mname] = infer_depth_m_depthrs(model, left, right, rs_mm)
-            timing_ms_raw[mname].append((time.monotonic() - t0) * 1000.0)
 
         gt_close_mask = (gt_m > 0) & (gt_m < CLOSE_RANGE_THRESHOLD_M)
         n_close = int(gt_close_mask.sum())
@@ -326,9 +258,9 @@ def main():
     }
     if 'finetuned' in models and finetuned_path:
         method_configs['finetuned'] = {'model_path': finetuned_path}
-    if 'isaactuned' in depthrs_models and depthrs_path:
-        method_configs['isaactuned'] = {'model_path': depthrs_path}
-    # if 'depthrs_v2' in depthrs_models and depthrs_v2_path:
+    if 'isaactuned' in models and isaactuned_path:
+        method_configs['isaactuned'] = {'model_path': isaactuned_path}
+    # if 'depthrs_v2' in models and depthrs_v2_path:
     #     method_configs['depthrs_v2'] = {'model_path': depthrs_v2_path}
 
     results = BenchmarkResults(
