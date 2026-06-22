@@ -189,29 +189,29 @@ def resolve_finetuned_model_path(preferred_path: str) -> Optional[str]:
     if preferred.exists():
         return str(preferred)
 
-    weights_dir = Path(code_dir) / '..' / 'weights'
-    candidate_names = [
-        'model_finetuned_inbolt.pth',
-        'model_finetuned_inbolt-20260415_epoch_030.pth',
-    ]
+    # weights_dir = Path(code_dir) / '..' / 'weights'
+    # candidate_names = [
+    #     'model_finetuned_inbolt.pth',
+    #     'model_finetuned_inbolt-20260415_epoch_030.pth',
+    # ]
 
-    # 1) Try known candidate file names anywhere under weights/
-    for name in candidate_names:
-        found = sorted(weights_dir.glob(f'**/{name}'))
-        if found:
-            logging.warning(
-                f'Preferred fine-tuned model not found at {preferred}. Using fallback {found[0]}'
-            )
-            return str(found[0])
+    # # 1) Try known candidate file names anywhere under weights/
+    # for name in candidate_names:
+    #     found = sorted(weights_dir.glob(f'**/{name}'))
+    #     if found:
+    #         logging.warning(
+    #             f'Preferred fine-tuned model not found at {preferred}. Using fallback {found[0]}'
+    #         )
+    #         return str(found[0])
 
-    # 2) Fallback to any Inbolt fine-tuned checkpoint, prefer lexicographically latest
-    generic = sorted(weights_dir.glob('**/model_finetuned_inbolt*.pth'))
-    if generic:
-        chosen = generic[-1]
-        logging.warning(
-            f'Preferred fine-tuned model not found at {preferred}. Using discovered checkpoint {chosen}'
-        )
-        return str(chosen)
+    # # 2) Fallback to any Inbolt fine-tuned checkpoint, prefer lexicographically latest
+    # generic = sorted(weights_dir.glob('**/model_finetuned_inbolt*.pth'))
+    # if generic:
+    #     chosen = generic[-1]
+    #     logging.warning(
+    #         f'Preferred fine-tuned model not found at {preferred}. Using discovered checkpoint {chosen}'
+    #     )
+    #     return str(chosen)
 
     return None
 

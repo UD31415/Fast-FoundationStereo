@@ -46,7 +46,7 @@ from benchmark_inbolt import (
     plot_depth_vs_distance,
     ITERS,
 )
-from benchmark_inbolt_fs import ReportGeneratorInbolt, resolve_finetuned_model_path
+#from benchmark_inbolt import ReportGeneratorInbolt, resolve_finetuned_model_path
 from scripts.data_manager_inbolt import DataSource, CAMERA_MATRIX_RS, DIST_COEFFS_RS
 from metrics import (
     BenchmarkResults,
@@ -120,7 +120,7 @@ def main():
     parser.add_argument('--data_dir',  default=DATA_DIR,       help='Dataset root')
     parser.add_argument('--original',  default=ORIGINAL_PATH,  help='Original FFS weights')
     parser.add_argument('--finetuned', default=FINETUNED_PATH, help='Stereo-only fine-tuned weights')
-    parser.add_argument('--isaactuned',    default=ISAACTUNED_PATH,    help='Stereo-only fine-tuned weights on ISAAC')
+    parser.add_argument('--isaactuned',default=ISAACTUNED_PATH,    help='Stereo-only fine-tuned weights on ISAAC')
     parser.add_argument('--n_viz', type=int, default=N_VIZ,     help='Frames saved for visual comparison')
     args = parser.parse_args()
 
@@ -131,14 +131,14 @@ def main():
     # ── load models ───────────────────────────────────────────────────────────
     models          = {}   # name → model  (stereo-only interface)
 
-    finetuned_path = resolve_finetuned_model_path(args.finetuned)
-    if finetuned_path is not None:
+    finetuned_path = args.finetuned
+    if Path(finetuned_path).exists():
         models['finetuned'] = load_model(finetuned_path)
     else:
         logging.warning(f'Stereo fine-tuned model not found at {args.finetuned} — skipping')
 
-    isaactuned_path = resolve_finetuned_model_path(args.isaactuned)
-    if isaactuned_path is not None:
+    isaactuned_path = args.isaactuned
+    if Path(isaactuned_path).exists():
         models['isaactuned'] = load_model(isaactuned_path)
     else:
         logging.warning(f'Depth-fusion v1 model not found at {args.isaactuned} — skipping')
@@ -284,7 +284,7 @@ def main():
     if RS_NAME in stats:
         stats[RS_NAME].fps_mean = RS_FPS
 
-    reporter = ReportGeneratorInbolt(results, stats, out_dir)
+    reporter = ReportGenerator(results, stats, out_dir)
     reporter.generate()
 
     # depth-vs-distance accuracy plot
