@@ -58,6 +58,119 @@ from metrics import (
 )
 from report import ReportGenerator
 
+# ── custom report generator ──────────────────────────────────────────────────
+
+class ReportGeneratorInbolt(ReportGenerator):
+    """Custom report generator that shows 4 frames in depth comparison and error maps."""
+
+    def __init__(self, results, stats, output_dir) -> None:
+        super().__init__(results, stats, output_dir)
+        self._selected_viz_indices = []
+
+    def _get_selected_viz_indices(self, n_pick: int = 4):
+        """Return cached random frame indices used consistently across report sections."""
+        if self._selected_viz_indices:
+            return self._selected_viz_indices
+
+        n_total = len(self._r.viz_frames)
+        if n_total == 0:
+            self._selected_viz_indices = []
+            return self._selected_viz_indices
+
+        n = min(n_pick, n_total)
+        rng = np.random.default_rng(42)
+        self._selected_viz_indices = sorted(rng.choice(n_total, size=n, replace=False).tolist())
+        return self._selected_viz_indices
+
+    def _fig_depth_comparison(self) -> str:
+        if not self._r.viz_frames:
+            return self._empty_fig("depth_comparison.png", "No viz frames")
+
+        sel = self._get_selected_viz_indices(n_pick=4)
+        if not sel:
+            return self._empty_fig("depth_comparison.png", "No viz frames")
+
+        vf0 = self._r.viz_frames[sel[0]]
+        method_names = [n for n in self._r.method_names if n in vf0]
+        nrows = len(sel)
+        ncols = len(method_names)
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.8 * nrows))
+        axes = np.atleast_2d(axes)
+        cmap = self._depth_cmap()
+
+        for r, frame_idx in enumerate(sel):
+            vf = self._r.viz_frames[frame_idx]
+            for c, name in enumerate(method_names):
+                ax = axes[r, c]
+                if name not in vf:
+                    ax.axis("off")
+                    continue
+                im = ax.imshow(vf[name], cmap=cmap, vmin=0.1, vmax=2.0)
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="m")
+                title = self._r.method_labels.get(name, name)
+                if c == 0:
+                    title = f"Frame {frame_idx + 1} • {title}"
+                ax.set_title(title, fontsize=9, wrap=True)
+                ax.axis("off")
+
+        fig.suptitle("Depth Map Comparison (4 random frames) — values in meters",
+                     fontsize=11, y=1.01)
+        fig.tight_layout()
+        return self._save(fig, "depth_comparison.png")
+
+    def _fig_error_maps(self) -> str:
+        if not self._r.viz_frames or not self._non_gt:
+            return self._empty_fig("error_maps.png", "No comparison methods")
+
+        sel = self._get_selected_viz_indices(n_pick=4)
+        if not sel:
+            return self._empty_fig("error_maps.png", "No viz frames")
+
+        vf0 = self._r.viz_frames[sel[0]]
+        names = ([self._gt] if self._gt in vf0 else []) + [n for n in self._non_gt if n in vf0]
+        if not names:
+            return self._empty_fig("error_maps.png", "Ground truth not available in viz frame")
+
+        nrows = len(sel)
+        ncols = len(names)
+        cmap = plt.get_cmap("hot").copy()
+        cmap.set_under("#222222")
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.8 * nrows))
+        axes = np.atleast_2d(axes)
+
+        for r, frame_idx in enumerate(sel):
+            vf = self._r.viz_frames[frame_idx]
+            gt = vf.get(self._gt)
+            if gt is None:
+                for c in range(ncols):
+                    axes[r, c].axis("off")
+                continue
+
+            for c, name in enumerate(names):
+                ax = axes[r, c]
+                if name not in vf:
+                    ax.axis("off")
+                    continue
+                pred = vf[name]
+                valid = (gt > 0) & (pred > 0)
+                err = np.where(valid, np.abs(pred - gt), 0.0).astype(np.float32)
+                im = ax.imshow(err, cmap=cmap, vmin=0.001, vmax=0.1)
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="|error| (m)")
+                mean_err = float(np.abs(pred[valid] - gt[valid]).mean()) if valid.any() else 0.0
+                label = self._r.method_labels.get(name, name)
+                if c == 0:
+                    ax.set_title(f"Frame {frame_idx + 1} • {label}\nMAE={mean_err:.4f} m", fontsize=9)
+                else:
+                    ax.set_title(f"{label}\nMAE={mean_err:.4f} m", fontsize=9)
+                ax.axis("off")
+
+        gt_label = self._r.method_labels.get(self._gt, self._gt)
+        fig.suptitle(f"Absolute Error vs {gt_label} (4 random frames, m)", fontsize=11, y=1.01)
+        fig.tight_layout()
+        return self._save(fig, "error_maps.png")
+
+
+
 
 # ── constants ────────────────────────────────────────────────────────────────
 
@@ -70,7 +183,7 @@ ORIGINAL_PATH  = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
 ISAACTUNED_PATH= f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_epoch_037.pth'
 DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_inbolt_trained_isaac'
-N_VIZ          = 5
+N_VIZ          = 6
 
 METHODS: Dict[str, Dict[str, str]] = {
     'original':          {'label': 'FFS Original',                         'color': '#2980b9'},
@@ -284,7 +397,7 @@ def main():
     if RS_NAME in stats:
         stats[RS_NAME].fps_mean = RS_FPS
 
-    reporter = ReportGenerator(results, stats, out_dir)
+    reporter = ReportGeneratorInbolt(results, stats, out_dir)
     reporter.generate()
 
     # depth-vs-distance accuracy plot
