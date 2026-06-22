@@ -63,8 +63,8 @@ from report import ReportGenerator
 
 DATA_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260415T084601Z-3-001/Data Collection'
 BF              = 50.102706998586 * 385.509887695312  #49470.45   # focal_px * baseline_mm  (calibrated from camera)
-#DATA_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260518-03' 
-#BF              = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18
+DATA_DIR       = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/Inbolt_datasets/Data Collection-20260518-03' 
+BF              = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18
 
 ORIGINAL_PATH  = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_inbolt-20260415_epoch_111.pth'
@@ -155,7 +155,7 @@ def main():
     active_methods  = [GT_NAME, RS_NAME] + all_model_names
 
     # ── dataset ───────────────────────────────────────────────────────────────
-    source = DataSource()
+    source = DataSource(train_mode=False)
     n = source.init_directory(input_rectified=args.data_dir)
     logging.info(f'Found {n} samples in {args.data_dir}')
     if n == 0:
