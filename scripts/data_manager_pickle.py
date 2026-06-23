@@ -2371,7 +2371,7 @@ class TestDataSource(unittest.TestCase):
         fnames = ["original",'depth_rs','finetuned','isaactuned','pickle_gt','left']
         fdata  = []
         for f in fnames:
-            png_path = f"{f}_2.png"
+            png_path = f"{f}_3.png"
             if not Path(png_path).exists():
                 self.skipTest(f"PNG file {png_path} does not exist")
             img_png = cv2.imread(str(png_path), cv2.IMREAD_UNCHANGED)
@@ -2392,14 +2392,14 @@ def RunTest() -> None:
     #tst.test_get_item_projected_raycast() # ok
     #tst.test_get_item_projected_open3d()
     #tst.test_get_item_and_scene() # ok
-    tst.test_get_item_and_scene_projected()
+    #tst.test_get_item_and_scene_projected()
 
     #tst.test_project_on_camera()
     # tst.test_show_icp_alignment()
     #tst.test_get_item_icp_projected()
     # tst.test_get_grid_coordinates()
     # tst.test_match_grid_to_cad()
-    #tst.test_load_and_show_png()
+    tst.test_load_and_show_png()
     
 
 if __name__ == "__main__":
