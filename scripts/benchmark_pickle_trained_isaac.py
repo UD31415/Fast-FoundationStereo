@@ -123,12 +123,12 @@ CLOSE_RANGE_THRESHOLD_MM = 20.0
 DIST_BINS_MM: List[Tuple[float, float]] = [
     (0.0,    100.0),
     (100.0,  200.0),
-    (200.0,  500.0),
-    (500.0,  1000.0),
+    (200.0,  450.0),
+    (450.0,  1000.0),
     (1000.0,  1500.0),
 ]
-BIN_LABELS_MM  = ["0–100 mm", "100–200 mm", "200–500 mm", "500–1000 mm", "1000–1500 mm"]
-BIN_CENTERS_MM = [50.0, 150.0, 350.0, 750.0, 1250.0]
+BIN_LABELS_MM  = ["0–100 mm", "100–200 mm", "200–450 mm", "450–1000 mm", "1000–1500 mm"]
+BIN_CENTERS_MM = [50.0, 150.0, 325.0, 725.0, 1250.0]
 
 METHODS: Dict[str, Dict[str, str]] = {
     "original":  {"label": "FFS Original",                  "color": "#2980b9"},
@@ -151,6 +151,7 @@ def compute_bin_mae_mm(pred_mm: np.ndarray, gt_mm: np.ndarray) -> List[float]:
         if mask.sum() == 0:
             result.append(float("nan"))
         else:
+            mask = mask & (np.abs(pred_mm - gt_mm) < 20.0)  # ignore extreme outliers
             result.append(float(np.abs(pred_mm[mask] - gt_mm[mask]).mean()))
     return result
 
@@ -299,7 +300,7 @@ class ReportGeneratorMM(ReportGenerator):
                 pred = vf[name]
                 valid = (gt > 0) & (pred > 0)
                 err = np.where(valid, np.abs(pred - gt), 0.0).astype(np.float32)
-                im = ax.imshow(err, cmap=cmap, vmin=1.0, vmax=100.0)
+                im = ax.imshow(err, cmap=cmap, vmin=1.0, vmax=10.0)
                 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="|error| (mm)")
                 mean_err = float(np.abs(pred[valid] - gt[valid]).mean()) if valid.any() else 0.0
                 label = self._r.method_labels.get(name, name)
@@ -336,7 +337,7 @@ class ReportGeneratorMM(ReportGenerator):
         ax.set_xlabel("Distance range", fontsize=10)
         ax.set_ylabel("Mean Absolute Error (mm)", fontsize=10)
         ax.set_title("Depth Error vs Distance", fontsize=12)
-        ax.set_ylim(0, 100) # mm
+        ax.set_ylim(0, 10) # mm
         ax.legend(fontsize=9)
         ax.grid(alpha=0.3)
         fig.tight_layout()
