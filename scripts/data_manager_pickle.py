@@ -112,8 +112,13 @@ DEFAULT_EXCEL = (
     r"\data path.xlsx"
 )
 
+DEFAULT_EXCEL = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
+    r"\yg_pickle\\2026-06-22--14-48-11\Pickle_Scene_Capture_336222073841"
+    r"\data path.xlsx"
+)
 
-DEFAULT_STL_NAME = "cube_100x100x100"
+#DEFAULT_STL_NAME = "cube_100x100x100"
 
 LABEL_RAW = "raw data (json file)"
 LABEL_ICP = "ICP"
@@ -2387,14 +2392,14 @@ def RunTest() -> None:
     #tst.test_get_item_projected_raycast() # ok
     #tst.test_get_item_projected_open3d()
     #tst.test_get_item_and_scene() # ok
-    #tst.test_get_item_and_scene_projected()
+    tst.test_get_item_and_scene_projected()
 
     #tst.test_project_on_camera()
     # tst.test_show_icp_alignment()
     #tst.test_get_item_icp_projected()
     # tst.test_get_grid_coordinates()
     # tst.test_match_grid_to_cad()
-    tst.test_load_and_show_png()
+    #tst.test_load_and_show_png()
     
 
 if __name__ == "__main__":
