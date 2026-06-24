@@ -72,10 +72,29 @@ class DataSource:
                    'test'  – return only images whose path matches at least one keyword
         """
         if len(input_rectified) < 3:
-            input_rectified = r'/mnt/algonas/Local'
+            input_rectified = r'\\svm.realsenseai.com\algonas\Local\Data\Stereo\Faro\FARO_DATA_BASE'
 
-        all_imgs = glob.glob(os.path.join(input_rectified, "**/L_images/L_Img_**.mat"), recursive=True)
+        # NOTE: use forward slashes in the glob pattern. ``os.path.join`` does not
+        # translate backslashes on POSIX, so r"**\L_images\L_Img_**.mat" becomes a
+        # literal path component there and matches nothing.
+        pattern = os.path.join(input_rectified, "**", "L_images", "L_Img_**.mat")
+        all_imgs = glob.glob(pattern, recursive=True)
         self.gray_scale_input = gray_scale_input
+
+        if not all_imgs:
+            # Diagnose the most common failure modes: missing/unreadable root.
+            if not os.path.isdir(input_rectified):
+                log.warning(f"FARO root not found or not a directory: {input_rectified!r}")
+            elif not os.access(input_rectified, os.R_OK | os.X_OK):
+                log.warning(
+                    f"FARO root is not readable by the current user "
+                    f"(check mount permissions): {input_rectified!r}"
+                )
+            else:
+                log.warning(
+                    f"No FARO samples matched pattern {pattern!r} "
+                    f"(root exists and is readable, but contains no L_images/L_Img_*.mat)"
+                )
 
         if test_keywords:
             keywords_upper = [kw.upper() for kw in test_keywords]
