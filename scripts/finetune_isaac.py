@@ -48,6 +48,9 @@ MODEL_PATH = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac.pth'
 
 
+DEFAULT_VIEWS    = ('wrist',) 
+DEFAULT_EPISODES = ('episode_12','episode_16','episode_18',)
+
 # BF         = 49.8624*385.73  # D435 - focal_px * baseline_mm (calibrated from camera)  # D435 - focal_px * baseline_mm (calibrated from camera)
 #BF         = 50.102706998586 * 385.509887695312 # new data 2
 #BF         = 50.102706998586 * 642.4910888671875 # new data 3 2026-05-18
@@ -160,7 +163,7 @@ def extract_patches(left, right, depth, valid, patch_size=512, min_valid_ratio=0
 class IsaacDataset(Dataset):
     def __init__(self, root, train_mode=True):
         self.source = DataSource(train_mode=train_mode)
-        n = self.source.init_directory(root = root)
+        n = self.source.init_directory(root = root, views = DEFAULT_VIEWS, episodes = DEFAULT_EPISODES)
         logging.info(f"DataSource found {n} samples in {root}")
 
     def __len__(self):

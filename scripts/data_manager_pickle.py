@@ -112,8 +112,13 @@ DEFAULT_EXCEL = (
     r"\data path.xlsx"
 )
 
+DEFAULT_EXCEL = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
+    r"\yg_pickle\\2026-06-22--14-48-11\Pickle_Scene_Capture_336222073841"
+    r"\data path.xlsx"
+)
 
-DEFAULT_STL_NAME = "cube_100x100x100"
+#DEFAULT_STL_NAME = "cube_100x100x100"
 
 LABEL_RAW = "raw data (json file)"
 LABEL_ICP = "ICP"
@@ -2361,6 +2366,21 @@ class TestDataSource(unittest.TestCase):
         self.assertEqual(rvec.shape, (3,))
         self.assertEqual(tvec.shape, (3,))
 
+    def test_load_and_show_png(self):
+        "loads png data"
+        fnames = ["original",'depth_rs','finetuned','isaactuned','pickle_gt','left']
+        fdata  = []
+        for f in fnames:
+            png_path = f"{f}_3.png"
+            if not Path(png_path).exists():
+                self.skipTest(f"PNG file {png_path} does not exist")
+            img_png = cv2.imread(str(png_path), cv2.IMREAD_UNCHANGED)
+            fdata.append(img_png)
+
+        p = DataSource()
+        p.show_subset(fdata,fnames)
+        plt.show()            
+
 
 def RunTest() -> None:
     tst = TestDataSource()
@@ -2372,13 +2392,14 @@ def RunTest() -> None:
     #tst.test_get_item_projected_raycast() # ok
     #tst.test_get_item_projected_open3d()
     #tst.test_get_item_and_scene() # ok
-    tst.test_get_item_and_scene_projected()
+    #tst.test_get_item_and_scene_projected()
 
     #tst.test_project_on_camera()
     # tst.test_show_icp_alignment()
     #tst.test_get_item_icp_projected()
     # tst.test_get_grid_coordinates()
     # tst.test_match_grid_to_cad()
+    tst.test_load_and_show_png()
     
 
 if __name__ == "__main__":
