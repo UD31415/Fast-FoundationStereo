@@ -62,6 +62,8 @@ import pandas as pd
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 
+from scripts.Uri_26_06_17 import T_camera_cad
+
 
 log.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=log.INFO)
 
@@ -112,8 +114,13 @@ DEFAULT_EXCEL = (
     r"\data path.xlsx"
 )
 
+DEFAULT_EXCEL = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
+    r"\yg_pickle\\2026-06-22--14-48-11\Pickle_Scene_Capture_336222073841"
+    r"\data path.xlsx"
+)
 
-DEFAULT_STL_NAME = "cube_100x100x100"
+#DEFAULT_STL_NAME = "cube_100x100x100"
 
 LABEL_RAW = "raw data (json file)"
 LABEL_ICP = "ICP"
@@ -693,12 +700,12 @@ class DataSource:
             log.warning(f"Session has no captures: {path}")
             return
 
-        cad_name = scene.get("cad_name", "")
-        cad_path = translate_path(scene.get("cad_path", ""))
-        t_camera_tooltip = np.array(scene.get("t_camera_tooltip", np.eye(4)), dtype=np.float64)
-        intrinsics = scene.get("intrinsics", {}) or {}
-        baseline_mm = scene.get("baseline", 0.05) * 1000.0
-        bf         = baseline_mm * intrinsics.get("fx", 660.0)
+        cad_name            = scene.get("cad_name", "")
+        cad_path            = translate_path(scene.get("cad_path", ""))
+        t_camera_tooltip    = np.array(scene.get("t_camera_tooltip", np.eye(4)), dtype=np.float64)
+        intrinsics          = scene.get("intrinsics", {}) or {}
+        baseline_mm         = scene.get("baseline", 0.05) * 1000.0
+        bf                  = baseline_mm * intrinsics.get("fx", 660.0)
 
 
         #baseline_mm = scene.get("baseline", 0.05) * 1000.0
@@ -835,7 +842,7 @@ class DataSource:
 
         #cad_pcd = self.render_points_from_mesh(mesh)
 
-        self._cad_cache[cad_path] = cad_pcd
+        self._cad_cache[cad_path]      = cad_pcd
         # Also cache the metres-scaled mesh for raycast rendering.
         self._cad_mesh_cache[cad_path] = mesh
         return cad_pcd
@@ -938,6 +945,45 @@ class DataSource:
         )
         self._background_mesh_cache = bg_mesh
         return bg_mesh
+    
+    def load_background_cad(self, background_cad_path: str) -> Optional[o3d.geometry.TriangleMesh]:
+        """Load and cache the background CAD mesh, scaled to metres."""
+        if not background_cad_path:
+            background_cad_path = r"..\assets\thorlab matrix.STL"  # Default path to the background CAD mesh
+
+        if self._background_mesh_cache is not None:
+            return self._background_mesh_cache
+
+        if not os.path.exists(background_cad_path):
+            log.warning(f"Background CAD path missing: {background_cad_path}")
+            return None
+
+        mesh = o3d.io.read_triangle_mesh(background_cad_path)
+        if mesh.is_empty():
+            log.warning(f"Failed to load background CAD mesh: {background_cad_path}")
+            return None
+
+        mesh.scale(0.001, center=(0.0, 0.0, 0.0))  # mm -> m
+        if not mesh.has_vertex_normals():
+            mesh.compute_vertex_normals()
+        self._background_mesh_cache = mesh
+        
+
+        pcd = mesh.sample_points_poisson_disk(
+            number_of_points=10000,
+            use_triangle_normal=True
+        )
+        
+        
+        R = pcd.get_rotation_matrix_from_xyz((0, 0,np.pi/2))
+        
+        # Apply rotation
+        pcd.rotate(R, center=(0, 0, 0))
+        
+        
+        pcd.transform(T_camera_cad)
+
+        return mesh
 
     def get_intrinsics_matrix(self, json_path: str) -> tuple[np.ndarray, np.ndarray]:
         """Return ``(K, dist_coeffs)`` for one session."""
@@ -2361,6 +2407,21 @@ class TestDataSource(unittest.TestCase):
         self.assertEqual(rvec.shape, (3,))
         self.assertEqual(tvec.shape, (3,))
 
+    def test_load_and_show_png(self):
+        "loads png data"
+        fnames = ["original",'depth_rs','finetuned','isaactuned','pickle_gt','left']
+        fdata  = []
+        for f in fnames:
+            png_path = f"{f}_3.png"
+            if not Path(png_path).exists():
+                self.skipTest(f"PNG file {png_path} does not exist")
+            img_png = cv2.imread(str(png_path), cv2.IMREAD_UNCHANGED)
+            fdata.append(img_png)
+
+        p = DataSource()
+        p.show_subset(fdata,fnames)
+        plt.show()            
+
 
 def RunTest() -> None:
     tst = TestDataSource()
@@ -2372,13 +2433,14 @@ def RunTest() -> None:
     #tst.test_get_item_projected_raycast() # ok
     #tst.test_get_item_projected_open3d()
     #tst.test_get_item_and_scene() # ok
-    tst.test_get_item_and_scene_projected()
+    #tst.test_get_item_and_scene_projected()
 
     #tst.test_project_on_camera()
     # tst.test_show_icp_alignment()
     #tst.test_get_item_icp_projected()
     # tst.test_get_grid_coordinates()
     # tst.test_match_grid_to_cad()
+    tst.test_load_and_show_png()
     
 
 if __name__ == "__main__":

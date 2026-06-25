@@ -44,7 +44,7 @@ from metrics import (
     CLOSE_RANGE_THRESHOLD_M,
 )
 from report import ReportGenerator
-from finetune_inbolt_planes import find_flat_regions
+#from finetune_inbolt_planes import find_flat_regions
 
 
 # ── custom report generator ──────────────────────────────────────────────────
