@@ -54,6 +54,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+from yaml import parser
+
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../')
 sys.path.append(code_dir)
@@ -80,7 +82,7 @@ import torch
 
 from core.utils.utils import InputPadder
 import Utils as U
-from scripts.data_manager_faro import DataSource
+from scripts.data_manager_pickle import DataSource
 from metrics import (
     BenchmarkResults,
     FrameMetrics,
@@ -91,6 +93,17 @@ from report import ReportGenerator
 
 
 # ── constants ─────────────────────────────────────────────────────────────────
+
+PICKLE_EXCEL = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
+    r"\yg_pickle\\2026-06-22--14-48-11\Pickle_Scene_Capture_336222073841"
+    r"\data path.xlsx"
+)
+
+DEFAULT_EXCEL = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\Public\Stavush\Pickle\Data\data for model training 25_6_26"
+    r"\data_25_06.xlsx"
+)
 
 FARO_DIR        = r'/mnt/algonas/Local/Data/Stereo/Faro/FARO_DATA_BASE'
 ORIGINAL_PATH   = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
@@ -129,9 +142,9 @@ METHODS: Dict[str, Dict[str, str]] = {
     "finetuned":  {"label": "FFS Fine-tuned (Pickle)",       "color": "#e74c3c"},
     "farotuned":  {"label": "FFS Fine-tuned (FARO)",         "color": "#8e44ad"},
     "depth_rs":   {"label": "RealSense Hardware Depth",      "color": "#f39c12"},
-    "faro_gt":    {"label": "FARO GT",                       "color": "#27ae60"},
+    "pickle_gt": {"label": "Pickle CAD GT (projected)",      "color": "#27ae60"},
 }
-GT_NAME = "faro_gt"
+GT_NAME = "pickle_gt"
 RS_NAME = "depth_rs"   # pre-recorded RealSense active-stereo depth from the dataset
 
 
@@ -162,8 +175,9 @@ def _preprocess_ir(left: np.ndarray, right: np.ndarray):
     return left_t, right_t
 
 
+
 @torch.no_grad()
-def infer_depth_mm(model, left: np.ndarray, right: np.ndarray) -> np.ndarray:
+def infer_depth_mm(model, left: np.ndarray, right: np.ndarray, bf: float) -> np.ndarray:
     """Run stereo inference on an IR pair; return depth map in mm (H×W float32).
 
     BF = focal_px × baseline_mm, so  depth_mm = BF / disparity_px.
@@ -181,7 +195,7 @@ def infer_depth_mm(model, left: np.ndarray, right: np.ndarray) -> np.ndarray:
 
     depth_mm = np.zeros_like(disp_np)
     valid = disp_np > 0
-    depth_mm[valid] = BF / disp_np[valid]   # disparity → mm  (BF already in focal·mm)
+    depth_mm[valid] = bf / disp_np[valid]   # disparity → mm  (BF already in focal·mm)
     return depth_mm
 
 
@@ -244,7 +258,7 @@ class ReportGeneratorMM(ReportGenerator):
                 if name not in vf:
                     ax.axis("off")
                     continue
-                im = ax.imshow(vf[name], cmap=cmap, vmin=1.0, vmax=5000.0)
+                im = ax.imshow(vf[name], cmap=cmap, vmin=1.0, vmax=1000.0)
                 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="mm")
                 title = self._r.method_labels.get(name, name)
                 if c == 0:
@@ -293,7 +307,7 @@ class ReportGeneratorMM(ReportGenerator):
                 pred = vf[name]
                 valid = (gt > 0) & (pred > 0)
                 err = np.where(valid, np.abs(pred - gt), 0.0).astype(np.float32)
-                im = ax.imshow(err, cmap=cmap, vmin=1.0, vmax=100.0)
+                im = ax.imshow(err, cmap=cmap, vmin=1.0, vmax=20.0)
                 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="|error| (mm)")
                 mean_err = float(np.abs(pred[valid] - gt[valid]).mean()) if valid.any() else 0.0
                 label = self._r.method_labels.get(name, name)
@@ -330,6 +344,7 @@ class ReportGeneratorMM(ReportGenerator):
         ax.set_xlabel("Distance range", fontsize=10)
         ax.set_ylabel("Mean Absolute Error (mm)", fontsize=10)
         ax.set_title("Depth Error vs Distance", fontsize=12)
+        ax.set_ylim(0, 20)
         ax.legend(fontsize=9)
         ax.grid(alpha=0.3)
         fig.tight_layout()
@@ -460,7 +475,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--out_dir',    default=DEFAULT_OUT,     help='Output directory for the report')
-    parser.add_argument('--faro_dir',   default=FARO_DIR,        help='Path to FARO dataset root')
+    parser.add_argument('--pickle_excel', default=PICKLE_EXCEL, help='Path to the Pickle manifest Excel (data path.xlsx). Windows UNC paths are auto-translated to the local mount.') 
     parser.add_argument('--original',   default=ORIGINAL_PATH,   help='Path to original model weights')
     parser.add_argument('--finetuned',  default=FINETUNED_PATH,  help='Path to Pickle fine-tuned model weights')
     parser.add_argument('--farotuned',  default=FAROTUNED_PATH,  help='Path to FARO fine-tuned model weights')
@@ -499,15 +514,12 @@ def main():
     active_methods = [GT_NAME, RS_NAME] + list(models.keys())
 
     # ── dataset ───────────────────────────────────────────────────────────────
-    source = DataSource()
-    n = source.init_directory(
-        input_rectified=args.faro_dir,
-        test_keywords=args.keywords,
-        split=args.split,
-    )
-    logging.info(f"Found {n} samples in {args.faro_dir}")
+    source = DataSource(train_mode=False)
+    n = source.init_directory(excel_path=args.pickle_excel)
+
+    logging.info(f"Found {n} samples in {args.pickle_excel}")
     if n == 0:
-        logging.error("No samples found — check --faro_dir path and --keywords/--split")
+        logging.error("No samples found — check --pickle_excel path and --keywords/--split")
         return
 
     # ── accumulators ──────────────────────────────────────────────────────────
@@ -520,15 +532,16 @@ def main():
     H = W = None
 
     for idx in range(n):
-        data  = source.get_item(idx)
-        left  = data['left']
-        right = data['right']
-        gt_mm = data['depth_faro'].astype(np.float32)   # FARO GT — already in mm
-        rs_mm = data['depth_rs'].astype(np.float32)     # RealSense hardware — already in mm
+        data  = source.get_item_and_scene_projected(idx)
+        left  = data['ir_left_img']
+        right = data['ir_right_img']
+        gt_mm = data['depth_scene_projected'].astype(np.float32)   # Pickle CAD-rendered GT (mm)
+        rs_mm = data['depth_img'].astype(np.float32)             # RealSense hardware depth (mm)
+        bf    = data['bf']
 
         if gt_mm.shape != rs_mm.shape:
             logging.warning(
-                f"Item {idx}: depth_faro {gt_mm.shape} != depth_rs {rs_mm.shape}; skipping"
+                f"Item {idx}: depth_cad_projected {gt_mm.shape} != depth_img {rs_mm.shape}; skipping"
             )
             continue
 
@@ -541,7 +554,7 @@ def main():
         frame_depths = {GT_NAME: gt_mm, RS_NAME: rs_mm}
         for mname, model in models.items():
             t0 = time.monotonic()
-            frame_depths[mname] = infer_depth_mm(model, left, right)
+            frame_depths[mname] = infer_depth_mm(model, left, right, bf)
             timing_ms_raw[mname].append((time.monotonic() - t0) * 1000.0)
 
         # ── per-frame metrics (all values in mm) ──────────────────────────────
@@ -601,7 +614,7 @@ def main():
     if "farotuned" in models:
         method_configs["farotuned"] = {"model_path": args.farotuned}
     method_configs[RS_NAME] = {"source": "RealSense D435 hardware depth (depth_rs, ~30 FPS)"}
-    method_configs[GT_NAME] = {"source": "FARO Focus 3D scanner — reference GT (depth_faro)"}
+    method_configs[GT_NAME] = {"source": "Pickle CAD-rendered ground-truth depth"}
 
     results = BenchmarkResults(
         method_names=active_methods,
@@ -617,8 +630,7 @@ def main():
         dist_bin_mae=dist_bin_mae,
         close_range_valid=close_range_valid,
         source=(
-            f"FARO dataset  •  {args.faro_dir}  "
-            f"•  split={args.split}  •  filter={args.keywords}"
+            f"Pickle scene-capture  •  {args.pickle_excel}  "
         ),
         method_configs=method_configs,
     )
