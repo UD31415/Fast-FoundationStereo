@@ -45,11 +45,18 @@ PICKLE_DIR    = (
     r"/data path.xlsx"
 )
 
+# server
+PICKLE_DIR = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
+    r"\yg_pickle\\2026-06-22--14-48-11\Pickle_Scene_Capture_336222073841"
+    r"\data path.xlsx"
+)
+
 
 # MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 # OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415.pth'
 MODEL_PATH = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
-OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle.pth'
+OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260622.pth'
 
 
 # BF         = 49.8624*385.73  # D435 - focal_px * baseline_mm (calibrated from camera)  # D435 - focal_px * baseline_mm (calibrated from camera)
