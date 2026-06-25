@@ -1650,16 +1650,18 @@ class DataSource:
         # Render the depth of the combined scene.
         depth_scene       = self.render_mesh_depth(mesh_combined, cam_matrix, frame_size=(h, w), output_units="mm")
 
+        # Object-only render (no background) for comparison / debugging.
+        depth_obj       = self.render_mesh_depth(mesh_cad_cam, cam_matrix, frame_size=(h, w), output_units="mm")
 
-        item["depth_cad_projected"] = depth_scene
+
+        item["depth_scene_projected"] = depth_scene
+        item["depth_cad_projected"] = depth_obj
         item["projection_method"] = 'raycast'
         # show meshes and depth maps for visual inspection
         #source.draw_point_clouds(item)
 
         if debug:
 
-            # Object-only render (no background) for comparison / debugging.
-            depth_obj       = self.render_mesh_depth(mesh_cad_cam, cam_matrix, frame_size=(h, w), output_units="mm")
 
             # background -only render ( background) for comparison / debugging.
             depth_backg     = self.render_mesh_depth(mesh_backg_cam, cam_matrix, frame_size=(h, w), output_units="mm")
