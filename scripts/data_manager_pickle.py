@@ -62,7 +62,7 @@ import pandas as pd
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 
-from scripts.Uri_26_06_17 import T_camera_cad
+#from scripts.Uri_26_06_17 import T_camera_cad
 
 
 log.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=log.INFO)
@@ -114,10 +114,16 @@ DEFAULT_EXCEL = (
     r"\data path.xlsx"
 )
 
+# working
 DEFAULT_EXCEL = (
     r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
     r"\yg_pickle\\2026-06-22--14-48-11\Pickle_Scene_Capture_336222073841"
     r"\data path.xlsx"
+)
+
+DEFAULT_EXCEL = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\Public\Stavush\Pickle\Data\data for model training 25_6_26"
+    r"\data_25_06.xlsx"
 )
 
 #DEFAULT_STL_NAME = "cube_100x100x100"
@@ -611,7 +617,7 @@ class DataSource:
         # Cached CAD triangle meshes (in metres) keyed by cad_path.
         self._cad_mesh_cache: dict[str, o3d.geometry.TriangleMesh] = {}
 
-        self._background_mesh_cache: dict[str, o3d.geometry.TriangleMesh] = None  # background mesh - plate
+        self._background_mesh_cache: dict[str, o3d.geometry.TriangleMesh] = {}  # background mesh - plate
 
         # Flat per-capture index. Each entry has at least:
         #   ``json_path``, ``capture_idx``, plus eager copies of useful fields.
@@ -652,6 +658,7 @@ class DataSource:
         self.sessions.clear()
         self._cad_cache.clear()
         self._cad_mesh_cache.clear()
+        self._background_mesh_cache.clear()
 
         if json_paths is not None:
             session_jsons: list[str] = [translate_path(p) for p in json_paths]
@@ -707,16 +714,21 @@ class DataSource:
         baseline_mm         = scene.get("baseline", 0.05) * 1000.0
         bf                  = baseline_mm * intrinsics.get("fx", 660.0)
 
+        background_cad_name = 'thorlab matrix'
+        background_cad_path = r".\assets\thorlab matrix.STL"
+        mesh_backg      = self.load_background_mesh(background_cad_path)                
 
         #baseline_mm = scene.get("baseline", 0.05) * 1000.0
         self.sessions[str(path)] = {
-            "scene"         : scene,
-            "cad_path"      : cad_path,
-            "cad_name"      : cad_name,
-            "t_camera_tooltip": t_camera_tooltip,
-            "intrinsics"    : intrinsics,
-            "bf"            : bf,
-            "baseline_mm"   : baseline_mm,
+            "scene"                 : scene,
+            "cad_path"              : cad_path,
+            "cad_name"              : cad_name,
+            "background_cad_path"   : background_cad_path,
+            "background_cad_name"   : background_cad_name,
+            "t_camera_tooltip"      : t_camera_tooltip,
+            "intrinsics"            : intrinsics,
+            "bf"                    : bf,
+            "baseline_mm"           : baseline_mm,
         }
 
         for ci, capture in enumerate(captures):
@@ -726,7 +738,7 @@ class DataSource:
                     "json_path": str(path),  # session address
                     "capture_idx": ci,
                     **paths,
-                    "robot_position": capture.get("robot_position", {}),
+                    "t_robot_position": capture.get("robot_position", np.eye(4)),
                 }
             )
 
@@ -869,7 +881,7 @@ class DataSource:
         self._cad_mesh_cache[cad_path] = mesh
         return mesh
     
-    def load_background_mesh(self,
+    def load_background_mesh_flat(self,
         mesh_cam: o3d.geometry.TriangleMesh,
         background_offset_m: float = 0.0,
         background_size_m: float = 2.0,
@@ -901,7 +913,8 @@ class DataSource:
         ``(H, W)`` ``float32`` depth image. Pixels are guaranteed to be
         populated as long as the background plane covers the field of view.
         """
-        if self._background_mesh_cache is not None:
+        #if self._background_mesh_cache is not None:
+        if len(self._background_mesh_cache) > 0:
             return self._background_mesh_cache
 
         # Determine where to place the background plane.
@@ -946,12 +959,12 @@ class DataSource:
         self._background_mesh_cache = bg_mesh
         return bg_mesh
     
-    def load_background_cad(self, background_cad_path: str) -> Optional[o3d.geometry.TriangleMesh]:
+    def load_background_mesh(self, background_cad_path: str) -> Optional[o3d.geometry.TriangleMesh]:
         """Load and cache the background CAD mesh, scaled to metres."""
-        if not background_cad_path:
-            background_cad_path = r"..\assets\thorlab matrix.STL"  # Default path to the background CAD mesh
+        if len(background_cad_path) < 2:
+            background_cad_path = r".\assets\thorlab matrix.STL"  # Default path to the background CAD mesh
 
-        if self._background_mesh_cache is not None:
+        if self._background_mesh_cache:
             return self._background_mesh_cache
 
         if not os.path.exists(background_cad_path):
@@ -966,29 +979,28 @@ class DataSource:
         mesh.scale(0.001, center=(0.0, 0.0, 0.0))  # mm -> m
         if not mesh.has_vertex_normals():
             mesh.compute_vertex_normals()
+        
+        
+
+        # pcd = mesh.sample_points_poisson_disk(
+        #     number_of_points=10000,
+        #     use_triangle_normal=True
+        # )
+        
+        # transform the mesh to align with the camera frame
+        R = mesh.get_rotation_matrix_from_xyz((0, 0,np.pi/2))
+        # # Apply rotation
+        mesh.rotate(R, center=(0, 0, 0))
+        #pcd.transform(T_camera_cad)
+
         self._background_mesh_cache = mesh
-        
-
-        pcd = mesh.sample_points_poisson_disk(
-            number_of_points=10000,
-            use_triangle_normal=True
-        )
-        
-        
-        R = pcd.get_rotation_matrix_from_xyz((0, 0,np.pi/2))
-        
-        # Apply rotation
-        pcd.rotate(R, center=(0, 0, 0))
-        
-        
-        pcd.transform(T_camera_cad)
-
         return mesh
 
-    def get_intrinsics_matrix(self, json_path: str) -> tuple[np.ndarray, np.ndarray]:
+    #def get_intrinsics_matrix(self, json_path: str) -> tuple[np.ndarray, np.ndarray]:
+    def get_intrinsics_matrix(self, item) -> tuple[np.ndarray, np.ndarray]:
         """Return ``(K, dist_coeffs)`` for one session."""
-        info = self.sessions.get(json_path, {})
-        intr = info.get("intrinsics", {})
+        #info = self.sessions.get(json_path, {})
+        intr = item.get("intrinsics", {})
         fx = float(intr.get("fx", 1.0))
         fy = float(intr.get("fy", 1.0))
         cx = float(intr.get("ppx", 0.0))
@@ -1092,9 +1104,9 @@ class DataSource:
 
         # Pose composition: camera <- CAD using Uri_26_06_17.py's convention.
         t_camera_tooltip    = session["t_camera_tooltip"]
-        robot_position      = meta["robot_position"]
-        t_tool_to_base      = build_t_tool_to_base(robot_position)
-        t_camera_cad        = compose_t_camera_cad(t_camera_tooltip, robot_position)
+        t_robot_position    = meta["t_robot_position"]
+        t_tool_to_base      = build_t_tool_to_base(t_robot_position)
+        t_camera_cad        = compose_t_camera_cad(t_camera_tooltip, t_robot_position)
 
         cad_pcd             = self.load_cad_pcd(session["cad_path"])
         cad_pcd_aligned: Optional[o3d.geometry.PointCloud] = None
@@ -1137,7 +1149,7 @@ class DataSource:
             "t_cad_to_user"         : T_CAD_TO_USER,
             "t_camera_cad"          : t_camera_cad,
             "t_camera_cad_icp"      : t_camera_cad_icp,
-            "robot_position"        : robot_position,
+            "t_robot_position"      : t_robot_position,
             'bf'                    : bf,
             "intrinsics"            : intrinsics,
         }
@@ -1615,16 +1627,19 @@ class DataSource:
         depth_img       = item["depth_img"]
         h, w            = depth_img.shape[:2]
 
-        cam_matrix, _   = self.get_intrinsics_matrix(item["json_path"])
+        #cam_matrix, _   = self.get_intrinsics_matrix(item["json_path"])
+        cam_matrix, _   = self.get_intrinsics_matrix(item)
 
-        # load CAD
+        # load object CAD
         mesh            = self.load_cad_mesh(item["cad_path"])
         t_camera_cad    = item["t_camera_cad"]
         mesh_cad_cam     = copy.deepcopy(mesh)
         mesh_cad_cam.transform(np.asarray(t_camera_cad, dtype=np.float64))
 
         # load background mesh
-        mesh_backg      = self.load_background_mesh(mesh)        
+        background_cad_path = r".\assets\thorlab matrix.STL"
+        #mesh_backg      = self.load_background_mesh(mesh)   
+        mesh_backg      = self.load_background_mesh(background_cad_path)                
         mesh_backg_cam  = copy.deepcopy(mesh_backg)
         mesh_backg_cam.transform(np.asarray(t_camera_cad, dtype=np.float64))  
 
@@ -1637,7 +1652,6 @@ class DataSource:
 
 
         item["depth_cad_projected"] = depth_scene
-        #
         item["projection_method"] = 'raycast'
         # show meshes and depth maps for visual inspection
         #source.draw_point_clouds(item)
@@ -1768,7 +1782,7 @@ class DataSource:
         depth_img = item.get("depth_img")
         if json_path and depth_img is not None:
             try:
-                K, _ = self.get_intrinsics_matrix(json_path)
+                K, _ = self.get_intrinsics_matrix(item)
                 h, w = depth_img.shape[:2]
                 frustum = self.make_camera_frustum(
                     K, frame_size=(h, w), scale=0.1, color=(1.0, 0.5, 0.0)
@@ -2433,14 +2447,14 @@ def RunTest() -> None:
     #tst.test_get_item_projected_raycast() # ok
     #tst.test_get_item_projected_open3d()
     #tst.test_get_item_and_scene() # ok
-    #tst.test_get_item_and_scene_projected()
+    tst.test_get_item_and_scene_projected()
 
     #tst.test_project_on_camera()
     # tst.test_show_icp_alignment()
     #tst.test_get_item_icp_projected()
     # tst.test_get_grid_coordinates()
     # tst.test_match_grid_to_cad()
-    tst.test_load_and_show_png()
+    #tst.test_load_and_show_png()
     
 
 if __name__ == "__main__":
