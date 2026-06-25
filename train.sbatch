@@ -9,7 +9,7 @@
 #SBATCH --nodelist=vtg-ptk-dsk03
 #SBATCH --signal=B:TERM@30             # SIGTERM to the batch shell 30s before kill
 
-
+# sbatch train.sbatch
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate ffs
 #srun python3 scripts/finetune_isaac.py
