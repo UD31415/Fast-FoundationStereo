@@ -105,9 +105,9 @@ DATASET_KEYWORDS = ['BATHROOM']
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {DEVICE}")
 
-BF     = 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
-ITERS  = 8          # GRU update iterations
-N_VIZ  = 12         # frames saved for visual comparison in the report
+BF              = 49470.45   # focal_px × baseline_mm  (calibrated from RealSense stereo pair)
+ITERS           = 8          # GRU update iterations
+N_VIZ           = 12         # frames saved for visual comparison in the report
 
 # Depth threshold for the "close-range" coverage metric — in mm
 CLOSE_RANGE_THRESHOLD_MM = 50.0
