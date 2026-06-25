@@ -47,6 +47,10 @@ import unittest
 import logging as log
 
 # --------------------------------
+# constants
+FARO_DATA_BASE = r'/mnt/algonas/Local/Data/Stereo/Faro/FARO_DATA_BASE'
+
+# --------------------------------
 #%% Data source
 class DataSource:
 
@@ -72,7 +76,7 @@ class DataSource:
                    'test'  – return only images whose path matches at least one keyword
         """
         if len(input_rectified) < 3:
-            input_rectified = r'\\svm.realsenseai.com\algonas\Local\Data\Stereo\Faro\FARO_DATA_BASE'
+            input_rectified = FARO_DATA_BASE #r'\\svm.realsenseai.com\algonas\Local\Data\Stereo\Faro\FARO_DATA_BASE'
 
         # NOTE: use forward slashes in the glob pattern. ``os.path.join`` does not
         # translate backslashes on POSIX, so r"**\L_images\L_Img_**.mat" becomes a
