@@ -688,6 +688,138 @@ class DataSource:
         )
         return len(self.items)
 
+    # Default root for ``init_multi_directory``. Each direct subfolder named with
+    # the timestamp pattern ``YYYY-MM-DD--HH-MM-SS`` is expected to contain a
+    # ``Pickle_Scene_Capture*/data path.xlsx`` manifest.
+    DEFAULT_MULTI_ROOT = (
+        r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0"
+        r"\2026_06\yg_pickle"
+    )
+    _SESSION_FOLDER_RE = re.compile(r"^\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2}$")
+
+    def init_multi_directory(
+        self,
+        root: str | os.PathLike[str] = DEFAULT_MULTI_ROOT,
+        excel_glob: str = "**/data path.xlsx",
+        session_pattern: Optional[re.Pattern[str] | str] = None,
+        keywords: Optional[Sequence[str]] = None,
+    ) -> int:
+        """Index captures from every ``data path.xlsx`` under ``root``.
+
+        Walks each timestamped subfolder (e.g. ``2026-06-24--16-56-29``) under
+        ``root``, locates its ``Pickle_Scene_Capture*/data path.xlsx`` manifest,
+        and accumulates all captures into ``self.items``. Useful when many
+        sessions need to be benchmarked together rather than one Excel at a
+        time as in :meth:`init_directory`.
+
+        Parameters
+        ----------
+        root : root directory containing dated session folders. May be a UNC
+            path; it is translated via :func:`translate_path`.
+        excel_glob : glob (relative to each session folder) used to locate the
+            manifest Excel file. Defaults to ``"**/data path.xlsx"`` so the
+            ``Pickle_Scene_Capture*`` subfolder is matched automatically.
+        session_pattern : optional regex (string or compiled) used to filter
+            session-folder names. Defaults to the ``YYYY-MM-DD--HH-MM-SS``
+            timestamp pattern.
+        keywords : optional list of case-insensitive substrings; if given,
+            only session folders whose name contains at least one keyword are
+            included.
+
+        Returns
+        -------
+        int : the total number of indexed capture items.
+        """
+        self.items.clear()
+        self.sessions.clear()
+        self._cad_cache.clear()
+        self._cad_mesh_cache.clear()
+        self._background_mesh_cache.clear()
+
+        root_path = Path(translate_path(root))
+        if not root_path.is_dir():
+            log.error(f"Multi-directory root not found or unreadable: {root_path}")
+            self.excel_path = None
+            self.manifest_df = None
+            return 0
+
+        if isinstance(session_pattern, str):
+            session_re = re.compile(session_pattern)
+        elif session_pattern is None:
+            session_re = self._SESSION_FOLDER_RE
+        else:
+            session_re = session_pattern
+
+        keywords_upper = [k.upper() for k in keywords] if keywords else None
+
+        session_folders = sorted(
+            p for p in root_path.iterdir()
+            if p.is_dir() and session_re.match(p.name)
+            and (keywords_upper is None
+                 or any(kw in p.name.upper() for kw in keywords_upper))
+        )
+        if not session_folders:
+            log.warning(
+                f"No timestamped session folders matched under {root_path} "
+                f"(pattern={session_re.pattern!r}, keywords={keywords})"
+            )
+            self.excel_path = None
+            self.manifest_df = None
+            return 0
+
+        excel_paths: list[Path] = []
+        for folder in session_folders:
+            matches = sorted(folder.glob(excel_glob))
+            if not matches:
+                log.warning(f"No manifest found in {folder} (glob={excel_glob!r})")
+                continue
+            if len(matches) > 1:
+                log.info(
+                    f"{len(matches)} manifests in {folder}; using first: "
+                    f"{matches[0].name}"
+                )
+            excel_paths.append(matches[0])
+
+        if not excel_paths:
+            log.warning(f"No manifest Excel files discovered under {root_path}")
+            self.excel_path = None
+            self.manifest_df = None
+            return 0
+
+        # Collect JSONs from every manifest, then run the regular indexing.
+        all_session_jsons: list[str] = []
+        manifest_frames: list[pd.DataFrame] = []
+        for xlsx in excel_paths:
+            try:
+                df = pd.read_excel(xlsx)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(f"Failed to read manifest {xlsx}: {exc}")
+                continue
+            df = df.copy()
+            df["__manifest_path"] = str(xlsx)
+            manifest_frames.append(df)
+
+            mask = df["Label"].astype(str) == LABEL_RAW
+            all_session_jsons.extend(
+                translate_path(p) for p in df.loc[mask, "Data Path"].tolist()
+            )
+
+        # Record bookkeeping that mirrors ``init_directory``.
+        self.excel_path = excel_paths[0]
+        self.manifest_df = (
+            pd.concat(manifest_frames, ignore_index=True) if manifest_frames else None
+        )
+
+        for json_path in all_session_jsons:
+            self.index_session(json_path)
+
+        log.info(
+            f"DataSource: indexed {len(self.items)} captures across "
+            f"{len(self.sessions)} sessions from {len(excel_paths)} manifests "
+            f"under {root_path}"
+        )
+        return len(self.items)
+
     def index_session(self, json_path: str) -> None:
         """Load one session JSON and append its captures to ``self.items``."""
         path = Path(json_path)

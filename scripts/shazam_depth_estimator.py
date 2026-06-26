@@ -1723,7 +1723,8 @@ class ShazamDepthEstimator:
         self.show_subset(img_list, ttl_list, col_num=1)        
 
         disp_index               = self.estimate_disparity_from_prob(prob_total_filter, estim_type = 1) # ensure values are within the valid range
-        disp_confidence           = np.max(prob_total_filter, axis=2)  # shape (N, M)       
+        disp_confidence           = np.max(prob_total_filter, axis=2)  # shape (N, M) 
+        disp_index[disp_confidence < 0.1]   = 0  # mask out low confidence areas      
 
 
         plt.figure(figsize=(12, 6)) 

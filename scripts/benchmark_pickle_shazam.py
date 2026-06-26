@@ -110,10 +110,16 @@ PICKLE_EXCEL = (
     r"\data path.xlsx"
 )
 
+PICKLE_EXCEL = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
+    r"\yg_pickle\\2026-06-25--15-00-20\Pickle_Scene_Capture_Exp1500_LP150_LightsON_336222073841"
+    r"\data path.xlsx"
+)
+
 ORIGINAL_PATH   = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_epoch_020.pth'
 ISAACTUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_epoch_037.pth'
-DEFAULT_OUT     = f'{code_dir}/../reports/benchmark_pickle_shazam'
+DEFAULT_OUT     = f'{code_dir}/../reports/benchmark_pickle_shazam_lights_on'
 
 # Projection method used to render CAD-based ground-truth depth.
 PROJECTION_METHOD = "splat"
@@ -123,7 +129,7 @@ PROJECTION_METHOD = "splat"
 # so the full-resolution cost volume is ~ (H · W · 3 · 128 · 4 bytes). To keep memory
 # and latency in check on CPU we optionally pre-downsample the IR pair and rescale
 # the returned disparity back to native resolution.
-SHAZAM_SCALE = 0.5   # pre-downscale factor applied to IR pair before Gabor matching
+SHAZAM_SCALE        = 0.5   # pre-downscale factor applied to IR pair before Gabor matching
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {DEVICE}")
@@ -138,18 +144,20 @@ CLOSE_RANGE_THRESHOLD_MM = 20.0
 DIST_BINS_MM: List[Tuple[float, float]] = [
     (0.0,    100.0),
     (100.0,  200.0),
-    (200.0,  450.0),
-    (450.0,  1000.0),
-    (1000.0, 1500.0),
+    (200.0,  300.0),
+    (300.0,  400.0),
+    (400.0,  500.0),
+    (500.0,  600.0),
+    (600.0,  700.0),
 ]
-BIN_LABELS_MM  = ["0–100 mm", "100–200 mm", "200–450 mm", "450–1000 mm", "1000–1500 mm"]
-BIN_CENTERS_MM = [50.0, 150.0, 325.0, 725.0, 1250.0]
+BIN_LABELS_MM  = ["0–100 mm", "100–200 mm", "200–300 mm", "300–400 mm", "400–500 mm", "500–600 mm", "600–700 mm"]
+BIN_CENTERS_MM = [50.0, 150.0, 250.0, 350.0, 450.0, 550.0, 650.0]
 
 METHODS: Dict[str, Dict[str, str]] = {
     "original":   {"label": "FFS Original",                  "color": "#2980b9"},
     "finetuned":  {"label": "FFS Fine-tuned (Pickle)",       "color": "#e74c3c"},
     "isaactuned": {"label": "FFS Fine-tuned (ISAAC)",        "color": "#8e44ad"},
-    "shazam":     {"label": "Shazam (Gabor, CPU)",           "color": "#16a085"},
+    "shazam":     {"label": "Shazam (CPU Only)",             "color": "#16a085"},
     "depth_rs":   {"label": "RealSense Hardware Depth",      "color": "#f39c12"},
     "pickle_gt":  {"label": "Pickle CAD GT (projected)",     "color": "#27ae60"},
 }
