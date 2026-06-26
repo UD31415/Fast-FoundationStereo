@@ -715,8 +715,8 @@ class DataSource:
         bf                  = baseline_mm * intrinsics.get("fx", 660.0)
 
         background_cad_name = 'thorlab matrix'
-        background_cad_path = r".\assets\thorlab matrix.STL"
-        mesh_backg      = self.load_background_mesh(background_cad_path)                
+        background_cad_path = r"..\assets\thorlab matrix.STL"
+        #mesh_backg      = self.load_background_mesh(background_cad_path)                
 
         #baseline_mm = scene.get("baseline", 0.05) * 1000.0
         self.sessions[str(path)] = {
@@ -966,6 +966,10 @@ class DataSource:
 
         if self._background_mesh_cache:
             return self._background_mesh_cache
+        
+        # resolve for linus machine
+        if not os.path.exists(background_cad_path):
+            background_cad_path = r"./assets/thorlab matrix.STL"
 
         if not os.path.exists(background_cad_path):
             log.warning(f"Background CAD path missing: {background_cad_path}")
@@ -1637,7 +1641,7 @@ class DataSource:
         mesh_cad_cam.transform(np.asarray(t_camera_cad, dtype=np.float64))
 
         # load background mesh
-        background_cad_path = r".\assets\thorlab matrix.STL"
+        background_cad_path = r"..\assets\thorlab matrix.STL"
         #mesh_backg      = self.load_background_mesh(mesh)   
         mesh_backg      = self.load_background_mesh(background_cad_path)                
         mesh_backg_cam  = copy.deepcopy(mesh_backg)

@@ -78,6 +78,7 @@ class DataSource:
         if len(input_rectified) < 3:
             input_rectified = FARO_DATA_BASE #r'\\svm.realsenseai.com\algonas\Local\Data\Stereo\Faro\FARO_DATA_BASE'
 
+
         # NOTE: use forward slashes in the glob pattern. ``os.path.join`` does not
         # translate backslashes on POSIX, so r"**\L_images\L_Img_**.mat" becomes a
         # literal path component there and matches nothing.
