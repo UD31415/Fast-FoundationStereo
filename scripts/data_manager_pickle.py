@@ -123,12 +123,6 @@ IMG_TYPE_IR_LEFT    = "IR"
 IMG_TYPE_IR_RIGHT   = "RightIR"
 IMG_TYPE_RGB        = "RGB8"
 MAX_Z_DISTANCE_MM   = 1200  # max z to show
-IMG_TYPE_VERTICES   = "Vertices"
-IMG_TYPE_DEPTH      = "Depth"
-IMG_TYPE_IR_LEFT    = "IR"
-IMG_TYPE_IR_RIGHT   = "RightIR"
-IMG_TYPE_RGB        = "RGB8"
-MAX_Z_DISTANCE_MM   = 1200  # max z to show
 
 
 # ---------------------------------------------------------------------------
