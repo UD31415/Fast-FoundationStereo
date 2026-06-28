@@ -101,25 +101,7 @@ def translate_path(p: str | os.PathLike[str] | None) -> str:
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-# set 1 - with aligned data
-DEFAULT_EXCEL = (
-    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
-    r"\yg_pickle\2026-06-16--15-12-54\Pickle_Scene_Capture_336222073841"
-    r"\data path.xlsx"
-)
-# here you have additional data with stronger angles and translations. Tell me if the alignment holds even here
-DEFAULT_EXCEL = (
-    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
-    r"\yg_pickle\2026-06-18--10-01-03\Pickle_Scene_Capture_336222073841"
-    r"\data path.xlsx"
-)
 
-# working
-DEFAULT_EXCEL = (
-    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
-    r"\yg_pickle\\2026-06-22--14-48-11\Pickle_Scene_Capture_336222073841"
-    r"\data path.xlsx"
-)
 
 DEFAULT_EXCEL = (
     r"\\svm.realsenseai.com\RealSense_Validation\VIDB\Public\Stavush\Pickle\Data\data for model training 25_6_26"
@@ -130,18 +112,17 @@ DEFAULT_EXCEL = (
 
 LABEL_RAW           = "raw data (json file)"
 LABEL_ICP           = "ICP"
-TRAIN_OBJECT_LIST = ['cube_100x100x100','SCencloser_v2', 'profile_8_40x40_light','MEC501482_v2',
-                     'RVH_BASE_v4','RVH_BASE_LID_v2']
-TRAIN_OBJECT_LIST = ['cube_100x100x100','SCencloser_v2', 'profile_8_40x40_light','MEC501482_v2',
-                     'RVH_BASE_v4']
+
+# train on 4 and test on  [' 'RVH_BASE_v4','RVH_BASE_LID_v2']
+TRAIN_OBJECT_LIST = ['cube_100x100x100','SCencloser_v2', 'profile_8_40x40_light','MEC501482_v2']
 
 # Image type strings used inside the per-session JSON.
-IMG_TYPE_VERTICES = "Vertices"
-IMG_TYPE_DEPTH = "Depth"
-IMG_TYPE_IR_LEFT = "IR"
-IMG_TYPE_IR_RIGHT = "RightIR"
-IMG_TYPE_RGB = "RGB8"
-MAX_Z_DISTANCE_MM = 1200  # max z to show
+IMG_TYPE_VERTICES   = "Vertices"
+IMG_TYPE_DEPTH      = "Depth"
+IMG_TYPE_IR_LEFT    = "IR"
+IMG_TYPE_IR_RIGHT   = "RightIR"
+IMG_TYPE_RGB        = "RGB8"
+MAX_Z_DISTANCE_MM   = 1200  # max z to show
 
 
 # ---------------------------------------------------------------------------
