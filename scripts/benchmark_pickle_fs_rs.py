@@ -82,6 +82,7 @@ from metrics import (
     BenchmarkResults,
     FrameMetrics,
     compute_metrics,
+    compute_edge_mae,
     aggregate,
 )
 from report import ReportGenerator
@@ -205,9 +206,12 @@ class ReportGeneratorMM(ReportGenerator):
     _bin_labels  = BIN_LABELS_MM
     _bin_centers = BIN_CENTERS_MM
 
-    def __init__(self, results, stats, output_dir) -> None:
+    def __init__(self, results, stats, output_dir,
+                 edge_mae_per_method: Dict[str, float] | None = None) -> None:
         super().__init__(results, stats, output_dir)
         self._selected_viz_indices: List[int] = []
+        # Per-method mean edge MAE (mm), computed by the benchmark loop.
+        self._edge_mae_per_method: Dict[str, float] = edge_mae_per_method or {}
 
     def _get_selected_viz_indices(self, n_pick: int = 4) -> List[int]:
         """Return cached random frame indices used consistently across report sections."""
@@ -382,16 +386,21 @@ class ReportGeneratorMM(ReportGenerator):
     def _fig_summary_table(self) -> str:
         if not self._stats:
             return self._empty_fig("summary_table.png", "No stats")
-        cols = ["Method", "MRE* (%)", "MRE (%)", "MAE (mm)", "δ1 (%)",
-                "Coverage (%)", "FPS", "GPU %", "GT?"]
+        cols = ["Method", "MRE* (%)", "MRE (%)", "MAE (mm)", "Edge MAE (mm)",
+                "δ1 (%)", "Coverage (%)", "FPS", "GPU %", "GT?"]
         gt_rows, other_rows = [], []
         for name, s in self._stats.items():
             is_gt = (name == self._gt)
+            edge_mae = self._edge_mae_per_method.get(name, float("nan"))
+            edge_mae_str = (
+                "—" if is_gt or not np.isfinite(edge_mae) else f"{edge_mae:.1f}"
+            )
             row = [
                 s.label,
                 "—" if is_gt else f"{s.mre_pen_mean * 100:.1f}",
                 "—" if is_gt else f"{s.mre_mean * 100:.1f}",
                 "—" if is_gt else f"{s.mae_mean:.1f}",
+                edge_mae_str,
                 "—" if is_gt else f"{s.delta1_mean:.1f}",
                 f"{s.coverage_mean:.1f}",
                 f"{s.fps_mean:.1f}" if s.fps_mean < 999 else "≈30",
@@ -509,6 +518,7 @@ def main():
     valid_acc         = {}     # initialised on first frame
     dist_bin_mae      = {m: [] for m in active_methods}
     close_range_valid = {m: [] for m in active_methods}
+    edge_mae_raw      = {m: [] for m in active_methods}   # per-frame edge MAE (mm)
     timing_ms_raw     = {m: [] for m in models}   # only NN models have inference latency
     H = W = None
 
@@ -542,6 +552,9 @@ def main():
         gt_close_mask = (gt_mm > 0) & (gt_mm < CLOSE_RANGE_THRESHOLD_MM)
         n_close = int(gt_close_mask.sum())
 
+        # Edge mask derived from the CAD-projected depth (uint8 0/255).
+        edge_mask = source.create_edge_mask(data, debug=False).astype(bool)
+
         for mname in active_methods:
             pred = frame_depths[mname]
             valid_acc[mname] += (pred > 0).astype(np.float32)
@@ -560,6 +573,12 @@ def main():
 
             all_metrics.append(fm)
             dist_bin_mae[mname].append(compute_bin_mae_mm(pred, gt_mm))
+
+            # Edge MAE (mm) — accuracy restricted to CAD-edge pixels.
+            if mname != GT_NAME:
+                edge_vals = compute_edge_mae(pred, gt_mm, edge_mask)
+                if edge_vals and np.isfinite(edge_vals[0]):
+                    edge_mae_raw[mname].append(float(edge_vals[0]))
 
             close_cov = (
                 float((pred[gt_close_mask] > 0).mean()) * 100.0
@@ -626,8 +645,20 @@ def main():
     if RS_NAME in stats:
         stats[RS_NAME].fps_mean = 30.0
 
+    # ── aggregate edge MAE per method ─────────────────────────────────────────
+    edge_mae_mean: Dict[str, float] = {
+        m: (float(np.mean(vals)) if vals else float("nan"))
+        for m, vals in edge_mae_raw.items()
+    }
+    for mname, val in edge_mae_mean.items():
+        if np.isfinite(val):
+            logging.info(f"Edge MAE [{mname}]: {val:.2f} mm")
+
     # ── generate report ───────────────────────────────────────────────────────
-    reporter = ReportGeneratorMM(results, stats, out_dir)
+    reporter = ReportGeneratorMM(
+        results, stats, out_dir,
+        edge_mae_per_method=edge_mae_mean,
+    )
     reporter.generate()
 
 

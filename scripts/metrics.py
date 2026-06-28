@@ -146,6 +146,21 @@ def compute_bin_mae(
             result.append(float(np.abs(pred_m[mask] - gt_m[mask]).mean()))
     return result
 
+def compute_edge_mae(
+    pred_m: np.ndarray,
+    gt_m: np.ndarray,
+    edge_mask: np.ndarray,
+) -> List[float]:
+    """MAE per distance bin; returns NaN for bins with no valid GT pixels. Works only on edge pixels."""
+    result = []
+
+    mask = (gt_m > 0) & (pred_m > 0) & edge_mask
+    if mask.sum() == 0:
+        result.append(float("nan"))
+    else:
+        result.append(float(np.abs(pred_m[mask] - gt_m[mask]).mean()))
+    return result
+
 
 def aggregate(
     results: BenchmarkResults,

@@ -128,8 +128,12 @@ DEFAULT_EXCEL = (
 
 #DEFAULT_STL_NAME = "cube_100x100x100"
 
-LABEL_RAW = "raw data (json file)"
-LABEL_ICP = "ICP"
+LABEL_RAW           = "raw data (json file)"
+LABEL_ICP           = "ICP"
+TRAIN_OBJECT_LIST = ['cube_100x100x100','SCencloser_v2', 'profile_8_40x40_light','MEC501482_v2',
+                     'RVH_BASE_v4','RVH_BASE_LID_v2']
+TRAIN_OBJECT_LIST = ['cube_100x100x100','SCencloser_v2', 'profile_8_40x40_light','MEC501482_v2',
+                     'RVH_BASE_v4']
 
 # Image type strings used inside the per-session JSON.
 IMG_TYPE_VERTICES = "Vertices"
@@ -670,11 +674,15 @@ class DataSource:
                 log.error(f"Manifest Excel does not exist: {self.excel_path}")
                 return 0
 
-            df = pd.read_excel(self.excel_path)
-            self.manifest_df = df
-            mask = df["Label"].astype(str) == LABEL_RAW
-            # if stl_name is not None:
-            #     mask &= df["STL name"].astype(str) == str(stl_name)
+            df                  = pd.read_excel(self.excel_path)
+            self.manifest_df    = df
+
+            mask                = df["Label"].astype(str) == LABEL_RAW
+            if self.train_mode:
+                mask &= df["STL name"].astype(str).isin(TRAIN_OBJECT_LIST)
+            else:
+                mask &= ~df["STL name"].astype(str).isin(TRAIN_OBJECT_LIST)
+
             session_jsons = [translate_path(p) for p in df.loc[mask, "Data Path"].tolist()]
 
         #self.stl_name = stl_name
