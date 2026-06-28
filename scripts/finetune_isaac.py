@@ -41,15 +41,16 @@ from scripts.data_manager_isaac import DataSource
 
 # ── constants ────────────────────────────────────────────────────────────────
 
-ISAAC_DIR    = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/isaac_basic_objects'
+#ISAAC_DIR    = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/isaac_basic_objects'
+ISAAC_DIR    = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/metal_ycb'
 # MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 # OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415.pth'
 MODEL_PATH = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
-OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac.pth'
+OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_metal_ycb.pth'
 
 
 DEFAULT_VIEWS    = ('wrist',) 
-DEFAULT_EPISODES = ('episode_12','episode_16','episode_18',)
+DEFAULT_EPISODES = ('episode_12','episode_16','episode_18','episode_20','episode_22','episode_24','episode_26','episode_28','episode_30','episode_32','episode_34','episode_36','episode_38','episode_40')
 
 # BF         = 49.8624*385.73  # D435 - focal_px * baseline_mm (calibrated from camera)  # D435 - focal_px * baseline_mm (calibrated from camera)
 #BF         = 50.102706998586 * 385.509887695312 # new data 2

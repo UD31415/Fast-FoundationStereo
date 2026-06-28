@@ -53,7 +53,8 @@ log.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=log.INF
 # Default dataset root on disk.
 #DEFAULT_ROOT = r"C:\Work\Data\Depth\reflective_test"
 #DEFAULT_ROOT = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/reflective_test'
-DEFAULT_ROOT = r'\\syn11.iil.intel.com\algonas\Local\Data\new_depth_stereo_datasets\isaac_datasets\isaac_basic_objects'
+#DEFAULT_ROOT = r'\\syn11.iil.intel.com\algonas\Local\Data\new_depth_stereo_datasets\isaac_datasets\isaac_basic_objects'
+DEFAULT_ROOT = r'/mnt/algonas/Local/Data/new_depth_stereo_datasets/isaac_datasets/metal_ycb'
 
 
 # Known view names. Sub-folders not present on disk are silently skipped.
