@@ -1659,10 +1659,12 @@ class DataSource:
 
 
         item["depth_scene_projected"] = depth_scene
-        item["depth_cad_projected"] = depth_obj
-        item["projection_method"] = 'raycast'
+        item["depth_cad_projected"]   = depth_obj
+        item["cad_pcd_background"]    = mesh_backg_cam
+        item["projection_method"]      = 'raycast'
         # show meshes and depth maps for visual inspection
         #source.draw_point_clouds(item)
+        item                        = self.create_edge_mask(item,  closing_radius=5,  debug=False)      
 
         if debug:
 
@@ -1678,7 +1680,7 @@ class DataSource:
             self.show_subset(
                 [
                     item.get("ir_left_img"),
-                    item.get("ir_right_img"),
+                    item.get("edge_mask"),
                     depth_obj,
                     depth_rs,
                     depth_scene,
@@ -1686,7 +1688,7 @@ class DataSource:
                 ],
                 [
                     "left (RS)",
-                    "right (RS)",
+                    "edge mask",
                     "depth CAD (mm)",
                     "depth RS (mm)",
                     f"depth CAD + background (mm)",
@@ -1696,6 +1698,90 @@ class DataSource:
             
             self.draw_point_clouds(item)
             plt.show()  
+
+        return item
+
+    # ------------------------------------------------------------------
+    # Edge mask
+    # ------------------------------------------------------------------
+
+    def create_edge_mask(
+        self,
+        item: dict[str, Any],
+        closing_radius: int = 3,
+        debug: bool = False,
+    ) -> np.ndarray:
+        """Build an edge mask from ``item["depth_cad_projected"]``.
+
+        Edges are pixels where the projected CAD depth has a significant
+        discontinuity — both the object silhouette (depth -> 0 transitions)
+        and internal depth jumps larger than ``depth_gradient_mm``. The raw
+        edge map is then dilated and closed (binary closing) to connect
+        nearby edge fragments and slightly thicken the boundary.
+
+        Parameters
+        ----------
+        item : sample dict returned by :meth:`get_item_projected` or
+            :meth:`get_item_and_scene_projected`. Must contain
+            ``"depth_cad_projected"``.
+        depth_gradient_mm : minimum depth jump (mm) between adjacent valid
+            pixels that counts as an internal edge.
+        closing_radius : structuring-element radius (pixels) used for the
+            morphological closing that extends the raw edges.
+        debug : when ``True``, displays the projected depth and the final
+            mask side by side.
+
+        Returns
+        -------
+        ``(H, W)`` ``uint8`` mask (0/255). The mask is also stored back on
+        ``item`` under the key ``"edge_mask"``.
+        """
+        depth_cad = item.get("depth_cad_projected")
+        if depth_cad is None:
+            raise KeyError(
+                "create_edge_mask: item is missing 'depth_cad_projected'; "
+                "call get_item_projected(...) first."
+            )
+
+        depth = np.asarray(depth_cad, dtype=np.float32)
+        valid = depth > 0
+
+        # Silhouette edges: boundary between valid and invalid pixels.
+        valid_u8 = valid.astype(np.uint8) * 255
+        # sil_edges = cv2.morphologyEx(
+        #     valid_u8,
+        #     cv2.MORPH_GRADIENT,
+        #     cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        # )
+
+        # Internal depth-jump edges: large gradient magnitude over valid pixels.
+        #gx = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3)
+        #gy = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3)
+        #grad_mag = cv2.magnitude(gx, gy)
+        #internal_edges = ((grad_mag >= float(depth_gradient_mm)) & valid).astype(np.uint8) * 255
+
+        #raw_edges = cv2.bitwise_or(sil_edges, internal_edges)
+        #raw_edges = sil_edges
+        # Binary closing to extend / connect edge fragments.
+        radius      = max(1, int(closing_radius))
+        ksize       = 2 * radius + 1
+        kernel      = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        #edge_mask = cv2.morphologyEx(raw_edges, cv2.MORPH_CLOSE, kernel)
+
+        
+        valid_erode  = cv2.morphologyEx(valid_u8, cv2.MORPH_ERODE, kernel)
+        valid_dilate = cv2.morphologyEx(valid_u8, cv2.MORPH_DILATE, kernel)
+        edge_mask    = cv2.bitwise_and(255 - valid_erode, valid_dilate)
+
+        item["edge_mask"] = edge_mask
+
+        if debug:
+            self.show_subset(
+                [depth, valid_u8, valid_erode, valid_dilate, edge_mask],
+                ["depth CAD (mm)", "valid mask", f"eroded mask (r={radius})", f"dilated mask (r={radius})", f"edge mask (close r={radius})"],
+                suptitle="create_edge_mask",
+            )
+            plt.show()
 
         return item
 
@@ -1730,10 +1816,12 @@ class DataSource:
                     vmax = 200
                 elif 'depth' in ttl_list[k].lower():
                     vmax = 1000
+                elif img.dtype == np.uint8:
+                    vmax = 255
                 else:
                     vmax = np.percentile(img, 95) #if img.dtype == np.uint8 else 1000
                 #vmax = 600 if k == 3 else vmax
-                axes[ri, ci].imshow(img, cmap="gray" if img.ndim == 2 and img.dtype == np.uint8 else None, vmax = vmax )
+                axes[ri, ci].imshow(img, cmap="gray" if img.dtype == np.uint8 else None, vmax = vmax )
             axes[ri, ci].set_title(ttl_list[k])
         # for k in range(img_num, row_num * col_num):
         #     axes[k // col_num, k % col_num].axis("off")
@@ -1757,7 +1845,8 @@ class DataSource:
         depth_pcd               = item.get("depth_pcd_raw")
         cad_pcd                 = item.get("cad_pcd")
         cad_pcd_aligned         = item.get("cad_pcd_aligned")
-        cad_pcd_aligned_icp     = item.get("cad_pcd_aligned_icp")
+        cad_pcd_aligned_icp     = None #item.get("cad_pcd_aligned_icp")
+        cad_pcd_background      = item.get("cad_pcd_background")
 
         if depth_pcd is not None and len(depth_pcd.points) > 0:
             depth_pcd = copy.deepcopy(depth_pcd)
@@ -1778,6 +1867,11 @@ class DataSource:
             cad_pcd_aligned_icp = copy.deepcopy(cad_pcd_aligned_icp)
             cad_pcd_aligned_icp.paint_uniform_color([0.0, 0.0, 0.0])  # black
             clouds.append(cad_pcd_aligned_icp)
+
+        if cad_pcd_background is not None:
+            cad_pcd_background = copy.deepcopy(cad_pcd_background)
+            cad_pcd_background.paint_uniform_color([0.0, 1.0, 0.0])  # green
+            clouds.append(cad_pcd_background)
 
         if not clouds:
             log.warning("No point clouds to display.")
@@ -2293,6 +2387,50 @@ class TestDataSource(unittest.TestCase):
         # Raycast produces a fully dense silhouette: at least one pixel hit.
         self.assertGreater(int(np.count_nonzero(out["depth_cad_projected"])), 0)
 
+    def test_create_edge_mask(self):
+        """Smoke-test :meth:`DataSource.create_edge_mask`.
+
+        Builds a projected CAD depth image, derives an edge mask from it,
+        and validates shape / dtype / non-empty content. The mask is also
+        rendered in debug mode for visual inspection.
+        """
+        source          = DataSource()
+        count           = source.init_directory()
+        self.assertTrue(count > 0)
+
+        item_id         = int(np.random.randint(0, count))
+        item            = source.get_item_and_scene_projected(item_id, debug=False)
+        depth_cad       = item["depth_cad_projected"]
+
+        item           = source.create_edge_mask(
+            item,
+            depth_gradient_mm=5.0,
+            closing_radius=3,
+            debug=True,
+        )
+
+        edge_mask = item["edge_mask"]
+        self.assertEqual(edge_mask.shape, depth_cad.shape)
+        self.assertEqual(edge_mask.dtype, np.uint8)
+        self.assertIs(item["edge_mask"], edge_mask)
+
+        edge_pixels     = int(np.count_nonzero(edge_mask))
+        self.assertGreater(edge_pixels, 0)
+        # Mask is binary 0/255.
+        unique_vals     = np.unique(edge_mask)
+        self.assertTrue(set(unique_vals.tolist()).issubset({0, 255}))
+
+        # The edge mask must lie close to the CAD silhouette: at least
+        # 80% of edge pixels should sit within a few pixels of a valid
+        # depth pixel.
+        valid_u8        = (depth_cad > 0).astype(np.uint8) * 255
+        kernel          = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        dilated_valid   = cv2.dilate(valid_u8, kernel)
+        near_object     = int(np.count_nonzero((edge_mask > 0) & (dilated_valid > 0)))
+        self.assertGreater(near_object, int(0.8 * edge_pixels))
+
+        plt.show()
+
     def test_project_on_camera(self):
         # NOTE: Open3D's ``OffscreenRenderer`` (Filament backend) is not
         # supported on Windows wheels (it requires EGL headless). On Windows
@@ -2454,11 +2592,12 @@ def RunTest() -> None:
     #tst.test_get_item_projected_open3d()
     #tst.test_get_item_and_scene() # ok
     tst.test_get_item_and_scene_projected()
+    #tst.test_create_edge_mask()
 
     #tst.test_project_on_camera()
-    # tst.test_show_icp_alignment()
+    #tst.test_show_icp_alignment()
     #tst.test_get_item_icp_projected()
-    # tst.test_get_grid_coordinates()
+    #tst.test_get_grid_coordinates()
     # tst.test_match_grid_to_cad()
     #tst.test_load_and_show_png()
     
