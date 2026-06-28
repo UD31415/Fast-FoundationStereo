@@ -52,11 +52,18 @@ PICKLE_DIR = (
     r"\data path.xlsx"
 )
 
+# new data 2026-06-26
+PICKLE_DIR = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\Public\Stavush\Pickle\Data\data for model training 25_6_26"
+    r"\data_25_06.xlsx"
+)
+
+
 
 # MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 # OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415.pth'
 MODEL_PATH = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
-OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260622.pth'
+OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625.pth'
 
 
 # BF         = 49.8624*385.73  # D435 - focal_px * baseline_mm (calibrated from camera)  # D435 - focal_px * baseline_mm (calibrated from camera)

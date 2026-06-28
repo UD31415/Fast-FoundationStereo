@@ -110,16 +110,16 @@ PICKLE_EXCEL = (
     r"\data path.xlsx"
 )
 
-PICKLE_EXCEL = (
-    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
-    r"\yg_pickle\\2026-06-25--15-00-20\Pickle_Scene_Capture_Exp1500_LP150_LightsON_336222073841"
-    r"\data path.xlsx"
-)
+# PICKLE_EXCEL = (
+#     r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
+#     r"\yg_pickle\\2026-06-25--15-00-20\Pickle_Scene_Capture_Exp1500_LP150_LightsON_336222073841"
+#     r"\data path.xlsx"
+# )
 
 ORIGINAL_PATH   = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_epoch_020.pth'
 ISAACTUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_epoch_037.pth'
-DEFAULT_OUT     = f'{code_dir}/../reports/benchmark_pickle_shazam_lights_on'
+DEFAULT_OUT     = f'{code_dir}/../reports/benchmark_pickle_shazam'
 
 # Projection method used to render CAD-based ground-truth depth.
 PROJECTION_METHOD = "splat"
