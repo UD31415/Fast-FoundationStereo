@@ -132,16 +132,16 @@ LABEL_RAW           = "raw data (json file)"
 LABEL_ICP           = "ICP"
 TRAIN_OBJECT_LIST = ['cube_100x100x100','SCencloser_v2', 'profile_8_40x40_light','MEC501482_v2',
                      'RVH_BASE_v4','RVH_BASE_LID_v2']
-TRAIN_OBJECT_LIST = ['cube_100x100x100','SCencloser_v2', 'profile_8_40x40_light','MEC501482_v2',
-                     'RVH_BASE_v4']
+TRAIN_OBJECT_LIST = ['cube_100x100x100','SCencloser_v2', 'profile_8_40x40_light',
+                     'RVH_BASE_v4','RVH_BASE_LID_v2']
 
 # Image type strings used inside the per-session JSON.
-IMG_TYPE_VERTICES = "Vertices"
-IMG_TYPE_DEPTH = "Depth"
-IMG_TYPE_IR_LEFT = "IR"
-IMG_TYPE_IR_RIGHT = "RightIR"
-IMG_TYPE_RGB = "RGB8"
-MAX_Z_DISTANCE_MM = 1200  # max z to show
+IMG_TYPE_VERTICES   = "Vertices"
+IMG_TYPE_DEPTH      = "Depth"
+IMG_TYPE_IR_LEFT    = "IR"
+IMG_TYPE_IR_RIGHT   = "RightIR"
+IMG_TYPE_RGB        = "RGB8"
+MAX_Z_DISTANCE_MM   = 1200  # max z to show
 
 
 # ---------------------------------------------------------------------------

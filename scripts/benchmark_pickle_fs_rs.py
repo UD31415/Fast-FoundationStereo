@@ -80,10 +80,10 @@ import Utils as U
 from scripts.data_manager_pickle import DataSource
 from metrics import (
     BenchmarkResults,
-    FrameMetrics,
+    FrameMetrics,DIST_BINS,
     compute_metrics,
     compute_edge_mae,
-    aggregate,
+    aggregate, 
 )
 from report import ReportGenerator
 
@@ -96,6 +96,11 @@ PICKLE_EXCEL  = (
     r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
     r"\yg_pickle\2026-06-18--10-01-03\Pickle_Scene_Capture_336222073841"
     r"\data path.xlsx"
+)
+# new data 2026-06-26
+PICKLE_EXCEL = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\Public\Stavush\Pickle\Data\data for model training 25_6_26"
+    r"\data_25_06.xlsx"
 )
 ORIGINAL_PATH  = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_epoch_020.pth'
@@ -529,6 +534,7 @@ def main():
         gt_mm = data['depth_cad_projected'].astype(np.float32)   # Pickle CAD-rendered GT (mm)
         rs_mm = data['depth_img'].astype(np.float32)             # RealSense hardware depth (mm)
         bf    = data['bf']
+        edge_mask = data['edge_mask'].astype(bool)   # CAD-projected edges (bool)
 
         if gt_mm.shape != rs_mm.shape:
             logging.warning(
@@ -553,7 +559,7 @@ def main():
         n_close = int(gt_close_mask.sum())
 
         # Edge mask derived from the CAD-projected depth (uint8 0/255).
-        edge_mask = source.create_edge_mask(data, debug=False).astype(bool)
+        #data = source.create_edge_mask(data, debug=False)#.astype(bool)
 
         for mname in active_methods:
             pred = frame_depths[mname]
