@@ -79,11 +79,22 @@ UNC_TO_POSIX_MAP: dict[str, str] = {
     r"\\svm.realsenseai.com\RealSense_Validation": "/mnt/validation",
 }
 
+# Workspace-relative mirror of the yg_pickle dataset. Paths whose remote
+# location contains ``/yg_pickle/<session>/...`` are rerouted to
+# ``<repo>/data/pickle/<session>/...`` whenever the local copy exists, so
+# downstream code reads from fast local storage instead of the network share.
+LOCAL_PICKLE_ROOT: Path = (Path(__file__).resolve().parent.parent
+                            / "data" / "pickle")
+# Marker used to locate the session-relative portion of a remote path.
+_PICKLE_MIRROR_MARKER = "/yg_pickle/"
+
 
 def translate_path(p: str | os.PathLike[str] | None) -> str:
     """Translate a Windows UNC path to its local POSIX equivalent.
 
     Non-string / empty / already-POSIX paths are returned unchanged (as ``str``).
+    After UNC translation, :func:`local_path_resolve` is applied so any path
+    that has been mirrored under ``data/pickle/`` is served from local disk.
     """
     if p is None:
         return ""
@@ -96,6 +107,40 @@ def translate_path(p: str | os.PathLike[str] | None) -> str:
                 s = posix_root + s[len(unc_root):]
                 break
         s = s.replace("\\", "/")
+    return local_path_resolve(s)
+
+
+def local_path_resolve(p: str | os.PathLike[str] | None) -> str:
+    """Reroute a ``yg_pickle`` path to the local ``data/pickle`` mirror.
+
+    Given a path that points somewhere under ``.../yg_pickle/<session>/...``
+    (either the UNC share or its ``/mnt/validation`` translation), this
+    function returns the equivalent path under :data:`LOCAL_PICKLE_ROOT`
+    when the local file exists. Otherwise the input is returned unchanged.
+
+    The replacement is intentionally cheap: a substring search for the
+    ``/yg_pickle/`` marker followed by an ``os.path.exists`` check.
+    """
+    if p is None:
+        return ""
+    s = str(p)
+    if not s:
+        return s
+
+    # Normalise separators so the marker search works for both UNC inputs
+    # ("...\\yg_pickle\\...") and already-translated POSIX strings.
+    normalised = s.replace("\\", "/")
+    marker_idx = normalised.lower().find(_PICKLE_MIRROR_MARKER)
+    if marker_idx < 0:
+        return s
+
+    rel = normalised[marker_idx + len(_PICKLE_MIRROR_MARKER):]
+    if not rel:
+        return s
+
+    candidate = LOCAL_PICKLE_ROOT / rel
+    if candidate.exists():
+        return str(candidate)
     return s
 
 
