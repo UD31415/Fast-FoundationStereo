@@ -428,10 +428,10 @@ class DataSource:
         # log.info(
         #     f"[{ep_name}] K =\n{np.array2string(K, precision=4, suppress_small=True)}"
         # )
-        log.info(
-            f"[{ep_name}] focal length @ pitch={sensor_pitch_um:.3f}um: "
-            f"fx={focal_mm_x:.4f} mm, fy={focal_mm_y:.4f} mm"
-        )
+        # log.info(
+        #     f"[{ep_name}] focal length @ pitch={sensor_pitch_um:.3f}um: "
+        #     f"fx={focal_mm_x:.4f} mm, fy={focal_mm_y:.4f} mm"
+        # )
         log.info(
             f"[{ep_name}] baseline={baseline_mm:.3f} mm  "
             f"disparity range [{d_min:.2f}, {d_max:.2f}] px -> "
@@ -479,6 +479,7 @@ class DataSource:
             for view in view_names:
                 view_dir = ep_dir / view
                 if not view_dir.is_dir():
+                    log.warning(f"Skipping {view_dir}: not a directory")
                     continue
 
                 ir_left_dir   = view_dir / "ir_left"
@@ -487,7 +488,7 @@ class DataSource:
                 depth_rs_dir  = view_dir / "depth_tyzx"
                 rgb_left_dir  = view_dir / "rgb_left"
                 rgb_right_dir = view_dir / "rgb_right"
-                seg_left_dir = view_dir / "seg_semantic_left"
+                seg_left_dir  = view_dir / "seg_instance_left"
 
                 if not (ir_left_dir.is_dir() and ir_right_dir.is_dir() and depth_rs_dir.is_dir() and depth_gt_dir.is_dir()):
                     log.warning(
@@ -502,13 +503,26 @@ class DataSource:
                 )
 
                 for fi in frame_indices:
-                    name = f"frame_{fi:04d}.png"
-                    ir_l = ir_left_dir / name
-                    ir_r = ir_right_dir / name
-                    depth_rs  = depth_rs_dir / name
-                    depth_gt   = depth_gt_dir / name
-                    seg_left = seg_left_dir / name
-                    if not (ir_l.exists() and ir_r.exists() and depth_rs.exists() and depth_gt.exists() and seg_left.exists()):
+                    name        = f"frame_{fi:04d}.png"
+                    ir_l        = ir_left_dir / name
+                    if not (ir_l.exists()): 
+                        log.warning(f"Skipping sample: missing IR left image for frame {fi} in {view_dir}")
+                        continue
+                    ir_r        = ir_right_dir / name
+                    if not (ir_r.exists()): 
+                        log.warning(f"Skipping sample: missing IR right image for frame {fi} in {view_dir}")
+                        continue                    
+                    depth_rs    = depth_rs_dir / name
+                    if not (depth_rs.exists()): 
+                        log.warning(f"Skipping sample: missing depth RS image for frame {fi} in {view_dir}")
+                        continue                    
+                    depth_gt    = depth_gt_dir / name
+                    if not (depth_gt.exists()): 
+                        log.warning(f"Skipping sample: missing depth GT image for frame {fi} in {view_dir}")
+                        continue                    
+                    seg_left    = seg_left_dir / name
+                    if not (seg_left.exists()):
+                        log.warning(f"Skipping sample: missing segmentation left image for frame {fi} in {view_dir}")
                         continue
 
                     self.items.append({
