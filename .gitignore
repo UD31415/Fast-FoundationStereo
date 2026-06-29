@@ -23,4 +23,6 @@ reports/*
 *.bak
 data/distance/*
 data/mos/*
+data/pickle/*
 *.out
+data/pickle
