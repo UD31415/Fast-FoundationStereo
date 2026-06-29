@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import json
 import logging as log
 import os
@@ -932,7 +933,17 @@ class DataSource:
         return sampled_pcd
 
     def load_cad_pcd(self, cad_path: str) -> Optional[o3d.geometry.PointCloud]:
-        """Load and cache the sampled CAD point cloud (in metres)."""
+        """Load and cache the sampled CAD point cloud (in metres).
+
+        Caches in two tiers:
+
+        1. In-memory ``self._cad_cache`` keyed by ``cad_path`` (per-process).
+        2. On-disk cache under ``$FAST_FS_PICKLE_CACHE`` (default:
+           ``~/.cache/fast_fs_pickle/cad_pcd``). The slow step here is
+           ``sample_points_poisson_disk(150_000)`` (~10 s per unique CAD).
+           The on-disk cache lets a fresh process or a forked DataLoader
+           worker pick up the sampled PCD as a plain ``.ply`` read.
+        """
         if not cad_path:
             return None
         if cad_path in self._cad_cache:
@@ -942,6 +953,23 @@ class DataSource:
             log.warning(f"CAD path missing: {cad_path}")
             return None
 
+        # ── on-disk cache ─────────────────────────────────────────────
+        disk_cache_path = self._cad_pcd_disk_cache_path(cad_path)
+        if disk_cache_path is not None and disk_cache_path.exists():
+            try:
+                cad_pcd = o3d.io.read_point_cloud(str(disk_cache_path))
+                if cad_pcd is not None and not cad_pcd.is_empty():
+                    log.debug(
+                        f"CAD PCD cache hit ({disk_cache_path.name}) for {cad_path}"
+                    )
+                    self._cad_cache[cad_path] = cad_pcd
+                    return cad_pcd
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    f"Failed to read CAD PCD disk cache {disk_cache_path}: {exc}"
+                )
+
+        # ── slow path: load mesh + poisson-disk sample ───────────────
         mesh = o3d.io.read_triangle_mesh(cad_path)
         if mesh.is_empty():
             log.warning(f"Failed to load CAD mesh: {cad_path}")
@@ -957,28 +985,46 @@ class DataSource:
             use_triangle_normal=True,
         )
 
-        # # Define your grid reference step size (voxel size)
-        # voxel_size = 0.0001 
-
-        # # Simplify the mesh using vertex clustering based on the grid size
-        # # Contraction option determines how points pool together (e.g., Average)
-        # simplified_mesh = mesh.simplify_vertex_clustering(
-        #     voxel_size=voxel_size,
-        #     contraction=o3d.geometry.SimplificationContraction.Average
-        # )
-
-        #simplified_mesh = mesh.subdivide_loop(number_of_iterations=10)
-
-        # # Extract the remaining grid-aligned points
-        # cad_pcd = o3d.geometry.PointCloud()
-        # cad_pcd.points = simplified_mesh.vertices
-
-        #cad_pcd = self.render_points_from_mesh(mesh)
-
         self._cad_cache[cad_path]      = cad_pcd
         # Also cache the metres-scaled mesh for raycast rendering.
         self._cad_mesh_cache[cad_path] = mesh
+
+        # Persist to disk so future runs / forked workers skip the resample.
+        if disk_cache_path is not None:
+            try:
+                disk_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                o3d.io.write_point_cloud(str(disk_cache_path), cad_pcd)
+                log.info(
+                    f"Wrote CAD PCD disk cache: {disk_cache_path}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    f"Failed to write CAD PCD disk cache {disk_cache_path}: {exc}"
+                )
         return cad_pcd
+
+    # Identifies the on-disk PCD; bump if the sampling parameters change so
+    # stale caches are rebuilt.
+    _CAD_PCD_CACHE_VERSION = "poisson150k_v1"
+
+    @classmethod
+    def _cad_pcd_disk_cache_path(cls, cad_path: str) -> Optional[Path]:
+        """Stable on-disk path for the cached sampled CAD point cloud.
+
+        Returns ``None`` if no usable cache directory is available.
+        """
+        if not cad_path:
+            return None
+        try:
+            base = Path(os.environ.get(
+                "FAST_FS_PICKLE_CACHE",
+                Path.home() / ".cache" / "fast_fs_pickle" / "cad_pcd",
+            ))
+        except Exception:  # noqa: BLE001
+            return None
+        digest = hashlib.sha1(cad_path.encode("utf-8")).hexdigest()[:16]
+        stem   = Path(cad_path).stem or "cad"
+        return base / f"{stem}_{digest}_{cls._CAD_PCD_CACHE_VERSION}.ply"
 
     def load_cad_mesh(self, cad_path: str) -> Optional[o3d.geometry.TriangleMesh]:
         """Load and cache the CAD mesh, scaled to metres."""
@@ -1240,11 +1286,13 @@ class DataSource:
             cad_pcd_aligned.transform(t_camera_cad)
 
         # ICP-refined alignment, when available.
-        t_camera_cad_icp    = self.load_icp_t_camera_cad(meta["capture_idx"])
-        cad_pcd_aligned_icp: Optional[o3d.geometry.PointCloud] = None
-        if cad_pcd is not None and t_camera_cad_icp is not None:
-            cad_pcd_aligned_icp = copy.deepcopy(cad_pcd)
-            cad_pcd_aligned_icp.transform(t_camera_cad_icp)
+        # t_camera_cad_icp    = self.load_icp_t_camera_cad(meta["capture_idx"])
+        # cad_pcd_aligned_icp: Optional[o3d.geometry.PointCloud] = None
+        # if cad_pcd is not None and t_camera_cad_icp is not None:
+        #     cad_pcd_aligned_icp = copy.deepcopy(cad_pcd)
+        #     cad_pcd_aligned_icp.transform(t_camera_cad_icp)
+        t_camera_cad_icp     = None
+        cad_pcd_aligned_icp  = None
 
         intrinsics           = session["intrinsics"]
         item: dict[str, Any] = {

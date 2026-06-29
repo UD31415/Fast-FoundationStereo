@@ -75,6 +75,13 @@ ITERS       = 8          # GRU iterations (same as inference)
 GAMMA       = 0.9        # sequence loss weight decay
 TRAIN_RATIO = 0.75
 SPLIT_SEED  = 0
+# NOTE: num_workers must stay at 0. The dataset caches non-picklable Open3D
+# objects (PointCloud / TriangleMesh) so workers can’t use "spawn", and main()
+# initialises CUDA before the DataLoader is built so fork-based workers inherit
+# CUDA file descriptors and hang. Multi-worker support would require building
+# the DataLoader before any CUDA init and refactoring the cache layout.
+NUM_WORKERS = 0
+PREFETCH    = 2          # only used when NUM_WORKERS > 0
 
 # -- Helpers -------------------------------
 
@@ -301,6 +308,7 @@ def main():
 
     dataset = PickleDataset(PICKLE_DIR, train_mode=True)
     n_total = len(dataset)
+    #n_total = 100
 
     if n_total < 2:
         raise RuntimeError(f"Need at least 2 samples for a 75/25 train/test split, got {n_total}.")
@@ -312,8 +320,28 @@ def main():
     split_generator = torch.Generator().manual_seed(SPLIT_SEED)
     train_set, test_set = random_split(dataset, [n_train, n_test], generator=split_generator)
 
-    train_loader = DataLoader(train_set, batch_size=1, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=0)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=1,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        persistent_workers=False,
+        prefetch_factor=PREFETCH if NUM_WORKERS > 0 else None,
+        pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_set,
+        batch_size=1,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        persistent_workers=False,
+        prefetch_factor=PREFETCH if NUM_WORKERS > 0 else None,
+        pin_memory=True,
+    )
+    logging.info(
+        f"DataLoaders: num_workers={NUM_WORKERS}, prefetch_factor={PREFETCH}, "
+        f"pin_memory=True, persistent_workers=False"
+    )
 
     logging.info(
         f"Random split with seed={SPLIT_SEED}: total={n_total}, train={len(train_set)} ({100.0*len(train_set)/n_total:.1f}%), "
