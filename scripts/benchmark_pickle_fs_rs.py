@@ -104,8 +104,9 @@ PICKLE_EXCEL = (
 )
 ORIGINAL_PATH  = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 #FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_epoch_020.pth'
-FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625_epoch_001.pth'
-DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_pickle_fs_rs'
+#FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625_epoch_001.pth'
+FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625_epoch_004.pth'
+DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_pickle_260625'
 
 # Projection method used to render CAD-based ground-truth depth.
 # One of: "splat" (sparse point projection), "raycast" (mesh rasterization),

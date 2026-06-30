@@ -11,9 +11,8 @@
 # squeue - list jobs
 # squeue -u urid
 # scancel 260
-
-
 # sbatch train.sbatch
+
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate ffs
 #srun python3 scripts/finetune_isaac.py
