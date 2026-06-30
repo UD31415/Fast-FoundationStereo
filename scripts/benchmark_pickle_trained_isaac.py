@@ -82,7 +82,8 @@ from metrics import (
     BenchmarkResults,
     FrameMetrics,
     compute_metrics,
-    aggregate,
+    compute_edge_mae,
+    aggregate, 
 )
 from report import ReportGenerator
 
@@ -102,10 +103,17 @@ PICKLE_EXCEL = (
     r"\yg_pickle\\2026-06-22--14-48-11\Pickle_Scene_Capture_336222073841"
     r"\data path.xlsx"
 )
+# new data 2026-06-26
+PICKLE_EXCEL = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\Public\Stavush\Pickle\Data\data for model training 25_6_26"
+    r"\data_25_06.xlsx"
+)
 
 ORIGINAL_PATH  = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
-FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_epoch_020.pth'
-ISAACTUNED_PATH= f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_epoch_037.pth'
+#FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_epoch_020.pth'
+#FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625_epoch_001.pth'
+ISAACTUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_metal_ycb_epoch_006.pth'
+FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625_epoch_004.pth'
 DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_pickle_trained_isaac'
 
 # Projection method used to render CAD-based ground-truth depth.
@@ -128,14 +136,16 @@ CLOSE_RANGE_THRESHOLD_MM = 20.0
 
 # Distance bins used for the per-bin MAE curve — all in mm
 DIST_BINS_MM: List[Tuple[float, float]] = [
-    (0.0,    100.0),
-    (100.0,  200.0),
-    (200.0,  450.0),
-    (450.0,  1000.0),
-    (1000.0,  1500.0),
+    (0.0,    200.0),
+    (200.0,  300.0),
+    (300.0,  400.0),
+    (400.0,  500.0),
+    (500.0,  600.0),
+    (600.0,  700.0),
+    (700.0,  800.0),    
 ]
-BIN_LABELS_MM  = ["0–100 mm", "100–200 mm", "200–450 mm", "450–1000 mm", "1000–1500 mm"]
-BIN_CENTERS_MM = [50.0, 150.0, 325.0, 725.0, 1250.0]
+BIN_LABELS_MM  = ["0–200 mm", "200–300 mm", "300–400 mm", "400–500 mm", "500–600 mm", "600–700 mm", "700–800 mm"]
+BIN_CENTERS_MM = [100.0, 250.0, 350.0, 450.0, 550.0, 650.0, 750.0]
 
 METHODS: Dict[str, Dict[str, str]] = {
     "original":  {"label": "FFS Original",                  "color": "#2980b9"},
@@ -150,15 +160,14 @@ RS_NAME = "depth_rs"   # pre-recorded RealSense active-stereo depth from the dat
 
 # ── mm-based metric helpers ───────────────────────────────────────────────────
 
-def compute_bin_mae_mm(pred_mm: np.ndarray, gt_mm: np.ndarray) -> List[float]:
+def compute_bin_mae_mm(pred_mm: np.ndarray, gt_mm: np.ndarray, edge_mask: np.ndarray) -> List[float]:
     """MAE (mm) per distance bin; returns NaN for bins with no valid GT pixels."""
     result = []
     for lo, hi in DIST_BINS_MM:
-        mask = (gt_mm >= lo) & (gt_mm < hi) & (gt_mm > 0) & (pred_mm > 0)
+        mask = (gt_mm >= lo) & (gt_mm < hi) & (gt_mm > 0) & (pred_mm > 0) & edge_mask
         if mask.sum() == 0:
             result.append(float("nan"))
         else:
-            mask = mask & (np.abs(pred_mm - gt_mm) < 20.0)  # ignore extreme outliers
             result.append(float(np.abs(pred_mm[mask] - gt_mm[mask]).mean()))
     return result
 
@@ -215,9 +224,16 @@ class ReportGeneratorMM(ReportGenerator):
     _bin_labels  = BIN_LABELS_MM
     _bin_centers = BIN_CENTERS_MM
 
-    def __init__(self, results, stats, output_dir) -> None:
+    def __init__(self, results, stats, output_dir,
+                 edge_mae_per_method: Dict[str, float] | None = None,
+                 edge_dist_bin_mae: Dict[str, List[List[float]]] | None = None) -> None:
         super().__init__(results, stats, output_dir)
         self._selected_viz_indices: List[int] = []
+        # Per-method mean edge MAE (mm), computed by the benchmark loop.
+        self._edge_mae_per_method: Dict[str, float] = edge_mae_per_method or {}
+        # Per-method per-frame per-bin edge MAE (mm). Same structure as
+        # ``results.dist_bin_mae`` but restricted to CAD-edge pixels.
+        self._edge_dist_bin_mae: Dict[str, List[List[float]]] = edge_dist_bin_mae or {}
 
     def _get_selected_viz_indices(self, n_pick: int = 4) -> List[int]:
         """Return cached random frame indices used consistently across report sections."""
@@ -325,27 +341,45 @@ class ReportGeneratorMM(ReportGenerator):
     def _fig_distance_error_curve(self) -> str:
         if not self._non_gt:
             return self._empty_fig("distance_error_curve.png", "No comparison methods")
-        fig, ax = plt.subplots(figsize=(8, 5))
-        for name in self._non_gt:
-            bin_data = self._r.dist_bin_mae.get(name, [])
+
+        def _mean_per_bin(bin_data: List[List[float]]) -> np.ndarray | None:
             if not bin_data:
-                continue
-            arr = np.array(bin_data)
-            mean_per_bin = np.array([
+                return None
+            arr = np.array(bin_data, dtype=float)
+            if arr.ndim != 2:
+                return None
+            return np.array([
                 np.nanmean(arr[:, i]) if np.any(~np.isnan(arr[:, i])) else 0.0
                 for i in range(arr.shape[1])
             ])
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        any_edge = False
+        for name in self._non_gt:
             color = self._r.method_colors.get(name, "#888")
             label = self._r.method_labels.get(name, name)
-            ax.plot(self._bin_centers, mean_per_bin, marker="o", color=color,
-                    label=label, linewidth=2, markersize=7)
+
+            depth_mean = _mean_per_bin(self._r.dist_bin_mae.get(name, []))
+            if depth_mean is not None:
+                ax.plot(self._bin_centers, depth_mean, marker="o", color=color,
+                        label=f"{label} \u2014 depth", linewidth=2, markersize=7)
+
+            edge_mean = _mean_per_bin(self._edge_dist_bin_mae.get(name, []))
+            if edge_mean is not None:
+                ax.plot(self._bin_centers, edge_mean, marker="s", color=color,
+                        label=f"{label} \u2014 edge", linewidth=2,
+                        markersize=7, linestyle="--")
+                any_edge = True
+
         ax.set_xticks(self._bin_centers)
         ax.set_xticklabels(self._bin_labels, fontsize=9)
         ax.set_xlabel("Distance range", fontsize=10)
         ax.set_ylabel("Mean Absolute Error (mm)", fontsize=10)
-        ax.set_title("Depth Error vs Distance", fontsize=12)
-        ax.set_ylim(0, 10) # mm
-        ax.legend(fontsize=9)
+        title = ("Depth and Edge Error vs Distance" if any_edge
+                 else "Depth Error vs Distance")
+        ax.set_title(title, fontsize=12)
+        ax.set_ylim(0, 30) # mm
+        ax.legend(fontsize=8, ncol=2 if any_edge else 1)
         ax.grid(alpha=0.3)
         fig.tight_layout()
         return self._save(fig, "distance_error_curve.png")
@@ -392,16 +426,21 @@ class ReportGeneratorMM(ReportGenerator):
     def _fig_summary_table(self) -> str:
         if not self._stats:
             return self._empty_fig("summary_table.png", "No stats")
-        cols = ["Method", "MRE* (%)", "MRE (%)", "MAE (mm)", "δ1 (%)",
-                "Coverage (%)", "FPS", "GPU %", "GT?"]
+        cols = ["Method", "MRE* (%)", "MRE (%)", "MAE (mm)", "Edge MAE (mm)",
+                "δ1 (%)", "Coverage (%)", "FPS", "GPU %", "GT?"]
         gt_rows, other_rows = [], []
         for name, s in self._stats.items():
             is_gt = (name == self._gt)
+            edge_mae = self._edge_mae_per_method.get(name, float("nan"))
+            edge_mae_str = (
+                "—" if is_gt or not np.isfinite(edge_mae) else f"{edge_mae:.1f}"
+            )
             row = [
                 s.label,
                 "—" if is_gt else f"{s.mre_pen_mean * 100:.1f}",
                 "—" if is_gt else f"{s.mre_mean * 100:.1f}",
                 "—" if is_gt else f"{s.mae_mean:.1f}",
+                edge_mae_str,
                 "—" if is_gt else f"{s.delta1_mean:.1f}",
                 f"{s.coverage_mean:.1f}",
                 f"{s.fps_mean:.1f}" if s.fps_mean < 999 else "≈30",
@@ -512,9 +551,13 @@ def main():
     active_methods = [GT_NAME, RS_NAME] + list(models.keys())
 
     # ── dataset ───────────────────────────────────────────────────────────────
-    source = DataSource(train_mode=False)
-    n = source.init_directory(excel_path=args.pickle_excel)
+    source          = DataSource(train_mode=False)
+    n               = source.init_directory(excel_path=args.pickle_excel)
     logging.info(f"Found {n} samples in {args.pickle_excel}")
+    #n               = min(n, 100)   # limit to 1000 frames for benchmarking
+    indxs           = np.random.randint(0, n, size=min(n, 100))   # random indices for visualisation
+    n               = len(indxs)
+    logging.warning(f"Using {len(indxs)} samples for benchmarking")
     if n == 0:
         logging.error("No samples found — check --pickle_excel path")
         return
@@ -525,16 +568,18 @@ def main():
     valid_acc         = {}     # initialised on first frame
     dist_bin_mae      = {m: [] for m in active_methods}
     close_range_valid = {m: [] for m in active_methods}
+    edge_mae_raw      = {m: [] for m in active_methods}   # per-frame edge MAE (mm)
     timing_ms_raw     = {m: [] for m in models}   # only NN models have inference latency
     H = W = None
-
-    for idx in range(n):
-        data  = source.get_item_and_scene_projected(idx)
-        left  = data['ir_left_img']
-        right = data['ir_right_img']
-        gt_mm = data['depth_cad_projected'].astype(np.float32)   # Pickle CAD-rendered GT (mm)
-        rs_mm = data['depth_img'].astype(np.float32)             # RealSense hardware depth (mm)
-        bf    = data['bf']
+    
+    for k,idx in enumerate(indxs): #range(n):
+        data    = source.get_item_and_scene_projected(idx)
+        left    = data['ir_left_img']
+        right   = data['ir_right_img']
+        gt_mm   = data['depth_scene_projected'].astype(np.float32)   # Pickle CAD-rendered GT (mm)
+        rs_mm   = data['depth_img'].astype(np.float32)             # RealSense hardware depth (mm)
+        bf      = data['bf']
+        edge_mask = data['edge_mask'].astype(bool)   # CAD-projected edges (bool)
 
         if gt_mm.shape != rs_mm.shape:
             logging.warning(
@@ -575,7 +620,14 @@ def main():
                 fm = compute_metrics(pred, gt_mm, timing_ms_raw[mname][-1], mname)
 
             all_metrics.append(fm)
-            dist_bin_mae[mname].append(compute_bin_mae_mm(pred, gt_mm))
+            dist_bin_mae[mname].append(compute_bin_mae_mm(pred, gt_mm, ~edge_mask))
+            edge_mae_raw[mname].append(compute_bin_mae_mm(pred, gt_mm, edge_mask))
+
+            # # Edge MAE (mm) — accuracy restricted to CAD-edge pixels.
+            # if mname != GT_NAME:
+            #     edge_vals = compute_edge_mae(pred, gt_mm, edge_mask)
+            #     if edge_vals and np.isfinite(edge_vals[0]):
+            #         edge_mae_raw[mname].append(float(edge_vals[0]))
 
             close_cov = (
                 float((pred[gt_close_mask] > 0).mean()) * 100.0
@@ -583,11 +635,11 @@ def main():
             )
             close_range_valid[mname].append(close_cov)
 
-        if idx < args.n_viz:
+        if k < args.n_viz:
             viz_frames.append({k: v.copy() for k, v in frame_depths.items()})
 
-        if (idx + 1) % 50 == 0 or (idx + 1) == n:
-            logging.info(f"  {idx + 1}/{n} frames processed")
+        if (k + 1) % 50 == 0 or (k + 1) == n:
+            logging.info(f"  {k + 1}/{n} frames processed")
 
     # normalise coverage maps to [0, 1]
     for m in active_methods:
@@ -642,8 +694,29 @@ def main():
     if RS_NAME in stats:
         stats[RS_NAME].fps_mean = 30.0
 
+    # ── aggregate edge MAE per method ─────────────────────────────────────────
+    # ``edge_mae_raw[m]`` is a list of per-frame per-bin lists (shape n_frames
+    # × n_bins). The scalar mean used in the summary table ignores NaNs and
+    # empty methods; the per-bin data is forwarded to the report for plotting
+    # alongside the depth-error-vs-distance curve.
+    edge_mae_mean: Dict[str, float] = {}
+    for m, vals in edge_mae_raw.items():
+        if vals:
+            arr = np.array(vals, dtype=float)
+            edge_mae_mean[m] = (float(np.nanmean(arr))
+                                if np.any(np.isfinite(arr)) else float("nan"))
+        else:
+            edge_mae_mean[m] = float("nan")
+    for mname, val in edge_mae_mean.items():
+        if np.isfinite(val):
+            logging.info(f"Edge MAE [{mname}]: {val:.2f} mm")
+
     # ── generate report ───────────────────────────────────────────────────────
-    reporter = ReportGeneratorMM(results, stats, out_dir)
+    reporter = ReportGeneratorMM(
+        results, stats, out_dir,
+        edge_mae_per_method=edge_mae_mean,
+        edge_dist_bin_mae=edge_mae_raw,
+    )
     reporter.generate()
 
 
