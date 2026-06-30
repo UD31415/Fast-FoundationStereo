@@ -432,11 +432,11 @@ class DataSource:
         #     f"[{ep_name}] focal length @ pitch={sensor_pitch_um:.3f}um: "
         #     f"fx={focal_mm_x:.4f} mm, fy={focal_mm_y:.4f} mm"
         # )
-        log.info(
-            f"[{ep_name}] baseline={baseline_mm:.3f} mm  "
-            f"disparity range [{d_min:.2f}, {d_max:.2f}] px -> "
-            f"depth range [{z_min_m:.4f}, {z_max_m:.4f}] m"
-        )
+        # log.info(
+        #     f"[{ep_name}] baseline={baseline_mm:.3f} mm  "
+        #     f"disparity range [{d_min:.2f}, {d_max:.2f}] px -> "
+        #     f"depth range [{z_min_m:.4f}, {z_max_m:.4f}] m"
+        # )
 
         return params
 
