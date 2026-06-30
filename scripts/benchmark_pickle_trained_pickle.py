@@ -541,7 +541,8 @@ def main():
     logging.info(f"Found {n} samples in {args.pickle_excel}")
     #n               = min(n, 100)   # limit to 1000 frames for benchmarking
     indxs           = np.random.randint(0, n, size=min(n, 100))   # random indices for visualisation
-    logging.warning(f"Using {200} samples for benchmarking")
+    n               = len()
+    logging.warning(f"Using {len(indxs)} samples for benchmarking")
     if n == 0:
         logging.error("No samples found — check --pickle_excel path")
         return
@@ -556,7 +557,7 @@ def main():
     timing_ms_raw     = {m: [] for m in models}   # only NN models have inference latency
     H = W = None
     
-    for idx in indxs: #range(n):
+    for k,idx in enumerate(indxs): #range(n):
         data    = source.get_item_and_scene_projected(idx)
         left    = data['ir_left_img']
         right   = data['ir_right_img']
@@ -622,11 +623,11 @@ def main():
             )
             close_range_valid[mname].append(close_cov)
 
-        if idx < args.n_viz:
+        if k < args.n_viz:
             viz_frames.append({k: v.copy() for k, v in frame_depths.items()})
 
-        if (idx + 1) % 50 == 0 or (idx + 1) == n:
-            logging.info(f"  {idx + 1}/{n} frames processed")
+        if (k + 1) % 50 == 0 or (k + 1) == n:
+            logging.info(f"  {k + 1}/{n} frames processed")
 
     # normalise coverage maps to [0, 1]
     for m in active_methods:
