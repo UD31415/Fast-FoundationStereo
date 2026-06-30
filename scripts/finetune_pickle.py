@@ -62,8 +62,9 @@ PICKLE_DIR = (
 
 # MODEL_PATH = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 # OUT_PATH   = f'{code_dir}/../weights/20-30-48/model_finetuned_inbolt-20260415.pth'
-MODEL_PATH = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
-OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625.pth'
+#MODEL_PATH = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
+MODEL_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625_epoch_006.pth'
+OUT_PATH   = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625_fast.pth'
 
 
 # BF         = 49.8624*385.73  # D435 - focal_px * baseline_mm (calibrated from camera)  # D435 - focal_px * baseline_mm (calibrated from camera)
@@ -73,7 +74,7 @@ EPOCHS      = 50
 LR          = 2e-5
 ITERS       = 8          # GRU iterations (same as inference)
 GAMMA       = 0.9        # sequence loss weight decay
-TRAIN_RATIO = 0.75
+TRAIN_RATIO = 0.1 #0.75
 SPLIT_SEED  = 0
 # NOTE: num_workers must stay at 0. The dataset caches non-picklable Open3D
 # objects (PointCloud / TriangleMesh) so workers can’t use "spawn", and main()
