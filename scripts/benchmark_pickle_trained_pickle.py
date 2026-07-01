@@ -105,7 +105,7 @@ PICKLE_EXCEL = (
 ORIGINAL_PATH  = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
 #FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_epoch_020.pth'
 #FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625_epoch_001.pth'
-FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625_epoch_004.pth'
+FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625_epoch_010.pth'
 DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_pickle_260625'
 
 # Projection method used to render CAD-based ground-truth depth.
@@ -541,7 +541,7 @@ def main():
     logging.info(f"Found {n} samples in {args.pickle_excel}")
     #n               = min(n, 100)   # limit to 1000 frames for benchmarking
     indxs           = np.random.randint(0, n, size=min(n, 100))   # random indices for visualisation
-    n               = len()
+    n               = len(indxs)
     logging.warning(f"Using {len(indxs)} samples for benchmarking")
     if n == 0:
         logging.error("No samples found — check --pickle_excel path")
