@@ -135,9 +135,11 @@ DIST_BINS_MM: List[Tuple[float, float]] = [
     (500.0,  600.0),
     (600.0,  700.0),
     (700.0,  800.0),    
+    (800.0,  900.0),    
+    (900.0, 1000.0),  
 ]
-BIN_LABELS_MM  = ["0–200 mm", "200–300 mm", "300–400 mm", "400–500 mm", "500–600 mm", "600–700 mm", "700–800 mm"]
-BIN_CENTERS_MM = [100.0, 250.0, 350.0, 450.0, 550.0, 650.0, 750.0]
+BIN_LABELS_MM  = ["0–200 mm", "200–300 mm", "300–400 mm", "400–500 mm", "500–600 mm", "600–700 mm", "700–800 mm", "800–900 mm", "900–1000 mm"]
+BIN_CENTERS_MM = [100.0, 250.0, 350.0, 450.0, 550.0, 650.0, 750.0, 850.0, 950.0]
 
 METHODS: Dict[str, Dict[str, str]] = {
     "original":  {"label": "FFS Original",                  "color": "#2980b9"},
@@ -541,6 +543,7 @@ def main():
     logging.info(f"Found {n} samples in {args.pickle_excel}")
     #n               = min(n, 100)   # limit to 1000 frames for benchmarking
     indxs           = np.random.randint(0, n, size=min(n, 100))   # random indices for visualisation
+    n               = len(indxs)
     n               = len(indxs)
     logging.warning(f"Using {len(indxs)} samples for benchmarking")
     if n == 0:
