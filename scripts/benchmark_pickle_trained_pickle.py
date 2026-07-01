@@ -544,7 +544,6 @@ def main():
     #n               = min(n, 100)   # limit to 1000 frames for benchmarking
     indxs           = np.random.randint(0, n, size=min(n, 100))   # random indices for visualisation
     n               = len(indxs)
-    n               = len(indxs)
     logging.warning(f"Using {len(indxs)} samples for benchmarking")
     if n == 0:
         logging.error("No samples found — check --pickle_excel path")
