@@ -26,14 +26,14 @@ from scipy.ndimage import correlate
 from scipy.interpolate import RegularGridInterpolator
 from scipy import ndimage
 import sys 
-sys.path.append(r'..\Utils\src')
+sys.path.append(r'C:\Work\Projects\Utils\src')
 from opencv_realsense_camera import RealSense, draw_str
 from common import RectSelector
 from logger import log
 # from extract_images_from_ros1bag import read_bin_file
 # from image_source import DataSource as DataSourceBin
 # from measure_camera_noise import NoiseEstimator
-
+sys.path.append(r'C:\Work\Projects\DepthRS\src')
 from depth_data_source import DataSource
 
 # ----------------------
@@ -3407,7 +3407,7 @@ class TestShazamDepthEstimator():
         ""
         
         d               = DataSource()
-        ret             = d.init_image(55) # 4-ok,7-ok,11-nok,26-ok, 54-chair,55-office far,56-office-chess-ok, ,62,66-nok, 71-home, 601-ok, 621,622-mbox
+        ret             = d.init_image(11) # 4-ok,7-ok,11-nok,26-ok, 54-chair,55-office far,56-office-chess-ok, ,62,66-nok, 71-home, 601-ok, 621,622-mbox
         d.show_images_left_right()
         img_left, img_right = d.imgL, d.imgR
 
