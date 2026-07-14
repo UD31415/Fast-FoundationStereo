@@ -103,8 +103,10 @@ PICKLE_EXCEL = (
     r"\data_25_06.xlsx"
 )
 ORIGINAL_PATH  = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
-FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_epoch_020.pth'
-DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_pickle_fs_rs'
+#FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_epoch_020.pth'
+#FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625_epoch_001.pth'
+FINETUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625_epoch_010.pth'
+DEFAULT_OUT    = f'{code_dir}/../reports/benchmark_pickle_260625'
 
 # Projection method used to render CAD-based ground-truth depth.
 # One of: "splat" (sparse point projection), "raycast" (mesh rasterization),
@@ -126,16 +128,18 @@ CLOSE_RANGE_THRESHOLD_MM = 20.0
 
 # Distance bins used for the per-bin MAE curve — all in mm
 DIST_BINS_MM: List[Tuple[float, float]] = [
-    (0.0,    100.0),
-    (100.0,  200.0),
+    (0.0,    200.0),
     (200.0,  300.0),
     (300.0,  400.0),
     (400.0,  500.0),
     (500.0,  600.0),
     (600.0,  700.0),
+    (700.0,  800.0),    
+    (800.0,  900.0),    
+    (900.0, 1000.0),  
 ]
-BIN_LABELS_MM  = ["0–100 mm", "100–200 mm", "200–300 mm", "300–400 mm", "400–500 mm", "500–600 mm", "600–700 mm"]
-BIN_CENTERS_MM = [50.0, 150.0, 250.0, 350.0, 450.0, 550.0, 650.0]
+BIN_LABELS_MM  = ["0–200 mm", "200–300 mm", "300–400 mm", "400–500 mm", "500–600 mm", "600–700 mm", "700–800 mm", "800–900 mm", "900–1000 mm"]
+BIN_CENTERS_MM = [100.0, 250.0, 350.0, 450.0, 550.0, 650.0, 750.0, 850.0, 950.0]
 
 METHODS: Dict[str, Dict[str, str]] = {
     "original":  {"label": "FFS Original",                  "color": "#2980b9"},
@@ -537,8 +541,10 @@ def main():
     source          = DataSource(train_mode=False)
     n               = source.init_directory(excel_path=args.pickle_excel)
     logging.info(f"Found {n} samples in {args.pickle_excel}")
-    n               = min(n, 100)   # limit to 1000 frames for benchmarking
-    logging.warning(f"Using {n} samples for benchmarking")
+    #n               = min(n, 100)   # limit to 1000 frames for benchmarking
+    indxs           = np.random.randint(0, n, size=min(n, 100))   # random indices for visualisation
+    n               = len(indxs)
+    logging.warning(f"Using {len(indxs)} samples for benchmarking")
     if n == 0:
         logging.error("No samples found — check --pickle_excel path")
         return
@@ -552,12 +558,12 @@ def main():
     edge_mae_raw      = {m: [] for m in active_methods}   # per-frame edge MAE (mm)
     timing_ms_raw     = {m: [] for m in models}   # only NN models have inference latency
     H = W = None
-
-    for idx in range(n):
+    
+    for k,idx in enumerate(indxs): #range(n):
         data    = source.get_item_and_scene_projected(idx)
         left    = data['ir_left_img']
         right   = data['ir_right_img']
-        gt_mm   = data['depth_cad_projected'].astype(np.float32)   # Pickle CAD-rendered GT (mm)
+        gt_mm   = data['depth_scene_projected'].astype(np.float32)   # Pickle CAD-rendered GT (mm)
         rs_mm   = data['depth_img'].astype(np.float32)             # RealSense hardware depth (mm)
         bf      = data['bf']
         edge_mask = data['edge_mask'].astype(bool)   # CAD-projected edges (bool)
@@ -619,11 +625,11 @@ def main():
             )
             close_range_valid[mname].append(close_cov)
 
-        if idx < args.n_viz:
+        if k < args.n_viz:
             viz_frames.append({k: v.copy() for k, v in frame_depths.items()})
 
-        if (idx + 1) % 50 == 0 or (idx + 1) == n:
-            logging.info(f"  {idx + 1}/{n} frames processed")
+        if (k + 1) % 50 == 0 or (k + 1) == n:
+            logging.info(f"  {k + 1}/{n} frames processed")
 
     # normalise coverage maps to [0, 1]
     for m in active_methods:

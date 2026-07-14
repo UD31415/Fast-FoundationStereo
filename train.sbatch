@@ -1,15 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=ffs-01
+#sbatch --job-name=ffs-01
 #SBATCH --chdir=/home/urid/dev/Fast-FoundationStereo
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
-#SBATCH --nodelist=vtg-ptk-dsk03
+#SBATCH --nodelist=vtg-ptk-dsk03,vtg-ptk-dsk04
 #SBATCH --signal=B:TERM@30             # SIGTERM to the batch shell 30s before kill
+## squeue - list jobs
+## squeue -u urid
+## scancel 260
+## sbatch train.sbatch
 
-# sbatch train.sbatch
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate ffs
 #srun python3 scripts/finetune_isaac.py

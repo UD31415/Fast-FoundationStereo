@@ -493,7 +493,7 @@ class TestDataSource(unittest.TestCase):
 
 def RunTest() -> None:
     tst = TestDataSource()
-    tst.test_init_all_defaults()
+    #tst.test_init_all_defaults()
     # tst.test_get_item_per_source()
     tst.test_show_item()
 
