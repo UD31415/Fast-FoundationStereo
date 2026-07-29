@@ -628,13 +628,89 @@ def colorize_label_mask(labels: np.ndarray, seed: int = 0) -> np.ndarray:
     palette[0] = (0, 0, 0)
     return palette[labels]
 
+def cad_bbox_from_pcd(
+    cad_pcd: o3d.geometry.PointCloud,
+    xy_padding: float = 0.01,
+    z_offset: float = 0.01,
+) -> dict:
+    """Return the AABB of a CAD PCD (CAD frame) as a dict of x/y/z min/max values.
+ 
+    xy_padding is added/subtracted from the X and Y extents.
+    z_offset is added to both Z extents.
+    """
+    pts = np.asarray(cad_pcd.points)
+    bbox = dict(
+        x_min=float(pts[:, 0].min()) - xy_padding,
+        x_max=float(pts[:, 0].max()) + xy_padding,
+        y_min=float(pts[:, 1].min()) - xy_padding,
+        y_max=float(pts[:, 1].max()) + xy_padding,
+        z_min=float(pts[:, 2].min()),
+        z_max=float(pts[:, 2].max()) +0.3,
+    )
+    print(
+        f"CAD AABB (CAD frame, xy_padding={xy_padding*1000:.0f}mm): "
+        f"x=[{bbox['x_min']:.4f}, {bbox['x_max']:.4f}]m, "
+        f"y=[{bbox['y_min']:.4f}, {bbox['y_max']:.4f}]m, "
+        f"z=[{bbox['z_min']:.4f}, {bbox['z_max']:.4f}]m"
+    )
+    return bbox
+def filter_by_cad_bbox(
+    camera_pcd: o3d.geometry.PointCloud,
+    bbox_pcd: dict,
+) -> o3d.geometry.PointCloud:
+    """Filter a camera-frame point cloud to the CAD's axis-aligned bounding box.
+ 
+    Transforms each point into the CAD frame and keeps only those whose XYZ
+    coordinates fall within the given bounds. Points are returned in the
+    original camera frame.
+    """
+
+    pts_cad = camera_pcd
+    pts_cam = np.asarray(camera_pcd.points)
+
+    x_min = float(bbox_pcd['x_min'])
+    x_max = float(bbox_pcd['x_max'])
+    y_min = float(bbox_pcd['y_min'])
+    y_max = float(bbox_pcd['y_max'])
+    z_min = float(bbox_pcd['z_min'])
+    z_max = float(bbox_pcd['z_max'])
+ 
+    mask = (
+        (pts_cam[:, 0] >= x_min) & (pts_cam[:, 0] <= x_max)
+        & (pts_cam[:, 1] >= y_min) & (pts_cam[:, 1] <= y_max)
+        & (pts_cam[:, 2] >= z_min) & (pts_cam[:, 2] <= z_max)
+    )
+
+    filtered_pcd = o3d.geometry.PointCloud()
+    filtered_pcd.points = o3d.utility.Vector3dVector(pts_cam[mask])
+ 
+    if camera_pcd.has_normals():
+        normals = np.asarray(camera_pcd.normals)
+        filtered_pcd.normals = o3d.utility.Vector3dVector(normals[mask])
+ 
+    return filtered_pcd
+
 
 # ---------------------------------------------------------------------------
 # DataSource
 # ---------------------------------------------------------------------------
+# Default root for ``init_multi_directory``. Each direct subfolder named with
+# the timestamp pattern ``YYYY-MM-DD--HH-MM-SS`` is expected to contain a
+# ``Pickle_Scene_Capture*/data path.xlsx`` manifest.
+DEFAULT_MULTI_ROOT = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0"
+    r"\2026_06\yg_pickle"
+)
+
 
 class DataSource:
     """Loader for the ISAC / Pickle Excel-driven capture dataset."""
+
+    _SESSION_FOLDER_RE = re.compile(r"^\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2}$")
+
+    # Identifies the on-disk PCD; bump if the sampling parameters change so
+    # stale caches are rebuilt.
+    _CAD_PCD_CACHE_VERSION = "poisson150k_v1"    
 
     def __init__(self, train_mode = False) -> None:
         self.excel_path: Optional[Path] = None
@@ -722,15 +798,6 @@ class DataSource:
             f"{len(self.sessions)} sessions"
         )
         return len(self.items)
-
-    # Default root for ``init_multi_directory``. Each direct subfolder named with
-    # the timestamp pattern ``YYYY-MM-DD--HH-MM-SS`` is expected to contain a
-    # ``Pickle_Scene_Capture*/data path.xlsx`` manifest.
-    DEFAULT_MULTI_ROOT = (
-        r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0"
-        r"\2026_06\yg_pickle"
-    )
-    _SESSION_FOLDER_RE = re.compile(r"^\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2}$")
 
     def init_multi_directory(
         self,
@@ -1048,10 +1115,6 @@ class DataSource:
                 )
         return cad_pcd
 
-    # Identifies the on-disk PCD; bump if the sampling parameters change so
-    # stale caches are rebuilt.
-    _CAD_PCD_CACHE_VERSION = "poisson150k_v1"
-
     @classmethod
     def _cad_pcd_disk_cache_path(cls, cad_path: str) -> Optional[Path]:
         """Stable on-disk path for the cached sampled CAD point cloud.
@@ -1212,7 +1275,6 @@ class DataSource:
         self._background_mesh_cache = mesh
         return mesh
 
-    #def get_intrinsics_matrix(self, json_path: str) -> tuple[np.ndarray, np.ndarray]:
     def get_intrinsics_matrix(self, item) -> tuple[np.ndarray, np.ndarray]:
         """Return ``(K, dist_coeffs)`` for one session."""
         #info = self.sessions.get(json_path, {})
@@ -1587,98 +1649,6 @@ class DataSource:
             raise ValueError("output_units must be 'mm' or 'm'")
         return depth.astype(np.float32)
 
-    # @staticmethod
-    # def render_scene_depth(
-    #     mesh_cam: o3d.geometry.TriangleMesh,
-    #     cam_matrix: np.ndarray,
-    #     frame_size: tuple[int, int],
-    #     background_offset_m: float = 0.2,
-    #     background_size_m: float = 5.0,
-    #     background_z_m: Optional[float] = None,
-    #     output_units: str = "mm",
-    # ) -> np.ndarray:
-    #     """Render ``mesh_cam`` plus a flat rectangular background to a depth image.
-
-    #     Builds a scene composed of the input mesh (already in the camera
-    #     frame) and a large flat rectangle parallel to the image plane,
-    #     placed behind the object so that every camera ray hits something.
-    #     The combined scene is then rasterized with the same pinhole
-    #     ray-casting pipeline used by :meth:`render_mesh_depth`.
-
-    #     Parameters
-    #     ----------
-    #     mesh_cam : ``TriangleMesh`` whose vertices are in the *camera*
-    #         frame, in metres.
-    #     cam_matrix : 3x3 pinhole intrinsic ``K`` (pixels).
-    #     frame_size : ``(H, W)``.
-    #     background_offset_m : distance (m) placed behind the mesh's
-    #         furthest +Z vertex when ``background_z_m`` is not specified.
-    #     background_size_m : edge length (m) of the square background plane.
-    #     background_z_m : explicit camera-Z (m) for the background plane.
-    #         Overrides ``background_offset_m`` when provided.
-    #     output_units : ``"mm"`` (default) or ``"m"``.
-
-    #     Returns
-    #     -------
-    #     ``(H, W)`` ``float32`` depth image. Pixels are guaranteed to be
-    #     populated as long as the background plane covers the field of view.
-    #     """
-    #     h, w = frame_size
-
-    #     # Determine where to place the background plane.
-    #     if background_z_m is None:
-    #         if mesh_cam is None or mesh_cam.is_empty():
-    #             bg_z = max(1.0, float(background_offset_m))
-    #         else:
-    #             verts = np.asarray(mesh_cam.vertices, dtype=np.float64)
-    #             z_max = float(verts[:, 2].max()) if verts.size else 0.0
-    #             bg_z = z_max + float(background_offset_m)
-    #     else:
-    #         bg_z = float(background_z_m)
-
-    #     if bg_z <= 0.0:
-    #         raise ValueError(
-    #             f"Background plane must lie in front of the camera (z>0), got z={bg_z}"
-    #         )
-
-    #     # Build a flat rectangular background facing the camera.
-    #     half = 0.5 * float(background_size_m)
-    #     bg_vertices = np.array(
-    #         [
-    #             [-half, -half, bg_z],
-    #             [ half, -half, bg_z],
-    #             [ half,  half, bg_z],
-    #             [-half,  half, bg_z],
-    #         ],
-    #         dtype=np.float64,
-    #     )
-    #     # Two triangles, double-sided so orientation does not matter.
-    #     bg_triangles = np.array(
-    #         [
-    #             [0, 1, 2], [0, 2, 3],
-    #             [0, 2, 1], [0, 3, 2],
-    #         ],
-    #         dtype=np.int32,
-    #     )
-    #     bg_mesh = o3d.geometry.TriangleMesh(
-    #         vertices=o3d.utility.Vector3dVector(bg_vertices),
-    #         triangles=o3d.utility.Vector3iVector(bg_triangles),
-    #     )
-
-    #     # Compose the scene: input mesh + background plane.
-    #     if mesh_cam is not None and not mesh_cam.is_empty():
-    #         combined = o3d.geometry.TriangleMesh(mesh_cam) + bg_mesh
-    #     else:
-    #         combined = bg_mesh
-
-    #     return DataSource.render_mesh_depth(
-    #         combined,
-    #         cam_matrix,
-    #         frame_size,
-    #         extrinsic=None,
-    #         output_units=output_units,
-    #     )
-
     def get_item_projected(
         self,
         index: int,
@@ -1817,7 +1787,6 @@ class DataSource:
 
         return item
     
-
     def get_item_and_scene_projected(
         self,
         index: int,
@@ -1875,6 +1844,7 @@ class DataSource:
         item["depth_scene_projected"] = depth_scene
         item["depth_cad_projected"]   = depth_obj
         item["cad_pcd_background"]    = mesh_backg_cam
+        item["cad_pcd_object"]        = mesh_cad_cam # similar to "cad_pcd_aligned" computed before
         item["projection_method"]      = 'raycast'
         # show meshes and depth maps for visual inspection
         #source.draw_point_clouds(item)
@@ -1916,7 +1886,7 @@ class DataSource:
         return item
 
     # ------------------------------------------------------------------
-    # Edge mask
+    # Metric : Edge mask & ICP alignment
     # ------------------------------------------------------------------
 
     def create_edge_mask(
@@ -1998,6 +1968,56 @@ class DataSource:
             plt.show()
 
         return item
+
+    def compute_icp_metric(self, s1, s2):
+        # code from Stav
+
+        S = np.asarray(s1.points) # Camera PC
+        D = np.asarray(s2.points) # CAD 
+        #N = np.asarray(s2.normals) # CAD normals
+    
+        # Convert numpy → Open3D point clouds
+        source = o3d.geometry.PointCloud()
+        source.points = o3d.utility.Vector3dVector(S)
+    
+        target = o3d.geometry.PointCloud()
+        target.points = o3d.utility.Vector3dVector(D)
+    
+        # Initial guess (identity)
+        init = np.eye(4)
+    
+        threshold = 0.01  # tune this based on your scene scale
+    
+        # Run ICP
+        result = o3d.pipelines.registration.registration_icp(
+            source,
+            target,
+            threshold,
+            init,
+            o3d.pipelines.registration.TransformationEstimationPointToPoint()
+        )
+    
+        T_icp = result.transformation
+    
+        print("ICP Transformation:\n", T_icp)
+        log.info("Fitness: %f", result.fitness)
+        log.info("RMSE: %f", result.inlier_rmse)
+    
+        R = T_icp[:3, :3]
+        t = T_icp[:3, 3]
+    
+        R_inv = R.T
+        t_inv = -R.T @ t
+    
+        cad_aligned_points = (R_inv @ D.T).T + t_inv
+    
+        #cad_aligned_normals = (R_inv @ N.T).T
+    
+        cad_aligned_pcd = o3d.geometry.PointCloud()
+        cad_aligned_pcd.points = o3d.utility.Vector3dVector(cad_aligned_points)
+        #cad_aligned_pcd.normals = o3d.utility.Vector3dVector(cad_aligned_normals)
+    
+        return cad_aligned_pcd, R_inv, t_inv
 
     # ------------------------------------------------------------------
     # Display helpers
@@ -2645,6 +2665,35 @@ class TestDataSource(unittest.TestCase):
 
         plt.show()
 
+    def test_get_item_and_compute_icp_metric(self):
+        """Gets and item and computes ICP alignment against the CAD mesh and Depth Mesh.
+        """        
+        source      = DataSource()
+        count       = source.init_directory()
+        self.assertTrue(count > 0)
+
+        item_id     = np.random.randint(0, count)
+        log.info(f"Testing get_item_and_scene_projected for item {item_id}")
+        out         = source.get_item_and_scene_projected(item_id, debug=True)
+        self.assertIn("cad_pcd_aligned", out)
+        self.assertIn("depth_pcd_raw", out)
+
+        pcd_cad      = out["cad_pcd_aligned"]
+        pcd_cam      = out["depth_pcd_raw"]
+
+        # filter only points around cad
+        pcd_bbox    = cad_bbox_from_pcd(pcd_cad)
+        pcd_cam     = filter_by_cad_bbox(pcd_cam, pcd_bbox)
+        pcd_cad_aligned, R, t = source.compute_icp_metric(pcd_cam, pcd_cad)
+
+        clouds = []
+        pcd_cam.paint_uniform_color([1.0, 0.0, 0])  # red
+        clouds.append(pcd_cam)
+        pcd_cad_aligned.paint_uniform_color([0.0, 1.0, 0])  # green
+        clouds.append(pcd_cad_aligned)
+        o3d.visualization.draw(clouds)
+
+        
     def test_project_on_camera(self):
         # NOTE: Open3D's ``OffscreenRenderer`` (Filament backend) is not
         # supported on Windows wheels (it requires EGL headless). On Windows
@@ -2805,8 +2854,9 @@ def RunTest() -> None:
     #tst.test_get_item_projected_raycast() # ok
     #tst.test_get_item_projected_open3d()
     #tst.test_get_item_and_scene() # ok
-    tst.test_get_item_and_scene_projected()
+    #tst.test_get_item_and_scene_projected()
     #tst.test_create_edge_mask()
+    tst.test_get_item_and_compute_icp_metric()
 
     #tst.test_project_on_camera()
     #tst.test_show_icp_alignment()  # no file csv
