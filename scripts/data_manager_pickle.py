@@ -2590,11 +2590,12 @@ class TestDataSource(unittest.TestCase):
         plt.show()
 
     def test_get_item_and_scene_projected(self):
-        source = DataSource()
-        count = source.init_directory()
+        source      = DataSource()
+        count       = source.init_directory()
         self.assertTrue(count > 0)
-        item_id = np.random.randint(0, count)
-        out = source.get_item_and_scene_projected(item_id, debug=True)
+        item_id     = np.random.randint(0, count)
+        log.info(f"Testing get_item_and_scene_projected for item {item_id}")
+        out         = source.get_item_and_scene_projected(item_id, debug=True)
         self.assertIn("depth_cad_projected", out)
         self.assertEqual(out["projection_method"], "raycast")
         self.assertEqual(out["depth_cad_projected"].shape, out["depth_img"].shape)
@@ -2618,7 +2619,6 @@ class TestDataSource(unittest.TestCase):
 
         item           = source.create_edge_mask(
             item,
-            depth_gradient_mm=5.0,
             closing_radius=3,
             debug=True,
         )
@@ -2809,7 +2809,7 @@ def RunTest() -> None:
     #tst.test_create_edge_mask()
 
     #tst.test_project_on_camera()
-    #tst.test_show_icp_alignment()
+    #tst.test_show_icp_alignment()  # no file csv
     #tst.test_get_item_icp_projected()
     #tst.test_get_grid_coordinates()
     # tst.test_match_grid_to_cad()
