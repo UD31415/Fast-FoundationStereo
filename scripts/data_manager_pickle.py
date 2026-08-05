@@ -2019,6 +2019,71 @@ class DataSource:
     
         return cad_aligned_pcd, R_inv, t_inv
 
+    def chamfer_distance(self, s1, s2):
+
+        """
+        Compute the bidirectional Chamfer Distance between two point clouds.
+        Parameters
+        ----------
+
+        s1 : open3d.geometry.PointCloud
+            First point cloud (depth scan).
+        s2 : open3d.geometry.PointCloud
+            Second point cloud (CAD model).
+
+        Returns
+        -------
+        tuple(float, float)
+            Mean nearest-neighbor distance:
+            - s1 → s2
+            - s2 → s1
+        Notes
+        -----
+
+        The function also plots histograms of the nearest-neighbor distance
+        distributions in millimeters for both Chamfer distance components.
+
+        """
+        from scipy.spatial import cKDTree as kd
+        
+        s1 = np.array(s1.points)
+        s2 = np.array(s2.points)
+
+        print(f"s1 points: {len(s1)}, s2 points: {len(s2)}")
+        print("Building KD-trees...")
+
+        s1_tree = kd(s1)
+        s2_tree = kd(s2)
+
+        print("Querying nearest neighbors...")
+        d_s1, _ = s2_tree.query(s1, p=2)
+        d_s2, _ = s1_tree.query(s2, p=2)
+
+        # Plot:
+        dist_d2c_mm = 1000 * d_s1 #convert to mm
+        dist_c2d_mm = 1000 * d_s2 #convert to mm
+
+        # Histograms (both terms)
+        plt.figure(figsize=(9, 5))
+        plt.hist(dist_d2c_mm, bins=60, alpha=0.6, label="Depth → CAD", edgecolor="black")
+        plt.hist(dist_c2d_mm, bins=60, alpha=0.35, label="CAD → Depth", edgecolor="black")
+
+        # Mean vertical lines
+        plt.axvline(np.mean(dist_d2c_mm), color='blue', linestyle='--', linewidth=2,
+                        label=f"Depth → CAD mean = {np.mean(dist_d2c_mm):.2f} mm")
+
+        plt.axvline(np.mean(dist_c2d_mm), color='orange', linestyle='--', linewidth=2,
+                        label=f"CAD → Depth mean = {np.mean(dist_c2d_mm):.2f} mm")
+
+        plt.xlabel("Nearest-neighbor distance (mm)")
+        plt.ylabel("Number of points")
+        plt.title("Chamfer Distance Components")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+
+        return np.mean(d_s1), np.mean(d_s2)
+
     # ------------------------------------------------------------------
     # Display helpers
     # ------------------------------------------------------------------
@@ -2684,7 +2749,7 @@ class TestDataSource(unittest.TestCase):
         # filter only points around cad
         pcd_bbox    = cad_bbox_from_pcd(pcd_cad)
         pcd_cam     = filter_by_cad_bbox(pcd_cam, pcd_bbox)
-        pcd_cad_aligned, R, t = source.compute_icp_metric(pcd_cam, pcd_cad)
+        pcd_cad_aligned, R, t = source.compute_icp_metric(pcd_cam, pcd_cad) #chamfer_distance
 
         clouds = []
         pcd_cam.paint_uniform_color([1.0, 0.0, 0])  # red
@@ -2692,6 +2757,34 @@ class TestDataSource(unittest.TestCase):
         pcd_cad_aligned.paint_uniform_color([0.0, 1.0, 0])  # green
         clouds.append(pcd_cad_aligned)
         o3d.visualization.draw(clouds)
+
+    def test_get_item_and_compute_chamfer_distance(self):
+        """Gets and item and computes ICP alignment against the CAD mesh and Depth Mesh chamfer_distance.
+        """        
+        source      = DataSource()
+        count       = source.init_directory()
+        self.assertTrue(count > 0)
+
+        item_id     = np.random.randint(0, count)
+        log.info(f"Testing get_item_and_scene_projected for item {item_id}")
+        out         = source.get_item_and_scene_projected(item_id, debug=True)
+        self.assertIn("cad_pcd_aligned", out)
+        self.assertIn("depth_pcd_raw", out)
+
+        pcd_cad      = out["cad_pcd_aligned"]
+        pcd_cam      = out["depth_pcd_raw"]
+
+        # filter only points around cad
+        pcd_bbox    = cad_bbox_from_pcd(pcd_cad)
+        pcd_cam     = filter_by_cad_bbox(pcd_cam, pcd_bbox)
+        d1, d2      = source.chamfer_distance(pcd_cam, pcd_cad) #chamfer_distance
+
+        clouds = []
+        pcd_cam.paint_uniform_color([1.0, 0.0, 0])  # red
+        clouds.append(pcd_cam)
+        pcd_cad.paint_uniform_color([0.0, 1.0, 0])  # green
+        clouds.append(pcd_cad)
+        o3d.visualization.draw(clouds)        
 
         
     def test_project_on_camera(self):
@@ -2856,7 +2949,8 @@ def RunTest() -> None:
     #tst.test_get_item_and_scene() # ok
     #tst.test_get_item_and_scene_projected()
     #tst.test_create_edge_mask()
-    tst.test_get_item_and_compute_icp_metric()
+    #tst.test_get_item_and_compute_icp_metric()
+    tst.test_get_item_and_compute_chamfer_distance()
 
     #tst.test_project_on_camera()
     #tst.test_show_icp_alignment()  # no file csv

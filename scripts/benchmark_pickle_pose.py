@@ -213,6 +213,7 @@ def compute_icp_metric(source_pcd: o3d.geometry.PointCloud, target_pcd: o3d.geom
     }
 
 
+
 def build_icp_summary_for_depth(depth_mm: np.ndarray, item: Dict[str, Any], source: DataSource) -> Dict[str, float]:
     """Back-project a depth map to a point cloud and compare it to the CAD cloud with ICP."""
     if item.get("cad_pcd_aligned") is None:
