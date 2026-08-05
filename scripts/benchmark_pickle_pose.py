@@ -51,6 +51,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import open3d as o3d
+from scipy.spatial import cKDTree
 
 from core.utils.utils import InputPadder
 import Utils as U
@@ -212,22 +213,26 @@ def compute_icp_metric(source_pcd: o3d.geometry.PointCloud, target_pcd: o3d.geom
         "rotation_deg": rotation_deg,
     }
 
+def _build_filtered_pcd_for_depth(
+    depth_mm: np.ndarray, item: Dict[str, Any], source: DataSource
+) -> Tuple[o3d.geometry.PointCloud | None, o3d.geometry.PointCloud | None]:
+    """Back-project a depth map to a point cloud and filter it to the CAD bounding box.
 
-
-def build_icp_summary_for_depth(depth_mm: np.ndarray, item: Dict[str, Any], source: DataSource) -> Dict[str, float]:
-    """Back-project a depth map to a point cloud and compare it to the CAD cloud with ICP."""
-    if item.get("cad_pcd_aligned") is None:
-        return {"fitness": float("nan"), "inlier_rmse": float("nan"), "translation_m": float("nan"), "rotation_deg": float("nan")}
+    Returns ``(filtered_depth_pcd, cad_pcd)``. ``cad_pcd`` is ``None`` when the item has
+    no aligned CAD cloud; ``filtered_depth_pcd`` is ``None`` when the depth map is empty.
+    """
+    cad_pcd = item.get("cad_pcd_aligned")
+    if cad_pcd is None:
+        return None, None
 
     intrinsics, _ = source.get_intrinsics_matrix(item)
     pts = depth_to_point_cloud(depth_mm, intrinsics)
     if pts.shape[0] == 0:
-        return {"fitness": 0.0, "inlier_rmse": float("inf"), "translation_m": float("inf"), "rotation_deg": float("inf")}
+        return None, cad_pcd
 
     pcd_depth = o3d.geometry.PointCloud()
     pcd_depth.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
 
-    cad_pcd = item["cad_pcd_aligned"]
     try:
         bbox = cad_bbox_from_pcd(cad_pcd)
         pcd_filtered = filter_by_cad_bbox(pcd_depth, bbox)
@@ -237,7 +242,51 @@ def build_icp_summary_for_depth(depth_mm: np.ndarray, item: Dict[str, Any], sour
     if len(pcd_filtered.points) < 10:
         pcd_filtered = pcd_depth
 
+    return pcd_filtered, cad_pcd
+
+
+def build_icp_summary_for_depth(depth_mm: np.ndarray, item: Dict[str, Any], source: DataSource) -> Dict[str, float]:
+    """Back-project a depth map to a point cloud and compare it to the CAD cloud with ICP."""
+    pcd_filtered, cad_pcd = _build_filtered_pcd_for_depth(depth_mm, item, source)
+    if cad_pcd is None:
+        return {"fitness": float("nan"), "inlier_rmse": float("nan"), "translation_m": float("nan"), "rotation_deg": float("nan")}
+    if pcd_filtered is None:
+        return {"fitness": 0.0, "inlier_rmse": float("inf"), "translation_m": float("inf"), "rotation_deg": float("inf")}
+
     return compute_icp_metric(pcd_filtered, cad_pcd)
+
+
+def compute_chamfer_metric(source_pcd: o3d.geometry.PointCloud, target_pcd: o3d.geometry.PointCloud) -> Dict[str, float]:
+    """Bidirectional Chamfer distance (mean nearest-neighbor distance, mm) between two point clouds.
+
+    Same algorithm as ``DataSource.chamfer_distance`` in ``data_manager_pickle.py`` (bidirectional
+    nearest-neighbor query via a KD-tree) but without the per-call histogram plot, so it is cheap
+    enough to run once per frame.
+    """
+    src = np.asarray(source_pcd.points, dtype=np.float64)
+    tgt = np.asarray(target_pcd.points, dtype=np.float64)
+    if src.size == 0 or tgt.size == 0:
+        return {"chamfer_d2c_mm": float("inf"), "chamfer_c2d_mm": float("inf"), "chamfer_mean_mm": float("inf")}
+
+    src_tree = cKDTree(src)
+    tgt_tree = cKDTree(tgt)
+    d_src_to_tgt, _ = tgt_tree.query(src, p=2)
+    d_tgt_to_src, _ = src_tree.query(tgt, p=2)
+
+    d2c_mm = float(np.mean(d_src_to_tgt) * 1000.0)
+    c2d_mm = float(np.mean(d_tgt_to_src) * 1000.0)
+    return {"chamfer_d2c_mm": d2c_mm, "chamfer_c2d_mm": c2d_mm, "chamfer_mean_mm": (d2c_mm + c2d_mm) / 2.0}
+
+
+def build_chamfer_summary_for_depth(depth_mm: np.ndarray, item: Dict[str, Any], source: DataSource) -> Dict[str, float]:
+    """Back-project a depth map to a point cloud and compute its Chamfer distance to the CAD cloud."""
+    pcd_filtered, cad_pcd = _build_filtered_pcd_for_depth(depth_mm, item, source)
+    if cad_pcd is None:
+        return {"chamfer_d2c_mm": float("nan"), "chamfer_c2d_mm": float("nan"), "chamfer_mean_mm": float("nan")}
+    if pcd_filtered is None:
+        return {"chamfer_d2c_mm": float("inf"), "chamfer_c2d_mm": float("inf"), "chamfer_mean_mm": float("inf")}
+
+    return compute_chamfer_metric(pcd_filtered, cad_pcd)
 
 
 def save_summary_csv(rows: List[Dict[str, Any]], out_dir: Path) -> Path:
@@ -260,6 +309,9 @@ def save_summary_csv(rows: List[Dict[str, Any]], out_dir: Path) -> Path:
         "inlier_rmse_m",
         "translation_m",
         "rotation_deg",
+        "chamfer_d2c_mm",
+        "chamfer_c2d_mm",
+        "chamfer_mean_mm",
     ]
     with out_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -294,6 +346,77 @@ def save_scatter_plot(rows: List[Dict[str, Any]], out_dir: Path) -> Path:
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
     return out_path
+
+
+class ReportGeneratorPose(ReportGeneratorMM):
+    """ReportGeneratorMM with an extra Chamfer-distance section appended at the end of the report."""
+
+    def __init__(self, *args, chamfer_summary_rows: List[Dict[str, Any]] | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._chamfer_summary_rows = chamfer_summary_rows or []
+
+    def _fig_chamfer_distance(self) -> str:
+        rows = self._chamfer_summary_rows
+        if not rows:
+            return self._empty_fig("chamfer_distance.png", "No chamfer data")
+
+        labels = [self._r.method_labels.get(row["method"], row["method"]) for row in rows]
+        colors = [self._r.method_colors.get(row["method"], "#888") for row in rows]
+        d2c = [row["chamfer_d2c_mm"] for row in rows]
+        c2d = [row["chamfer_c2d_mm"] for row in rows]
+
+        x = np.arange(len(rows))
+        width = 0.35
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.bar(x - width / 2, d2c, width, label="Depth → CAD", color=colors, alpha=0.9, edgecolor="black")
+        ax.bar(x + width / 2, c2d, width, label="CAD → Depth", color=colors, alpha=0.5, edgecolor="black")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=9)
+        ax.set_ylabel("Mean nearest-neighbor distance (mm)")
+        ax.set_title("Chamfer Distance vs CAD Ground Truth")
+        ax.legend()
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        return self._save(fig, "chamfer_distance.png")
+
+    def generate(self) -> None:
+        super().generate()
+        fig_path = self._fig_chamfer_distance()
+        self._append_chamfer_section(fig_path)
+
+    def _append_chamfer_section(self, fig_path: str) -> None:
+        rows_html = "".join(
+            f'<tr><td style="padding:6px 12px;">{self._r.method_labels.get(row["method"], row["method"])}</td>'
+            f'<td style="padding:6px 12px;">{row["chamfer_d2c_mm"]:.2f}</td>'
+            f'<td style="padding:6px 12px;">{row["chamfer_c2d_mm"]:.2f}</td>'
+            f'<td style="padding:6px 12px;">{row["chamfer_mean_mm"]:.2f}</td></tr>'
+            for row in self._chamfer_summary_rows
+        )
+        section = f"""
+    <div class="section">
+      <h2>Chamfer Distance</h2>
+      <div class="figure-wrapper">
+        <img src="{fig_path}" alt="Chamfer Distance">
+        <p class="caption">Bidirectional Chamfer distance (mean nearest-neighbor distance, mm) between the
+        back-projected depth point cloud (filtered to the CAD bounding box) and the aligned CAD point cloud,
+        averaged over all evaluated frames.</p>
+      </div>
+      <table style="border-collapse:collapse;width:100%;font-size:.9em;margin-top:12px;">
+        <tr style="background:#2c3e50;color:white;font-weight:bold;">
+          <td style="padding:6px 12px;">Method</td>
+          <td style="padding:6px 12px;">Depth → CAD (mm)</td>
+          <td style="padding:6px 12px;">CAD → Depth (mm)</td>
+          <td style="padding:6px 12px;">Mean (mm)</td>
+        </tr>
+        {rows_html}
+      </table>
+    </div>
+  </body>
+</html>"""
+        index_path = self._out / "index.html"
+        html = index_path.read_text(encoding="utf-8")
+        html = html.replace("\n</body>\n</html>", section)
+        index_path.write_text(html, encoding="utf-8")
 
 
 def main() -> None:
@@ -384,6 +507,7 @@ def main() -> None:
             close_range_valid[method_name].append(close_cov)
 
             icp_metrics = build_icp_summary_for_depth(pred_depth, item, source)
+            chamfer_metrics = build_chamfer_summary_for_depth(pred_depth, item, source)
             frame_row = {
                 "method": method_name,
                 "mae_mm": metrics.mae,
@@ -396,6 +520,9 @@ def main() -> None:
                 "inlier_rmse_m": icp_metrics.get("inlier_rmse", float("nan")),
                 "translation_m": icp_metrics.get("translation_m", float("nan")),
                 "rotation_deg": icp_metrics.get("rotation_deg", float("nan")),
+                "chamfer_d2c_mm": chamfer_metrics.get("chamfer_d2c_mm", float("nan")),
+                "chamfer_c2d_mm": chamfer_metrics.get("chamfer_c2d_mm", float("nan")),
+                "chamfer_mean_mm": chamfer_metrics.get("chamfer_mean_mm", float("nan")),
             }
             rows.append(frame_row)
             per_method_frames[method_name].append(frame_row)
@@ -427,6 +554,9 @@ def main() -> None:
                 "inlier_rmse_m": float(np.mean([r["inlier_rmse_m"] for r in frames])),
                 "translation_m": float(np.mean([r["translation_m"] for r in frames])),
                 "rotation_deg": float(np.mean([r["rotation_deg"] for r in frames])),
+                "chamfer_d2c_mm": float(np.mean([r["chamfer_d2c_mm"] for r in frames])),
+                "chamfer_c2d_mm": float(np.mean([r["chamfer_c2d_mm"] for r in frames])),
+                "chamfer_mean_mm": float(np.mean([r["chamfer_mean_mm"] for r in frames])),
             }
         )
 
@@ -478,27 +608,31 @@ def main() -> None:
         else:
             edge_mae_mean[method_name] = float("nan")
 
-    reporter = ReportGeneratorMM(
+    reporter = ReportGeneratorPose(
         results,
         stats,
         out_dir,
         edge_mae_per_method=edge_mae_mean,
         edge_dist_bin_mae=edge_dist_bin_mae,
+        chamfer_summary_rows=summary_rows,
     )
     reporter.generate()
 
     logging.info("Saved summary CSV to %s", summary_csv)
     logging.info("Saved scatter plot to %s", scatter_path)
 
-    print("\nDepth + ICP benchmark summary")
-    print("-" * 96)
-    print(f"{'method':<14} {'MAE (mm)':>10} {'ICP RMSE (m)':>14} {'fitness':>10} {'delta1 (%)':>12}")
-    print("-" * 96)
+    print("\nDepth + ICP + Chamfer benchmark summary")
+    print("-" * 112)
+    print(
+        f"{'method':<14} {'MAE (mm)':>10} {'ICP RMSE (m)':>14} {'fitness':>10} {'delta1 (%)':>12} {'Chamfer (mm)':>14}"
+    )
+    print("-" * 112)
     for row in summary_rows:
         print(
-            f"{row['method']:<14} {row['mae_mm']:>10.1f} {row['inlier_rmse_m']:>14.4f} {row['fitness']:>10.3f} {row['delta1_pct']:>12.1f}"
+            f"{row['method']:<14} {row['mae_mm']:>10.1f} {row['inlier_rmse_m']:>14.4f} {row['fitness']:>10.3f} "
+            f"{row['delta1_pct']:>12.1f} {row['chamfer_mean_mm']:>14.2f}"
         )
-    print("-" * 96)
+    print("-" * 112)
 
 
 if __name__ == "__main__":
