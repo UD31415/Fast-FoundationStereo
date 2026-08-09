@@ -348,6 +348,56 @@ def save_scatter_plot(rows: List[Dict[str, Any]], out_dir: Path) -> Path:
     return out_path
 
 
+def save_icp_pose_summary_plot(rows: List[Dict[str, Any]], out_dir: Path) -> Path:
+    """Bar-chart summary of ICP pose-alignment quality (fitness, RMSE, translation, rotation) per method."""
+    out_path = out_dir / "icp_pose_summary.png"
+    if not rows:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.text(0.5, 0.5, "No ICP data", ha="center", va="center", transform=ax.transAxes)
+        ax.axis("off")
+        fig.savefig(out_path, dpi=180)
+        plt.close(fig)
+        return out_path
+
+    methods = [row["method"] for row in rows]
+    labels = [METHODS.get(m, {}).get("label", m) for m in methods]
+    colors = [METHODS.get(m, {}).get("color", "#888") for m in methods]
+    x = np.arange(len(methods))
+
+    panels = [
+        ("fitness", "ICP Fitness (higher is better)", "Fitness"),
+        ("inlier_rmse_m", "ICP Inlier RMSE (lower is better)", "RMSE (m)"),
+        ("translation_m", "Translation Error (lower is better)", "Translation (m)"),
+        ("rotation_deg", "Rotation Error (lower is better)", "Rotation (deg)"),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+    for ax, (key, title, ylabel) in zip(axes.flat, panels):
+        values = [row.get(key, float("nan")) for row in rows]
+        bars = ax.bar(x, values, color=colors, edgecolor="black", linewidth=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontsize=10)
+        ax.grid(axis="y", alpha=0.3)
+        for bar, value in zip(bars, values):
+            if np.isfinite(value):
+                ax.annotate(
+                    f"{value:.3f}",
+                    (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha="center",
+                    fontsize=7,
+                )
+
+    fig.suptitle("ICP Pose Alignment Summary", fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return out_path
+
+
 class ReportGeneratorPose(ReportGeneratorMM):
     """ReportGeneratorMM with an extra Chamfer-distance section appended at the end of the report."""
 
