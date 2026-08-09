@@ -418,6 +418,8 @@ class ReportGenerator:
                 "Aggregate quality metrics — see legend below the table for column explanations.",
             "close_range_analysis.png":
                 f"Coverage and stability for objects closer than {CLOSE_RANGE_THRESHOLD_M} m. Highlights MinZ benefit.",
+            "icp_pose_summary.png":
+                "Average ICP translation and rotation errors across all evaluated frames for each method.",
             "timing_bars.png":
                 "Processing speed in FPS. Hardware baseline is fixed at ~30 FPS (camera frame rate).",
         }

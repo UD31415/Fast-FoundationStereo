@@ -295,6 +295,47 @@ def save_scatter_plot(rows: List[Dict[str, Any]], out_dir: Path) -> Path:
     return out_path
 
 
+def save_icp_pose_summary_plot(rows: List[Dict[str, Any]], out_dir: Path) -> Path:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    axes = np.atleast_1d(axes)
+    valid_rows = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and np.isfinite(row.get("translation_m", np.nan))
+        and np.isfinite(row.get("rotation_deg", np.nan))
+    ]
+
+    for ax, metric_key, title, ylabel in (
+        (axes[0], "translation_m", "Average Translation Error", "Translation (m)"),
+        (axes[1], "rotation_deg", "Average Rotation Error", "Rotation (deg)"),
+    ):
+        if not valid_rows:
+            ax.text(0.5, 0.5, "No ICP pose data", ha="center", va="center", transform=ax.transAxes, color="gray")
+            ax.set_title(title)
+            ax.set_axis_off()
+            continue
+
+        labels = [row["method"] for row in valid_rows]
+        values = [float(row.get(metric_key, float("nan"))) for row in valid_rows]
+        colors = [METHODS.get(row["method"], {}).get("color", "#888") for row in valid_rows]
+
+        bars = ax.bar(labels, values, color=colors, edgecolor="black", linewidth=0.5, alpha=0.8)
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.grid(axis="y", alpha=0.3)
+        ax.set_ylim(bottom=0)
+        for bar, value in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(value * 0.01, 1e-3), f"{value:.3f}", ha="center", va="bottom", fontsize=8)
+
+    fig.suptitle("ICP Pose Results (mean over all evaluated frames)", fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    out_path = out_dir / "icp_pose_summary.png"
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return out_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out_dir", default=DEFAULT_OUT, help="Output directory for the benchmark report")
@@ -432,6 +473,7 @@ def main() -> None:
     summary_rows = sorted(summary_rows, key=lambda row: (row["inlier_rmse_m"], row["mae_mm"]))
     summary_csv = save_summary_csv(summary_rows, out_dir)
     scatter_path = save_scatter_plot(summary_rows, out_dir)
+    pose_summary_path = save_icp_pose_summary_plot(summary_rows, out_dir)
 
     mean_timing: Dict[str, float] = {
         method_name: float(np.mean(timing_ms_raw.get(method_name, []))) if timing_ms_raw.get(method_name) else 0.0
@@ -483,11 +525,13 @@ def main() -> None:
         out_dir,
         edge_mae_per_method=edge_mae_mean,
         edge_dist_bin_mae=edge_dist_bin_mae,
+        icp_summary_rows=summary_rows,
     )
     reporter.generate()
 
     logging.info("Saved summary CSV to %s", summary_csv)
     logging.info("Saved scatter plot to %s", scatter_path)
+    logging.info("Saved ICP pose summary plot to %s", pose_summary_path)
 
     print("\nDepth + ICP benchmark summary")
     print("-" * 96)

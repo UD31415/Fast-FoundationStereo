@@ -49,7 +49,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../')
@@ -219,7 +219,8 @@ class ReportGeneratorMM(ReportGenerator):
 
     def __init__(self, results, stats, output_dir,
                  edge_mae_per_method: Dict[str, float] | None = None,
-                 edge_dist_bin_mae: Dict[str, List[List[float]]] | None = None) -> None:
+                 edge_dist_bin_mae: Dict[str, List[List[float]]] | None = None,
+                 icp_summary_rows: List[Dict[str, Any]] | None = None) -> None:
         super().__init__(results, stats, output_dir)
         self._selected_viz_indices: List[int] = []
         # Per-method mean edge MAE (mm), computed by the benchmark loop.
@@ -227,6 +228,8 @@ class ReportGeneratorMM(ReportGenerator):
         # Per-method per-frame per-bin edge MAE (mm). Same structure as
         # ``results.dist_bin_mae`` but restricted to CAD-edge pixels.
         self._edge_dist_bin_mae: Dict[str, List[List[float]]] = edge_dist_bin_mae or {}
+        # Per-method average ICP pose metrics, used for the pose-summary figure.
+        self._icp_summary_rows: List[Dict[str, Any]] = icp_summary_rows or []
 
     def _get_selected_viz_indices(self, n_pick: int = 4) -> List[int]:
         """Return cached random frame indices used consistently across report sections."""
@@ -243,6 +246,22 @@ class ReportGeneratorMM(ReportGenerator):
         rng = np.random.default_rng(42)
         self._selected_viz_indices = sorted(rng.choice(n_total, size=n, replace=False).tolist())
         return self._selected_viz_indices
+
+    def generate(self) -> None:
+        fig_paths = [
+            self._fig_depth_comparison(),
+            self._fig_error_maps(),
+            self._fig_coverage_heatmaps(),
+            self._fig_distance_error_curve(),
+            self._fig_error_histograms(),
+            self._fig_summary_table(),
+            self._fig_close_range_analysis(),
+            self._fig_timing_bars(),
+            self._fig_icp_pose_summary(),
+        ]
+        self._write_json()
+        self._write_html([p for p in fig_paths if p])
+        print(f"\nReport written to: {self._out / 'index.html'}")
 
     def _fig_depth_comparison(self) -> str:
         if not self._r.viz_frames:
@@ -415,6 +434,36 @@ class ReportGeneratorMM(ReportGenerator):
         fig.suptitle("Per-Pixel Error Distribution (vs GT, viz frames)", fontsize=11)
         fig.tight_layout()
         return self._save(fig, "error_histograms.png")
+
+    def _fig_icp_pose_summary(self) -> str:
+        if not self._icp_summary_rows:
+            return self._empty_fig("icp_pose_summary.png", "No ICP pose summary")
+
+        rows = [row for row in self._icp_summary_rows if isinstance(row, dict)]
+        if not rows:
+            return self._empty_fig("icp_pose_summary.png", "No ICP pose summary")
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+        axes = np.atleast_1d(axes)
+        for ax, metric_key, title, ylabel in (
+            (axes[0], "translation_m", "Average Translation Error", "Translation (m)"),
+            (axes[1], "rotation_deg", "Average Rotation Error", "Rotation (deg)"),
+        ):
+            labels = [row.get("method", "") for row in rows]
+            values = [float(row.get(metric_key, float("nan"))) for row in rows]
+            colors = [self._r.method_colors.get(row.get("method"), "#888") for row in rows]
+            bars = ax.bar(labels, values, color=colors, edgecolor="black", linewidth=0.5, alpha=0.8)
+            ax.set_title(title)
+            ax.set_ylabel(ylabel)
+            ax.grid(axis="y", alpha=0.3)
+            ax.set_ylim(bottom=0)
+            for bar, value in zip(bars, values):
+                if np.isfinite(value):
+                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(value * 0.01, 1e-3), f"{value:.3f}", ha="center", va="bottom", fontsize=8)
+
+        fig.suptitle("ICP Pose Results (mean over all evaluated frames)", fontsize=12, fontweight="bold")
+        fig.tight_layout()
+        return self._save(fig, "icp_pose_summary.png")
 
     def _fig_summary_table(self) -> str:
         if not self._stats:
