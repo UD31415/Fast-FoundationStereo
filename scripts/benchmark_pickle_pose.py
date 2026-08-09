@@ -350,7 +350,7 @@ def save_scatter_plot(rows: List[Dict[str, Any]], out_dir: Path) -> Path:
 
 def save_icp_pose_summary_plot(rows: List[Dict[str, Any]], out_dir: Path) -> Path:
     """Bar-chart summary of ICP pose-alignment quality (fitness, RMSE, translation, rotation) per method."""
-    out_path = out_dir / "icp_pose_summary.png"
+    out_path = out_dir / "icp_pose_summary_detail.png"
     if not rows:
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.text(0.5, 0.5, "No ICP data", ha="center", va="center", transform=ax.transAxes)
@@ -665,6 +665,7 @@ def main() -> None:
         out_dir,
         edge_mae_per_method=edge_mae_mean,
         edge_dist_bin_mae=edge_dist_bin_mae,
+        icp_summary_rows=summary_rows,
         chamfer_summary_rows=summary_rows,
     )
     reporter.generate()
