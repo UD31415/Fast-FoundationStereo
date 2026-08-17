@@ -2617,7 +2617,7 @@ class ShazamDepthEstimator:
         kernel                  = np.array([0.2, 0.6, 0.2]) 
 
         row_index               = debug_row if debug_row is not None else 400
-        debug                   = debug_row is not None
+        debug_on                = False #debug_row is not None
 
         level_num               = 4
         max_disparity           = 128
@@ -2710,22 +2710,24 @@ class ShazamDepthEstimator:
 
     
         # show the difference data
-        img_list                 = [distance_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
-        ttl_list                 = [f'Level {m} Distance Volume (row {debug_row})' for m in range(level_num)]
-        self.show_subset(img_list, ttl_list, col_num=2)
+        if debug_on:
+            img_list                 = [distance_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+            ttl_list                 = [f'Level {m} Distance Volume (row {debug_row})' for m in range(level_num)]
+            self.show_subset(img_list, ttl_list, col_num=2)
 
-        # show the energy data
-        img_list                 = [energy_total[:,:,m] for m in range(level_num)]
-        ttl_list                 = [f'Level {m} Energy Features (row {debug_row})' for m in range(level_num)]
-        self.show_subset(img_list, ttl_list, col_num=2)        
+            # show the energy data
+            img_list                 = [energy_total[:,:,m] for m in range(level_num)]
+            ttl_list                 = [f'Level {m} Energy Features (row {debug_row})' for m in range(level_num)]
+            self.show_subset(img_list, ttl_list, col_num=2)        
 
         # convert to probability using soft max over the disparity dimension, which can help normalize the scores and make them more interpretable as probabilities. The temperature parameter T can be tuned to control the sharpness of the distribution, with lower values leading to a more peaked distribution and higher values leading to a softer distribution.
         prob_total               = self.softmax_with_threshold(-distance_total, dim=3, T=0.1, x_thr=-3) #T_weights[k])  # shape (N, M, D), higher is more similar
-        
-        #img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(3)]
-        img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
-        ttl_list                 = [f'Level {m} Probability Volume (row {debug_row})' for m in range(level_num )]
-        self.show_subset(img_list, ttl_list, col_num=2)
+
+        if debug_on:        
+            #img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(3)]
+            img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+            ttl_list                 = [f'Level {m} Probability Volume (row {debug_row})' for m in range(level_num )]
+            self.show_subset(img_list, ttl_list, col_num=2)
 
         # debug_row               += 1
         # img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
@@ -2735,18 +2737,20 @@ class ShazamDepthEstimator:
         prob_energy              = energy_total[:,:,:]
         prob_energy              = prob_energy/(np.sum(prob_energy, axis=2, keepdims=True) + 1e-1)
 
-        img_list                 = [prob_energy[:,:,m] for m in range(level_num)]
-        ttl_list                 = [f'Level {m} Probability Energy (row {debug_row})' for m in range(level_num )]
-        self.show_subset(img_list, ttl_list, col_num=2)         
+        if debug_on:
+            img_list                 = [prob_energy[:,:,m] for m in range(level_num)]
+            ttl_list                 = [f'Level {m} Probability Energy (row {debug_row})' for m in range(level_num )]
+            self.show_subset(img_list, ttl_list, col_num=2)         
 
         # do edge filtering
         prob_filtered              = prob_total.copy()#*prob_energy[:,:,:,np.newaxis]
         # for m in range(level_num):
         #     prob_filtered[:,:,m,:]  = self.anisotropic_filter_with_edges(prob_total[:,:,m,:], img_left_ref, num_iter = 8)
 
-        img_list                 = [prob_filtered[debug_row,:,m,:].squeeze().T for m in range(level_num)]
-        ttl_list                 = [f'Level {m} Probability Filtered (row {debug_row})' for m in range(level_num )]
-        self.show_subset(img_list, ttl_list, col_num=2)            
+        if debug_on:
+            img_list                 = [prob_filtered[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+            ttl_list                 = [f'Level {m} Probability Filtered (row {debug_row})' for m in range(level_num )]
+            self.show_subset(img_list, ttl_list, col_num=2)            
 
   
 
@@ -2780,9 +2784,10 @@ class ShazamDepthEstimator:
         #     prob_total_filter    = self.joint_bilateral_filtering(img_left_ref, prob_total_filter, spatial_sigma=3.0, range_sigma=5.1, radius=3)
         #prob_total_filter        = self.joint_bilateral_filtering(img_left_ref, prob_total_final, spatial_sigma=3.0, range_sigma=5.1, radius=3, iter_num=8) 
 
-        img_list                 = [prob_total_final[debug_row,:,:].squeeze().T , prob_total_filter[debug_row,:,:].squeeze().T]
-        ttl_list                 = [f'Final Probability Volume (row {debug_row})', f'Filtered Final Probability Volume (row {debug_row})']
-        self.show_subset(img_list, ttl_list, col_num=1)        
+        if debug_on:
+            img_list                 = [prob_total_final[debug_row,:,:].squeeze().T , prob_total_filter[debug_row,:,:].squeeze().T]
+            ttl_list                 = [f'Final Probability Volume (row {debug_row})', f'Filtered Final Probability Volume (row {debug_row})']
+            self.show_subset(img_list, ttl_list, col_num=1)        
 
         disp_index               = self.estimate_disparity_from_prob(prob_total_filter, estim_type = 4) # ensure values are within the valid range
         disp_confidence          = np.max(prob_total_filter, axis=2)  # shape (N, M)
@@ -2798,14 +2803,12 @@ class ShazamDepthEstimator:
         # ttl_list                 = ['Left Image', 'Estimated Disparity Map', 'Estimated Disparity Confidence Map','Filtered Confidence Map']
         # self.show_subset(img_list, ttl_list, col_num=2) 
 
-        img_list                 = [img_left_ref, disp_index , disp_confidence]
-        ttl_list                 = ['Left Image', 'Estimated Disparity Map', 'Estimated Confidence Map']
-        self.show_subset(img_list, ttl_list, col_num=1)         
+        if debug_on:
+            img_list                 = [img_left_ref, disp_index , disp_confidence]
+            ttl_list                 = ['Left Image', 'Estimated Disparity Map', 'Estimated Confidence Map']
+            self.show_subset(img_list, ttl_list, col_num=1)         
 
-        # if debug and row_index is not None:
-        #     self.debug_gabor_image_disparity_multiscale(debug_levels, prob_total, row_index=row_index)
-
-        plt.show()
+            plt.show()
         return disp_index
 
     def multiscale_disparity_edge_aware(self, img_left, img_right, debug_row=None):
