@@ -274,6 +274,7 @@ class ShazamDepthEstimator:
 
         # show 3d in real time
         self.show_info   = None
+        self.debug_show  = True
 
         # opencv stereo matcher
         self.camera_bf   = 95*100   # camera basline multiplied by focal
@@ -557,6 +558,333 @@ class ShazamDepthEstimator:
         
         
         return img_C, p_C    
+
+    def joint_bilateral_upsampling(self, lr_img, hr_guide, spatial_sigma=3.0, range_sigma=0.1, radius=4):
+        # =====================================================================
+        # 1. High-Performance NumPy JBU Implementation
+        # =====================================================================
+        log.info('Starting joint bilateral upsampling')
+        if lr_img.ndim == 2:
+            lr_img = lr_img[..., np.newaxis]
+        if hr_guide.ndim == 2:
+            hr_guide = hr_guide[..., np.newaxis]
+            
+        H_lr, W_lr, C_lr = lr_img.shape
+        H_hr, W_hr, C_g = hr_guide.shape
+        
+        scale_y = H_hr / H_lr
+        scale_x = W_hr / W_lr
+        
+        # Precompute spatial Gaussian weights
+        y_coords, x_coords = np.mgrid[-radius:radius+1, -radius:radius+1]
+        spatial_dist_sq = y_coords**2 + x_coords**2
+        spatial_weights = np.exp(-spatial_dist_sq / (2 * spatial_sigma**2))
+        
+        upsampled = np.zeros_like(hr_guide, dtype=np.float32) if C_lr == C_g else np.zeros((H_hr, W_hr, C_lr), dtype=np.float32)
+        norm_factor = np.zeros((H_hr, W_hr, 1), dtype=np.float32)
+        hr_y, hr_x = np.meshgrid(np.arange(H_hr), np.arange(W_hr), indexing='ij')
+        
+        # Neighborhood search loop
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                s_w = spatial_weights[dy + radius, dx + radius]
+                if s_w < 1e-4:
+                    continue
+                
+                lr_y_idx        = np.clip(np.round(hr_y / scale_y).astype(np.int32) + dy, 0, H_lr - 1)
+                lr_x_idx        = np.clip(np.round(hr_x / scale_x).astype(np.int32) + dx, 0, W_lr - 1)
+                
+                lr_val          = lr_img[lr_y_idx, lr_x_idx, :]
+                
+                hr_y_from_lr    = np.clip(np.round(lr_y_idx * scale_y).astype(np.int32), 0, H_hr - 1)
+                hr_x_from_lr    = np.clip(np.round(lr_x_idx * scale_x).astype(np.int32), 0, W_hr - 1)
+                
+                guide_diff      = hr_guide - hr_guide[hr_y_from_lr, hr_x_from_lr]
+                range_dist_sq   = np.sum(guide_diff**2, axis=-1, keepdims=True)
+                range_weights   = np.exp(-range_dist_sq / (2 * range_sigma**2))
+                
+                weight          = s_w * range_weights
+                upsampled      += lr_val * weight
+                norm_factor    += weight
+                
+        upsampled /= (norm_factor + 1e-8)
+        log.info('Done')
+        return np.squeeze(upsampled)    
+
+    def joint_bilateral_filtering(self, img_left, img_volume, spatial_sigma=3.0, range_sigma=0.1, radius=4, iter_num=1):
+        # =====================================================================
+        # 1. High-Performance NumPy JBU Implementation
+        # =====================================================================
+        log.info('Starting joint bilateral filtering with spatial_sigma=%.2f, range_sigma=%.2f, radius=%d, iter_num=%d', spatial_sigma, range_sigma, radius, iter_num)
+        if img_left.ndim == 2:
+            img_left = img_left[..., np.newaxis]
+        if img_volume.ndim == 2:
+            img_volume = img_volume[..., np.newaxis]
+            
+        H_lr, W_lr, C_lr    = img_left.shape
+        H_hr, W_hr, C_hr    = img_volume.shape
+
+        
+        # Precompute spatial Gaussian weights
+        y_coords, x_coords  = np.mgrid[-radius:radius+1, -radius:radius+1]
+        spatial_dist_sq     = y_coords**2 + x_coords**2
+        spatial_weights     = np.exp(-spatial_dist_sq / (2 * spatial_sigma**2))
+        
+        #img_volume_filtered = img_volume.copy() #np.zeros_like(img_volume, dtype=np.float32) #if C_lr == C_hr else np.zeros((H_hr, W_hr, C_lr), dtype=np.float32)
+        
+        #hr_y, hr_x     = np.meshgrid(np.arange(H_hr), np.arange(W_hr), indexing='ij')
+        y_index             = np.arange(radius, H_hr - radius - 1).reshape(-1, 1)
+        x_index             = np.arange(radius, W_hr - radius - 1).reshape(1, -1)
+        
+        # Neighborhood match loop
+        for k in range(iter_num):
+            img_volume_filtered     = np.zeros_like(img_volume, dtype=np.float32)
+            norm_factor             = np.zeros_like(img_left, dtype=np.float32)
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    s_w             = spatial_weights[dy + radius, dx + radius]
+
+                    #lr_val         = img_volume[y_index, x_index,:] - img_volume[y_index + dy, x_index + dx,:]
+                    lr_val          = img_volume[y_index + dy, x_index + dx,:]
+                    guide_diff      = img_left[y_index, x_index,:] - img_left[y_index + dy, x_index + dx,:]
+                    range_weights   = np.exp(-guide_diff**2 / (2 * range_sigma**2))
+                    
+                    weight                                      = s_w * range_weights #* 1.1 - 0.1 # -0.1 high pass
+                    img_volume_filtered[y_index, x_index,:]    += lr_val * weight
+                    norm_factor[y_index, x_index,:]            += weight                
+                    
+            img_volume_filtered /= (norm_factor + 1e-8)
+            img_volume = img_volume_filtered.copy()
+        log.info('Done')
+        return np.squeeze(img_volume_filtered)  
+
+    def probability_bilateral_filtering(self, img_left, prob_volume, spatial_sigma=3.0, range_sigma=0.1, radius=4, iter_num=1):
+        # =====================================================================
+        # 1. fills low probabilities using neighbrhood information defined by the left image
+        # =====================================================================
+        if img_left.ndim == 2:
+            img_left = img_left[..., np.newaxis]
+        if prob_volume.ndim == 2:
+            prob_volume = prob_volume[..., np.newaxis]
+            
+        H_lr, W_lr, C_lr    = img_left.shape
+        H_hr, W_hr, C_hr    = prob_volume.shape
+        prob_volume         = np.clip(prob_volume, 0.0, 1.0)
+
+        
+        # Precompute spatial Gaussian weights
+        y_coords, x_coords  = np.mgrid[-radius:radius+1, -radius:radius+1]
+        spatial_dist_sq     = y_coords**2 + x_coords**2
+        spatial_weights     = np.exp(-spatial_dist_sq / (2 * spatial_sigma**2))
+        
+        #img_volume_filtered = img_volume.copy() #np.zeros_like(img_volume, dtype=np.float32) #if C_lr == C_hr else np.zeros((H_hr, W_hr, C_lr), dtype=np.float32)
+        
+        #hr_y, hr_x     = np.meshgrid(np.arange(H_hr), np.arange(W_hr), indexing='ij')
+        y_index             = np.arange(radius, H_hr - radius - 1).reshape(-1, 1)
+        x_index             = np.arange(radius, W_hr - radius - 1).reshape(1, -1)
+        
+        # Neighborhood match loop
+        for k in range(iter_num):
+            prob_volume_filtered    = np.zeros_like(prob_volume, dtype=np.float32)
+            norm_factor             = np.zeros_like(img_left, dtype=np.float32)
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    s_w             = spatial_weights[dy + radius, dx + radius]
+
+                    #lr_val         = prob_volume[y_index, x_index,:] - prob_volume[y_index + dy, x_index + dx,:]
+                    prob_val        = (1-prob_volume[y_index, x_index,:]) * prob_volume[y_index + dy, x_index + dx,:]
+                    guide_diff      = img_left[y_index, x_index,:] - img_left[y_index + dy, x_index + dx,:]
+                    range_weights   = np.exp(-guide_diff**2 / (2 * range_sigma**2))
+                    
+                    weight                                      = s_w * range_weights - 0.1 # -0.1 high pass
+                    prob_volume_filtered[y_index, x_index,:]    += prob_val * weight
+                    norm_factor[y_index, x_index,:]             += weight                
+                    
+            prob_volume_filtered /= (norm_factor + 1e-8)
+            prob_volume = prob_volume_filtered.copy()
+        return np.squeeze(prob_volume_filtered)  
+
+    #%% -----------------------------------------
+    def compute_edges(self, img = None):
+        "edges of the image"
+        if img is None:
+            raise ValueError('image is not defined')
+
+        # Convert to grayscale, as edge detection works on intensity
+        img = img if len(img.shape)<3 else cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+
+        # 2. Use a Gaussian Blur for noise reduction (optional, but recommended)
+        img_blur = cv.GaussianBlur(img, (3, 3), 0) # 5x5 kernel size
+        #img_blur  = cv.pyrDown(img)
+        #img_blur  = cv.pyrDown(img_blur)
+        #img_blur  = cv.pyrDown(img_blur)
+
+        # 3. Calculate the Sobel Derivatives
+        # ddepth=cv.CV_64F is used for accuracy to prevent overflow, as derivatives can be negative.
+        # ksize=3 is the 3x3 kernel size.
+
+        # Sobel X (Detects vertical edges)
+        sobelx = cv.Sobel(src=img_blur, ddepth=cv.CV_64F, dx=1, dy=0, ksize=3)
+
+        # Sobel Y (Detects horizontal edges)
+        sobely = cv.Sobel(src=img_blur, ddepth=cv.CV_64F, dx=0, dy=1, ksize=3)
+
+        # 4. Convert back to 8-bit image and find the absolute value
+        # The original Sobel output contains negative values, so we take the absolute value
+        # and scale it back to the 0-255 range for display.
+        #abs_sobelx = np.clip(sobelx + 128, 0, 255) #cv.convertScaleAbs(sobelx)
+        #abs_sobely = np.clip(sobely + 128, 0, 255) #cv.convertScaleAbs(sobely)
+        abs_sobelx = cv.convertScaleAbs(sobelx)
+        abs_sobely = cv.convertScaleAbs(sobely)        
+
+        # 5. Combine the X and Y gradient components
+        # The final edge map (magnitude) is a weighted combination of the X and Y results.
+        # Gradient Magnitude G = sqrt(Gx^2 + Gy^2) (or approximated as |Gx| + |Gy|)
+        #sobel_combined = cv.addWeighted(abs_sobelx, 0.5, abs_sobely, 0.5, 0)
+        sobel_combined = np.hypot(sobelx, sobely)  # more accurate magnitude
+
+        #sobel_combined  = cv.pyrUp(sobel_combined)
+        #sobel_combined  = cv.pyrUp(sobel_combined)      
+        #sobel_combined  = cv.pyrUp(sobel_combined)  
+        # img_edges       = np.zeros((img.shape[0], img.shape[1],3), dtype=np.float32)
+        # img_edges[:,:,0] = sobelx
+        # img_edges[:,:,1] = sobely
+        # img_edges[:,:,2] = sobel_combined
+
+        # # 6. Display the results
+        # titles = ['Original Image', 'Sobel X (Vertical Edges)', 'Sobel Y (Horizontal Edges)', 'Combined Sobel Edges']
+        # images = [img, abs_sobelx, abs_sobely, sobel_combined]
+        # self.show_subset(images, titles)
+
+        return sobel_combined
+
+    def pixel_features(self, img, feat_type = 'center'):
+        """
+        Converts the image to a hashable feature. Each image offset is compared to each other
+        """
+        # Convert image to grayscale if it is not already
+        img_h, img_w    = img.shape[:2]
+        if img_h < 32 or img_w < 32:
+            raise ValueError("Image must be at least 32x32 pixels in size.")
+        
+        
+        # Apply box filter
+        #filtered_img    = self.apply_box_filter(img)
+        filtered_img    = img.copy().astype(np.float32)
+
+        # Create compares the central pixel with the rest according to the offset
+        if feat_type == 'center':
+            pixel_offsets   = np.array([(1, 0), (0, 1), (-1, 0), (0, -1)])
+        elif feat_type == 'right':
+            pixel_offsets   = np.array([(2, 0), (1, 0), (2, 1), (2, -1)]) # bias right
+        elif feat_type == 'left':
+            pixel_offsets   = np.array([(-2, 0), (-1, 0), (-2, 1), (-2, -1)]) # bias left
+        elif feat_type == 'up':
+            pixel_offsets   = np.array([(-1, 2), (0, 2), (1, 2), (0, 1)]) # bias up     
+        elif feat_type == 'down':
+            pixel_offsets   = np.array([(-1, -2), (0, -2), (1, -2), (0, -1)]) # bias down  
+        elif feat_type == 'center_big':
+            pixel_offsets   = np.array([(3, 0), (0, 3), (-3, 0), (0, -3)])                               
+        else:
+            pixel_offsets   = np.array([(1, 0), (0, 1), (-1, 0), (0, -1)])
+        #pixel_offsets   = np.array([(2, 0), (1, 0), (2, 1), (2, -1)]) # bias right
+        #pixel_offsets   = np.array([(1, 0), (0, 1), (-1, 0), (0, -1), (3, 0), (0, 2), (-3, 0), (0, -2)])*3
+        #pixel_offsets   = np.array([(1, 0), (-1, 0), (3, 0), (-3, 0), (7, 0), (-7, 0)])*2
+        max_offset      = np.max(np.abs(pixel_offsets))+1
+        num_offsets    = pixel_offsets.shape[0]
+
+        # Initialize the hash values
+        img_feat        = np.zeros((img_h, img_w, num_offsets), dtype=np.float32)
+        bit_index       = 0
+        center_img      = filtered_img[max_offset:-max_offset,max_offset:-max_offset]
+        for k in range(num_offsets):
+            offset      = pixel_offsets[k]
+            # image difference
+            offset_img  = filtered_img[max_offset + offset[1]:-max_offset + offset[1], max_offset + offset[0]:-max_offset + offset[0]]
+            diff_img    = offset_img #- center_img
+            #sign_img    = np.sign(diff_img)  # Get the sign of the difference
+            img_feat[max_offset:-max_offset,max_offset:-max_offset,k] = diff_img
+
+        #print(f"Created complex hash with {bit_index} bits.")
+        return img_feat 
+
+    def inverse_filter_with_edges(self, prob_distance, img_left, num_iter = 8):
+        """
+        Makes the inversion on the edges before interpolation
+        """        
+        num_iter    = np.maximum(4,num_iter)
+        delta       = 0.24
+        kappa       = 50
+        s           = 1
+        log.debug(f'Starting inversion filtering with num_iter={num_iter}, delta={delta}, kappa={kappa}')
+
+        img_blur   = cv.GaussianBlur(img_left, (3, 3), 0) # 5x5 kernel size
+        grad_img_S  = cv.Sobel(img_blur, cv.CV_32F, 0, 1, ksize=3)
+        grad_img_E  = cv.Sobel(img_blur, cv.CV_32F, 1, 0, ksize=3)  
+        img_edges   = np.hypot(grad_img_S, grad_img_E)  # more accurate magnitude
+
+        #img_edges   = self.compute_edges(img_left)
+        grad_img    = np.exp(-img_edges/ kappa)
+        grad_img    = grad_img - 0.2
+
+        out         = prob_distance * grad_img[:, :, np.newaxis] 
+
+
+        log.debug('Finished anisotropic diffusion filtering after %d iterations', num_iter)
+        return out
+
+    def softmax_local_maxima(self, img = None, kernel_size = 7, T = 1.0, x_thr = -2.5):
+        "compute local spatial maxima of an image"
+        if img is None:
+            raise ValueError('image is not defined')
+        
+        # Ensure kernel size is odd
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        # Convert image to float to avoid issues with arithmetic operations
+        img_float = img.astype(np.float32)
+
+        # 2. Perform Dilation
+        # Dilation replaces each pixel with the MAXIMUM pixel value found in its 
+        # surrounding neighborhood defined by the kernel.
+        
+        # Create the structuring element (kernel)
+        kernel      = np.ones((kernel_size, kernel_size), np.uint8)
+        
+        # Apply dilation
+        # The result 'dilated_img' contains, at every pixel (x, y), the maximum value 
+        # of the original image within the kernel_size window centered at (x, y).
+        img_max    = cv.dilate(img_float, kernel, iterations=1)
+        
+        # 3. Find Maxima using Comparison
+        # A pixel (x, y) in the original image is a TRUE local maximum only if:
+        # img_float[x, y] == dilated_img[x, y]
+        # AND it is NOT equal to a plateau of adjacent equal-valued pixels.
+        
+        # To enforce strict local maxima (strictly greater than neighbors):
+        # We compare the original image with its dilated version MINUS a small epsilon.
+        # epsilon = 0.0001
+        
+        # Boolean mask: True where original pixel value > maximum of its neighbors (excluding itself potentially)
+        # The use of 'dilated_img' ensures comparison against ALL neighbors.
+        #maxima_mask = (img_float > (dilated_img - epsilon))        
+        x_eps     = np.exp(x_thr / T)  # shift by threshold to control sparsity
+        # it means low probability.
+        x_shifted = img_max - img_float #- np.maximum(x, axis=dim, keepdims=True)   # numerical stability
+        exp_x     = np.exp(-x_shifted / T)
+
+        img_prob =  exp_x #/ (np.sum(exp_x, axis=(0,1), keepdims=True) + x_eps)
+
+        # local maxima mask
+        #local_max_mask          = (maxima_mask*250).astype(np.uint8)
+
+        # titles = ['Edge Magnitudes', 'Dilated Edges', 'Local Maxima Mask']
+        # images = [img, dilated_img, local_max_mask]  
+        # self.show_images_debug(images, titles, False)  
+
+        return img_prob
+
     #%% -----------------------------------------
 
     def gabor_bank_channels(
@@ -815,6 +1143,10 @@ class ShazamDepthEstimator:
         "right bank"
 
         log.debug(f'Calculating disparity difference with max_disparity {max_disparity}')
+        bank_left  = bank_left[..., np.newaxis]  if bank_left.ndim == 2  else bank_left
+        bank_right = bank_right[..., np.newaxis] if bank_right.ndim == 2 else bank_right
+        max_disparity = int(max_disparity)
+
         h, w            = bank_right.shape[:2]
         diff_array       = np.full((h, w, max_disparity), 1, dtype=np.float32)
         
@@ -833,6 +1165,15 @@ class ShazamDepthEstimator:
         gabor_left               = gabor_left / gabor_left_norm
 
         return gabor_left
+
+    def gabor_normalize_responses_with_energy(self, gabor_left):
+         # This can help improve the correlation by making it more about the pattern of responses across channels rather 
+         # than their absolute strength.  SQRT is important, we want to differentiate between strong and no strong responses, but we don't want the strongest responses to dominate the correlation.
+        gabor_left_norm          = np.sqrt(np.linalg.norm(gabor_left, axis=2, keepdims=True)) + 1e-6
+        #gabor_left_norm          = np.linalg.norm(gabor_left, axis=2, keepdims=True) + 1e-6
+        gabor_left               = gabor_left / gabor_left_norm
+
+        return gabor_left, gabor_left_norm.squeeze()   
 
     def gabor_decomposition_variability(self, gaborL, kernel_size = 7):
         "compute variability of the gabor responses across channels for each pixel, which can be used as a measure of local information content. This can help identify pixels that are more likely to provide reliable matches, so we can use this information to weight the correlation scores."
@@ -996,15 +1337,15 @@ class ShazamDepthEstimator:
         log.debug('Finished anisotropic diffusion filtering after %d iterations', num_iter)
         return out
 
-    def anisotropic_filter_3d(self, prob_distance, img_left=None):
+    def anisotropic_filter_3d(self, prob_distance, kappa = 0.1, img_left=None):
         """
         Perona-Malik Anisotropic Diffusion.
         img: 2D grayscale float array
         kappa: Edge threshold (higher = smoother, lower = preserves sharper edges)
         """        
-        num_iter = 8
-        delta    = 0.25
-        kappa    = 0.1
+        num_iter = 4
+        delta    = 0.1
+        
         log.debug(f'Starting anisotropic diffusion filtering with num_iter={num_iter}, delta={delta}, kappa={kappa}')
 
         out_new    = prob_distance.copy() #.astype(np.float32)
@@ -1013,7 +1354,7 @@ class ShazamDepthEstimator:
         
         for i in range(num_iter):
             out         = out_new.copy()
-            out_new[:]  = 0
+            #out_new[:]  = 0
             for d in directions:
                 for s in shift:
                     grad = np.roll(out, s, axis=d) - out
@@ -1052,26 +1393,33 @@ class ShazamDepthEstimator:
         log.debug(f'Finished anisotropic diffusion filtering after {num_iter} iterations')
         return out_new    
 
-    def anisotropic_filter_not_good(self, prob_distance, img_left):
+    def anisotropic_filter_with_edges(self, prob_distance, img_left, num_iter = 8):
         """
         Perona-Malik Anisotropic Diffusion.
         img: 2D grayscale float array
         kappa: Edge threshold (higher = smoother, lower = preserves sharper edges)
         """        
-        num_iter    = 16
-        delta       = 0.25
-        kappa       = 10
+        num_iter    = np.maximum(4,num_iter)
+        delta       = 0.24
+        kappa       = 80
+        s          = 1
         log.debug(f'Starting anisotropic diffusion filtering with num_iter={num_iter}, delta={delta}, kappa={kappa}')
 
         grad_img_S  = cv.Sobel(img_left, cv.CV_32F, 0, 1, ksize=3)
         grad_img_E  = cv.Sobel(img_left, cv.CV_32F, 1, 0, ksize=3)  
-        grad_img    = np.exp(-(grad_img_S**2 + grad_img_E**2)/ kappa**2)[:, :, np.newaxis]  # gradient magnitude as edge strength
-        #c_S         = np.exp(-(grad_img_S / kappa)**2)[:, :, np.newaxis] # expand to 3d if needed
-        #c_E         = np.exp(-(grad_img_E / kappa)**2)[:, :, np.newaxis]      
+        img_edges   = np.hypot(grad_img_S, grad_img_E)  # more accurate magnitude
 
-        out         = prob_distance #.astype(np.float32)
+        #img_edges   = self.compute_edges(img_left)
+        grad_img    = np.exp(-img_edges/ kappa)[:, :, np.newaxis]  # gradient magnitude as edge strength
+
+        # c_N         = np.abs(np.roll(grad_img, -s, axis=0) - grad_img)
+        # c_S         = np.abs(np.roll(grad_img,  s, axis=0) - grad_img)
+        # c_E         = np.abs(np.roll(grad_img, -s, axis=1) - grad_img)
+        # c_W         = np.abs(np.roll(grad_img,  s, axis=1) - grad_img)
+
+        out         = prob_distance.copy() #.astype(np.float32)
         #directions = [0,1,2]
-        s          = 1
+       
         
         for i in range(num_iter):
                     
@@ -1087,7 +1435,8 @@ class ShazamDepthEstimator:
             
             # Update image
             #out += delta * (c_N * grad_N + c_S * grad_S + c_E * grad_E + c_W * grad_W)    
-            out += delta * grad_img * (grad_N + grad_S + grad_E + grad_W)             
+            out += delta * grad_img * (grad_N + grad_S + grad_E + grad_W)   
+            out = np.clip(out, 0, 5)  # Ensure the output remains in the valid range [0, 1]          
 
 
         log.debug('Finished anisotropic diffusion filtering after %d iterations', num_iter)
@@ -1104,6 +1453,9 @@ class ShazamDepthEstimator:
         delta       = 0.25
         kappa       = 10
         log.debug(f'Starting anisotropic diffusion filtering ....')
+
+        if prob_distance.ndim == 2:
+            prob_distance = prob_distance[:, :, np.newaxis]  # expand to 3d for broadcasting        
 
         grad_img_S  = cv.Sobel(img_left, cv.CV_32F, 0, 1, ksize=3)
         grad_img_E  = cv.Sobel(img_left, cv.CV_32F, 1, 0, ksize=3)  
@@ -1135,7 +1487,7 @@ class ShazamDepthEstimator:
             out          = out / filtered_sum 
 
         log.debug('Finished anisotropic diffusion filtering after %d iterations', num_iter)
-        return out
+        return out.squeeze()
 
     def anisotropic_filter(self, prob_distance, img_left):
         """
@@ -1176,25 +1528,67 @@ class ShazamDepthEstimator:
             out += delta * (c_N * grad_N + c_S * grad_S + c_E * grad_E + c_W * grad_W)
             
         log.debug(f'Finished anisotropic diffusion filtering after {num_iter} iterations')
-        return out
+        return out.squeeze()
 
     def adaptive_filter_3d(self, prob_3d, kernel_size = 3, kappa = 0.1):
         "finds similar pixels in a local neighborhood and computes a weighted average of the depth values, where the weights are based on the similarity of the pixel values. This can help reduce noise and improve the quality of the depth map."
 
         nr, nc, nd              = prob_3d.shape
         border                  = kernel_size >> 1
+        border_d                = 3
+        
         # downscale depth maps 
         prob_3d_filt            = np.zeros_like(prob_3d)  # make a copy to avoid modifying the original array
         
         for r in range(border, nr - border):
             for c in range(border, nc - border):
-                for d in range(border, nd - border):
+                for d in range(border_d, nd - border_d):
 
                     # compute adaptive mask - only pixels that have close values are used
-                    neighborhood_volume  = prob_3d[r-border:r+border+1, c-border:c+border+1, d-border:d+border+1]
-                    neighborhood_pixels   = np.abs(neighborhood_volume - prob_3d[r,c,d])
-                    neighborhood_mask     = 1.0 - np.clip(neighborhood_pixels/kappa, 0, 1)
+                    neighborhood_volume  = prob_3d[r-border:r+border+1, c-border:c+border+1, d-border_d:d+border_d+1]
+                    #neighborhood_pixels   = np.abs(neighborhood_volume - prob_3d[r,c,d])
+                    # the prob_3d[r,c,d] is local minima => neighborhood_pixels are positive
+                    neighborhood_pixels   = neighborhood_volume - prob_3d[r,c,d]
+                    #neighborhood_mask     = 1.0 - np.clip(neighborhood_pixels/kappa, 0, 1)
+                    neighborhood_mask     = np.exp(-neighborhood_pixels/kappa)
                     prob_3d_filt[r,c,d]   = np.sum(neighborhood_mask * neighborhood_volume) / (np.sum(neighborhood_mask) + 1e-5)
+
+        return prob_3d_filt
+
+    def adaptive_filter_3d_fast(self, prob_3d, kernel_size = 3, kappa = 0.1):
+        "Vectorized equivalent of adaptive_filter_3d. Accumulates weighted contributions over all kernel offsets using shifted views, avoiding the per-voxel Python loops. Borders are left as zeros to match adaptive_filter_3d."
+
+        nr, nc, nd      = prob_3d.shape
+        border          = kernel_size >> 1
+        p               = prob_3d.astype(np.float32, copy=False)
+        border_d        = 3
+
+        weight_sum      = np.zeros_like(p)
+        value_sum       = np.zeros_like(p)
+
+        # iterate over all (dr, dc, dd) offsets in the kernel window and accumulate
+        # using shifted volumes. For interior voxels (those at least `border` away
+        # from every face) the shifted view contains the exact neighborhood values
+        # the original loop visits.
+        for dr in range(-border, border + 1):
+            for dc in range(-border, border + 1):
+                for dd in range(-border_d, border_d + 1):
+                    if dr == 0 and dc == 0 and dd == 0:
+                        shifted = p
+                    else:
+                        shifted = np.roll(p, shift=(dr, dc, dd), axis=(0, 1, 2))
+                    diff        = np.abs(shifted - p)
+                    w           = 1.0 - np.clip(diff / kappa, 0.0, 1.0)
+                    weight_sum += w
+                    value_sum  += w * shifted
+
+        filtered            = value_sum / (weight_sum + 1e-5)
+
+        prob_3d_filt        = np.zeros_like(prob_3d)
+        if nr > 2 * border and nc > 2 * border and nd > 2 * border_d:
+            prob_3d_filt[border:nr - border, border:nc - border,  border_d:nd - border_d] = filtered[border:nr - border,
+                                                            border:nc - border,
+                                                            border_d:nd - border_d].astype(prob_3d.dtype, copy=False)
 
         return prob_3d_filt
 
@@ -1206,18 +1600,120 @@ class ShazamDepthEstimator:
         elif estim_type == 2:            
             # "More advanced way is to create a disparity index np.arange(0,L) and compute the expected value of the disparity for each pixel, which can help reduce noise and provide a more robust estimate of the disparity. This can be done by multiplying the probability volume by the disparity index and summing over the disparity dimension, then normalizing by the sum of probabilities."
             disparity_index = np.arange(D, dtype=np.float32)
-            prob_sum        = np.sum(prob_total, axis=2) + 1e-6
+            prob_sum        = np.sum(prob_total, axis=2) + 1e-2
             disparity_map   = np.sum(prob_total * disparity_index[np.newaxis, np.newaxis, :], axis=2) /  prob_sum # shape (N, M)  
         elif estim_type == 3: 
             prob_total       = self.softmax_with_threshold(prob_total**2, dim=2, T=0.05)  # shape (N, M, D), higher is more similar
+            disparity_index = np.arange(D, dtype=np.float32)
+            disparity_map   = np.sum(prob_total * disparity_index[np.newaxis, np.newaxis, :], axis=2) #/  prob_sum # shape (N, M)  
         elif estim_type == 4:            
             # "More advanced way is to create a disparity index np.arange(0,L) and compute the expected value of the disparity for each pixel, which can help reduce noise and provide a more robust estimate of the disparity. This can be done by multiplying the probability volume by the disparity index and summing over the disparity dimension, then normalizing by the sum of probabilities."
             disparity_index = np.arange(D, dtype=np.float32)
             prob_total      = prob_total**2
-            prob_sum        = np.sum(prob_total, axis=2) + 1e-6
-            disparity_map   = np.sum(prob_total * disparity_index[np.newaxis, np.newaxis, :], axis=2) /  prob_sum # shape (N, M)  
-        
+            prob_sum        = np.sum(prob_total, axis=2) + 1e-2
+            disparity_map   = np.sum(prob_total * disparity_index[np.newaxis, np.newaxis, :], axis=2) /  prob_sum
+            disparity_map[prob_sum < 0.1] = 0  # replace NaN values with 0
+            # shape (N, M)
+        elif estim_type == 5:
+            # Hard argmax with a local 3-tap parabola refinement around the peak only.
+            # estim_type 2-4 take a probability-weighted average over the *whole* disparity
+            # axis, which blends separate matching modes together - exactly what smears
+            # disparity across a depth edge, where the distribution is bimodal (one peak for
+            # the foreground, one for the background). Fitting a parabola through only the
+            # peak and its two immediate neighbors gives sub-pixel precision without ever
+            # mixing in a distant, unrelated mode.
+            d_peak      = np.argmax(prob_total, axis=2)              # (N, M)
+            border      = (d_peak == 0) | (d_peak == D - 1)
+            d_peak_c    = np.clip(d_peak, 1, D - 2)
+
+            p0 = np.take_along_axis(prob_total, (d_peak_c - 1)[:, :, np.newaxis], axis=2)[:, :, 0]
+            p1 = np.take_along_axis(prob_total,  d_peak_c[:, :, np.newaxis],      axis=2)[:, :, 0]
+            p2 = np.take_along_axis(prob_total, (d_peak_c + 1)[:, :, np.newaxis], axis=2)[:, :, 0]
+
+            denom           = p0 - 2 * p1 + p2
+            offset          = np.zeros_like(denom)
+            valid           = np.abs(denom) > 1e-6
+            offset[valid]   = 0.5 * (p0[valid] - p2[valid]) / denom[valid]
+            offset          = np.clip(offset, -0.5, 0.5)  # parabola fit is only trustworthy this close to the peak
+
+            disparity_map           = d_peak.astype(np.float32) + offset
+            disparity_map[border]   = d_peak[border].astype(np.float32)  # no margin to fit a parabola at the border
+
         return disparity_map
+
+    def disparity_peak_ambiguity(self, prob_volume, suppress_radius=2):
+        "Best-peak / second-peak ratio along the disparity axis. A pixel whose distribution has two comparably strong peaks (e.g. straddling a depth edge, where both the foreground and background match reasonably well) shows a ratio close to 1; an unambiguous match shows a ratio close to 0."
+        N, M, D     = prob_volume.shape
+        best_idx    = np.argmax(prob_volume, axis=2)                       # (N, M)
+        best_val    = np.max(prob_volume, axis=2)                          # (N, M)
+
+        d_range     = np.arange(D)[np.newaxis, np.newaxis, :]              # (1, 1, D)
+        near_peak   = np.abs(d_range - best_idx[:, :, np.newaxis]) <= suppress_radius
+        suppressed  = np.where(near_peak, -np.inf, prob_volume)
+        second_val  = np.max(suppressed, axis=2)
+        second_val[~np.isfinite(second_val)] = 0.0
+
+        ratio       = second_val / (best_val + 1e-6)                       # (N, M)
+        return ratio, best_val
+
+    #%% ------------------------------------------
+    # Upscaling
+
+    def upscale_img_array(self, low_res_array, img_ref, upscale_type = 1):
+        "Upscale the disparity map to the target shape using interpolation. This can be useful when the disparity map is computed at a lower resolution and needs to be upscaled to match the original image size."
+        log.debug(f'Upscaling disparity map from {low_res_array.shape} to {img_ref.shape}')
+        ndims = low_res_array.ndim
+        if ndims == 2:
+            low_res_array = low_res_array[:, :, np.newaxis]  # expand to 3d for broadcasting
+        nr_lr, nc_lr, nd_lr = low_res_array.shape
+        nr_hr, nc_hr        = img_ref.shape[:2]
+        scale_factor        = int(nc_hr/nr_lr)
+        nd_hr               = nd_lr * scale_factor
+        high_res_array      = np.zeros((nr_hr, nc_hr, nd_hr), dtype=low_res_array.dtype)
+
+        if upscale_type == 1:
+            for d in range(nd_lr):
+                high_res_array[:,:,d] = cv.resize(low_res_array[:,:,d], (nc_hr, nr_hr), interpolation=cv.INTER_LINEAR)
+        elif upscale_type == 2:
+            for d in range(nd_lr):
+                high_res_array[:,:,d] = cv.resize(low_res_array[:,:,d], (nc_hr, nr_hr), interpolation=cv.INTER_CUBIC)
+        elif upscale_type == 11:
+            for d in range(nd_lr):
+                high_res_array[:,:,d] = zoom(low_res_array[:,:,d], zoom=(scale_factor, scale_factor), order=1)
+        elif upscale_type == 12:
+                high_res_array = zoom(low_res_array, zoom=(scale_factor, scale_factor, scale_factor), order=1)                
+        elif upscale_type == 22:
+            guide_u8        = cv.normalize(img_ref, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+            for d in range(nd_lr):
+                baseline        = low_res_array[:,:,d]
+                src_u8          = cv.normalize(baseline, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+                # 4) Guided filter
+                context_guided  = cv.ximgproc.guidedFilter(
+                    guide=guide_u8,
+                    src=src_u8,
+                    radius=4,
+                    eps=25.0
+                    )
+                high_res_array[:,:,d] = context_guided.astype(high_res_array.dtype)
+
+        elif upscale_type == 23:
+            guide_u8        = cv.normalize(img_ref, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+            for d in range(nd_lr):
+                baseline        = low_res_array[:,:,d]
+                src_u8          = cv.normalize(baseline, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+                context_fgs = cv.ximgproc.fastGlobalSmootherFilter(
+                guide=guide_u8,
+                src=src_u8,
+                lambda_=12.0,
+                sigma_color=8.0
+                )
+                high_res_array[:,:,d] = context_fgs.astype(high_res_array.dtype)
+
+        if ndims == 2:
+            high_res_array = high_res_array.squeeze()
+        return high_res_array
+
+    #%% ------------------------------------------
 
     def gabor_image_disparity_multiscale(self, img_left, img_right, debug_row=None):
         "compute row-wise left/right gabor channel inner products and show MxM matrix"
@@ -1622,6 +2118,7 @@ class ShazamDepthEstimator:
 
         level_num               = 3
         max_disparity           = 128
+        debug_on                = False
         
         kernel_size             = 9
         row_num,col_num        = img_left.shape[:2]
@@ -1634,7 +2131,7 @@ class ShazamDepthEstimator:
         rot_left, rot_right     = np.pi/16*0, np.pi/10*0  # rotate left image Gabors slightly counterclockwise and right image Gabors slightly clockwise to better match floor pattern    
         #rot_left, rot_right   = 0, 0 
         thetas                  = [0.0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
-        lambdas                 = [8.0, 16.0, 32.0];  psis = [0.0, np.pi / 2];  ksize = 13; sigma  = 4.0;  gamma = 0.5
+        lambdas                 = [8.0, 16.0, 32.0];  psis = [0.0, np.pi / 2];  ksize = 9; sigma  = 4.0;  gamma = 0.5
         thetas_left             = [t + rot_left for t in thetas]  # rotate left image Gabors slightly counterclockwise
         thetas_right            = [t - rot_right for t in thetas]
         bank_left, p_left        = self.gabor_bank_init(ksize=ksize, sigma=sigma, lambdas=lambdas, gamma=gamma, psis=psis, thetas=thetas_left)
@@ -1654,7 +2151,11 @@ class ShazamDepthEstimator:
         distance_left            = self.gabor_dispartity(gabor_left, gabor_right, max_disparity=max_disparity) # shape (N, M, D)   
 
         # store the distance volume for the first level
-        prob_total[:,:,0,:]      = distance_left
+        #distance_left_filtered   = self.joint_bilateral_upsampling(distance_left, img_left_ref, spatial_sigma=3.0, range_sigma=7.1, radius=4)
+        #distance_left             = self.joint_bilateral_filtering(img_left, distance_left, spatial_sigma=3.0, range_sigma=5.1, radius=2, iter_num=3)
+        prob_total[:,:,0,:]       = distance_left
+
+        #distance_left_filtered   = self.anisotropic_filter_3d(distance_left, kappa = 0.1)  # shape (N, M, D)
 
         # downscale images
         img_left                = zoom(img_left,  zoom=0.5, order=1)
@@ -1671,7 +2172,12 @@ class ShazamDepthEstimator:
         distance_left            = self.gabor_dispartity(gabor_left, gabor_right, max_disparity=max_disparity//2) # shape (N, M, D)   
 
         # store the distance volume for the first level
-        prob_total[:,:,1,:]      = zoom(distance_left,  zoom=(2, 2, 2), order=1)     
+        #distance_left_filtered  = self.joint_bilateral_upsampling(distance_left, img_left_ref, spatial_sigma=3.0, range_sigma=7.1, radius=4)
+        #distance_left             = self.joint_bilateral_filtering(img_left, distance_left, spatial_sigma=3.0, range_sigma=5.1, radius=2, iter_num=3)
+        #prob_total[:,:,1,:]      = distance_left
+        prob_total[:,:,1,:]      = zoom(distance_left,  zoom=(2, 2, 2), order=1) 
+        #prob_total[:,:,1,:]      = np.roll(zoom(distance_left,  zoom=(2, 2, 2), order=1), shift=[ksize//2, -ksize//2], axis=[0,1])
+        #prob_total[:,:,1,:]      = zoom(distance_left_filtered,  zoom=(1, 1, 2), order=1)    
 
         # downscale images
         img_left                = zoom(img_left,  zoom=0.5, order=1)
@@ -1687,69 +2193,755 @@ class ShazamDepthEstimator:
         # 3d volume distance between left and right gabor responses across channels for each pixel and disparity. This can be used as a cost volume for stereo matching, where lower values indicate more similar responses and thus more likely matches.
         distance_left            = self.gabor_dispartity(gabor_left, gabor_right, max_disparity=max_disparity//4) # shape (N, M, D)   
 
+        # upsample
+        #distance_left_filtered  = self.joint_bilateral_upsampling(distance_left, img_left_ref, spatial_sigma=3.0, range_sigma=7.1, radius=4)
+
         # store the distance volume for the first level
-        prob_total[:,:,2,:]      = zoom(distance_left,  zoom=(4, 4, 4), order=1)     
+        #distance_left            = self.joint_bilateral_filtering(img_left, distance_left, spatial_sigma=3.0, range_sigma=5.1, radius=2, iter_num=3)
+        prob_total[:,:,2,:]      = zoom(distance_left,  zoom=(4, 4, 4), order=1)    
+        #prob_total[:,:,2,:]      = np.roll(zoom(distance_left,  zoom=(4, 4, 4), order=1), shift=[ksize,-ksize*3//2], axis=[0,1]) 
+        #prob_total[:,:,2,:]      = zoom(distance_left_filtered,  zoom=(1, 1, 4), order=1)      
 
-
-        img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(3)]
-        ttl_list                 = [f'Level {m} Probability Volume (row {debug_row})' for m in range(3)]
-        self.show_subset(img_list, ttl_list, col_num=1)
+        if debug_on:
+            img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(3)]
+            ttl_list                 = [f'Level {m} Probability Volume (row {debug_row})' for m in range(3)]
+            self.show_subset(img_list, ttl_list, col_num=1)
 
         # convert to probability using soft max over the disparity dimension, which can help normalize the scores and make them more interpretable as probabilities. The temperature parameter T can be tuned to control the sharpness of the distribution, with lower values leading to a more peaked distribution and higher values leading to a softer distribution.
-        prob_total               = self.softmax_with_threshold(-prob_total, dim=3, T=0.2) #T_weights[k])  # shape (N, M, D), higher is more similar
-        
-        img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(3)]
-        ttl_list                 = [f'Level {m} Probability Volume (row {debug_row})' for m in range(3)]
-        self.show_subset(img_list, ttl_list, col_num=1)
+        prob_total               = self.softmax_with_threshold(-prob_total, dim=3, T=0.05) #T_weights[k])  # shape (N, M, D), higher is more similar
 
-        img_list                 = [prob_total[debug_row+10,:,m,:].squeeze().T for m in range(3)]
-        ttl_list                 = [f'Level {m} Probability Volume (row {debug_row+10})' for m in range(3)]
-        self.show_subset(img_list, ttl_list, col_num=1)
+        if debug_on:        
+            #img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(3)]
+            img_list                 = [prob_total[:,debug_row,m,:].squeeze().T for m in range(3)]
+            ttl_list                 = [f'Level {m} Probability Volume (row {debug_row})' for m in range(3)]
+            self.show_subset(img_list, ttl_list, col_num=1)
 
-        img_list                 = [prob_total[debug_row-10,:,m,:].squeeze().T for m in range(3)]
-        ttl_list                 = [f'Level {m} Probability Volume (row {debug_row-10})' for m in range(3)]
-        self.show_subset(img_list, ttl_list, col_num=1)   
+            img_list                 = [prob_total[debug_row+15,:,m,:].squeeze().T for m in range(3)]
+            ttl_list                 = [f'Level {m} Probability Volume (row {debug_row+15})' for m in range(3)]
+            self.show_subset(img_list, ttl_list, col_num=1)
+
+            img_list                 = [prob_total[debug_row-15,:,m,:].squeeze().T for m in range(3)]
+            ttl_list                 = [f'Level {m} Probability Volume (row {debug_row-15})' for m in range(3)]
+            self.show_subset(img_list, ttl_list, col_num=1)   
 
         # collaps
-        prob_total_final         = np.sum(prob_total, axis=2).squeeze()  # weight by confidence, shape (N, M, D)     
+        prob_total_final         = np.sum(prob_total, axis=2).squeeze()  # weight by confidence, shape (N, M, D)   
+        #prob_total_final         = np.sum(prob_total / (np.sum(prob_total, axis=2, keepdims=True) + 0.01), axis=2).squeeze()
+        #prob_total_filter        = self.probability_bilateral_filtering(img_left_ref, prob_total_final, spatial_sigma=3.0, range_sigma=5.1, radius=3, iter_num=1) 
+        prob_total_filter        = self.joint_bilateral_filtering(img_left_ref, prob_total_final, spatial_sigma=3.0, range_sigma=5.1, radius=2, iter_num=4) 
+        
 
         # do some filtering on the final probability volume to smooth out noise and improve the disparity estimation. This can be done using a Gaussian filter, a median filter, or an anisotropic diffusion filter, depending on the characteristics of the data and the desired level of smoothing. The goal is to reduce spurious peaks in the probability distribution while preserving important features such as edges and texture.
-        #prob_total_filter         = self.adaptive_filter_3d(prob_total_final, kernel_size = 5, kappa = 0.1)  # shape (N, M, D)
+        #prob_total_filter         = self.adaptive_filter_3d_fast(prob_total_final, kernel_size = 15, kappa = 0.1)  # shape (N, M, D)
         #prob_total_filter         = self.anisotropic_filter_avergaing(prob_total_final, img_left_ref)  # shape (N, M, D)
-        prob_total_filter        = prob_total_final
+        #prob_total_filter        = self.joint_bilateral_upsampling(prob_total_final, img_left_ref, spatial_sigma=3.0, range_sigma=7.1, radius=4)
+        # prob_total_filter        = prob_total_final.copy()
+        # for i in range(8):
+        #     prob_total_filter    = self.joint_bilateral_filtering(img_left_ref, prob_total_filter, spatial_sigma=3.0, range_sigma=5.1, radius=3)
+        #prob_total_filter        = self.joint_bilateral_filtering(img_left_ref, prob_total_final, spatial_sigma=3.0, range_sigma=5.1, radius=3, iter_num=8) 
+
+        if debug_on:
+            img_list                 = [prob_total_final[debug_row,:,:].squeeze().T , prob_total_filter[debug_row,:,:].squeeze().T]
+            ttl_list                 = [f'Final Probability Volume (row {debug_row})', f'Filtered Final Probability Volume (row {debug_row})']
+            self.show_subset(img_list, ttl_list, col_num=1)        
+
+        disp_index               = self.estimate_disparity_from_prob(prob_total_filter, estim_type = 4) # ensure values are within the valid range
+        disp_confidence          = np.max(prob_total_filter, axis=2)  # shape (N, M)
+        disp_index[disp_confidence < 0.1]   = 0  # mask out low confidence areas
+
+        # disp_confidence_filter    = disp_confidence.copy()
+        # for i in range(8):
+        #     disp_confidence_filter    = self.joint_bilateral_filtering(img_left_ref, disp_confidence_filter, spatial_sigma=3.0, range_sigma=5.1, radius=2)
+        disp_confidence_filter    = self.joint_bilateral_filtering(img_left_ref, disp_confidence, spatial_sigma=3.0, range_sigma=5.1, radius=2, iter_num=4)
+
+
+        if debug_on:
+            img_list                 = [img_left_ref, disp_index , disp_confidence, disp_confidence_filter]
+            ttl_list                 = ['Left Image', 'Estimated Disparity Map', 'Estimated Disparity Confidence Map','Filtered Confidence Map']
+            self.show_subset(img_list, ttl_list, col_num=2) 
+
+        # if debug and row_index is not None:
+        #     self.debug_gabor_image_disparity_multiscale(debug_levels, prob_total, row_index=row_index)
+
+        #plt.show()
+        return prob_total    
+
+    #%% -----------------------------------------
+    # Pixel disparity
+
+    def pixel_two_image_disparity(self, img_left, img_right, spatial_sigma=3.0, range_sigma=0.1, radius=2):
+        # =====================================================================
+        # 1. High-Performance NumPy JBU Implementation
+        # =====================================================================
+        # if img_left.ndim == 2:
+        #     img_left = img_left[..., np.newaxis]
+        # if img_right.ndim == 2:
+        #     img_right = img_right[..., np.newaxis]
+            
+        H_lr, W_lr          = img_left.shape
+        H_hr, W_hr          = img_right.shape
+
+        lr_diff             = np.abs(img_left - img_right)
+
+        
+        # Precompute spatial Gaussian weights
+        y_coords, x_coords  = np.mgrid[-radius:radius+1, -radius:radius+1]
+        spatial_dist_sq     = y_coords**2 + x_coords**2
+        spatial_weights     = np.exp(-spatial_dist_sq / (2 * spatial_sigma**2))
+        
+        upsampled           = np.zeros_like(img_left, dtype=np.float32) #if C_lr == C_hr else np.zeros((H_hr, W_hr, C_lr), dtype=np.float32)
+        norm_factor         = np.ones_like(img_left, dtype=np.float32)
+        #hr_y, hr_x     = np.meshgrid(np.arange(H_hr), np.arange(W_hr), indexing='ij')
+        y_index             = np.arange(radius, H_hr - radius - 1).reshape(-1, 1)
+        x_index             = np.arange(radius, W_hr - radius - 1).reshape(1, -1)
+        
+        # Neighborhood match loop
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                s_w             = spatial_weights[dy + radius, dx + radius]
+                if s_w < 1e-4:
+                    continue
+
+                #lr_val          = np.abs(img_left[y_index, x_index] - img_right[y_index + dy, x_index + dx])
+                lr_val          = lr_diff[y_index + dy, x_index + dx]
+                guide_diff      = img_left[y_index, x_index] - img_left[y_index + dy, x_index + dx]
+                range_weights   = np.exp(-guide_diff**2 / (2 * range_sigma**2))
+                
+                #weight          = s_w * range_weights
+                #upsampled[y_index, x_index]      += weight #lr_val * weight
+                #norm_factor    += weight
+
+                weight                            = s_w * range_weights
+                upsampled[y_index, x_index]      += lr_val * weight
+                norm_factor[y_index, x_index]    += weight                
+                
+        upsampled /= (norm_factor + 1e-8)
+        return np.squeeze(upsampled)  
+
+    def pixel_image_disparity(self, img_left, img_right, max_disparity = 64):
+        "left and right pixel matcjing with bilateral filtering"
+
+        log.debug(f'Calculating disparity difference with max_disparity {max_disparity}')
+        h, w             = img_right.shape[:2]
+        diff_array       = np.full((h, w, max_disparity), 0, dtype=np.float32)
+        img_left, img_right = img_left.astype(np.float32), img_right.astype(np.float32)
+        
+        for shift in range(max_disparity):
+            img_pixel_match = self.pixel_two_image_disparity(img_left[:, shift:], img_right[:, :w - shift], spatial_sigma=3.0, range_sigma=7.1, radius=4)
+            diff_array[:, shift:, shift] = img_pixel_match
+
+        log.debug('Done')
+        return diff_array        
+
+    #%% -----------------------------------------
+    # Multiscale disparity
+
+    def multiscale_disparity(self, img_left, img_right, debug_row=None):
+        "compute row-wise left/right gabor channel inner products and show MxM matrix"
+
+        row_index               = debug_row if debug_row is not None else 400
+        debug_on                = debug_row is not None
+
+        level_num               = 4
+        max_disparity           = 64
+        
+        row_num,col_num        = img_left.shape[:2]
+        T_weights               = [0.05, 0.1, 0.2]  # example weights for each level, should sum to 1
+
+        img_left, img_right     = img_left.astype(np.float32), img_right.astype(np.float32)
+        img_left_ref            = img_left.copy()
+
+        # Gabor bank parameters.
+        rot_left, rot_right     = np.pi/16*0, np.pi/10*0  # rotate left image Gabors slightly counterclockwise and right image Gabors slightly clockwise to better match floor pattern    
+        #rot_left, rot_right   = 0, 0 
+        thetas                  = [0.0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
+        lambdas                 = [8.0, 16.0, 32.0];  psis = [0.0, np.pi / 2];  ksize = 7; sigma  = 3.0;  gamma = 0.5
+        thetas_left             = [t + rot_left for t in thetas]  # rotate left image Gabors slightly counterclockwise
+        thetas_right            = [t - rot_right for t in thetas]
+        bank_left, p_left        = self.gabor_bank_init(ksize=ksize, sigma=sigma, lambdas=lambdas, gamma=gamma, psis=psis, thetas=thetas_left)
+        bank_right, p_right      = self.gabor_bank_init(ksize=ksize, sigma=sigma, lambdas=lambdas, gamma=gamma, psis=psis, thetas=thetas_right)         
+
+        distance_total           = np.zeros((row_num, col_num ,level_num, max_disparity), dtype=np.float32)
+
+        # calculate simple features
+        feature_left            = self.pixel_features(img_left)  # shape (N, M, C)
+        feature_right           = self.pixel_features(img_right) # shape (N, M, C)
+
+        # normalize the responses across channels for each pixel to have zero mean but not variance. 
+        feature_left             = self.gabor_normalize_responses(feature_left)
+        feature_right            = self.gabor_normalize_responses(feature_right)         
+
+        # only pixels in the valid range are considered for disparity estimation, 
+        distance_left            = self.gabor_dispartity(feature_left, feature_right, max_disparity=max_disparity) # shape (N, M, D) 
+        distance_total[:,:,0,:]      = distance_left
+
+        for level in range(1, level_num):
+
+            # scale factor
+            scale_factor             = 2**(level-1)
+        
+            # processing one by one
+            gabor_left               = self.gabor_bank_filter(img_left, bank=bank_left)
+            gabor_right              = self.gabor_bank_filter(img_right, bank=bank_right) 
+
+            # normalize the responses across channels for each pixel to have zero mean but not variance. 
+            gabor_left               = self.gabor_normalize_responses(gabor_left)
+            gabor_right              = self.gabor_normalize_responses(gabor_right)        
+
+            # 3d volume distance between left and right gabor responses across channels for each pixel and disparity. This can be used as a cost volume for stereo matching, where lower values indicate more similar responses and thus more likely matches.
+            distance_left            = self.gabor_dispartity(gabor_left, gabor_right, max_disparity=max_disparity//scale_factor) # shape (N, M, D)   
+
+            # filter
+            #distance_left           = self.anisotropic_filter_with_edges(distance_left, img_left, num_iter=8)
+            #distance_left           = self.inverse_filter_with_edges(distance_left, img_left)
+            #distance_left_interpolated   = self.joint_bilateral_upsampling(distance_left, img_left_ref, spatial_sigma=3.0, range_sigma=0.1, radius=7)
+            #distance_left_interpolated   = zoom(distance_left_interpolated,zoom=(1,1,scale_factor))
+
+            # interpolate to original 
+            #cv2.resize(low_res_feat, (img_left_ref.shape[1], img_left_ref.shape[0]), interpolation=cv2.INTER_NEAREST)
+            distance_left_interpolated    = zoom(distance_left,  zoom=(scale_factor, scale_factor, scale_factor), order=1)  
+            distance_total[:,:,level,:]   = distance_left_interpolated
+
+            # filter
+            distance_total[:,:,level,:]   = self.anisotropic_filter_with_edges(distance_total[:,:,level,:], img_left_ref, num_iter=8)
+            #distance_total[:,:,level,:]    = cv.ximgproc.guidedFilter( guide=img_left_ref, src=distance_total[:,:,level,:],  radius=8,  eps=1e-3 )  
+
+            # # Edge-preserving sharpening
+            # bilateral                   = cv.bilateralFilter(img, d=9, sigmaColor=75, sigmaSpace=75)
+            # edge_mask                   = cv.subtract(img, bilateral)
+            # sharpened_robust            = cv.add(img, cv.multiply(edge_mask, 1.5))        
+
+            # downscale images
+            img_left                = zoom(img_left,  zoom=0.5, order=1)
+            img_right               = zoom(img_right, zoom=0.5, order=1) 
+
+    
+        # show the difference data
+        if debug_on:
+            img_list                 = [distance_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+            ttl_list                 = [f'Level {m} Distance Volume (row {debug_row})' for m in range(level_num)]
+            self.show_subset(img_list, ttl_list, col_num=2)
+
+        # convert to probability using soft max over the disparity dimension, which can help normalize the scores and make them more interpretable as probabilities. The temperature parameter T can be tuned to control the sharpness of the distribution, with lower values leading to a more peaked distribution and higher values leading to a softer distribution.
+        prob_total               = self.softmax_with_threshold(-distance_total, dim=3, T=0.1, x_thr=-1) #T_weights[k])  # shape (N, M, D), higher is more similar
+
+        if debug_on:        
+            #img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(3)]
+            img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+            ttl_list                 = [f'Level {m} Probability Volume (row {debug_row})' for m in range(level_num )]
+            self.show_subset(img_list, ttl_list, col_num=2)
+
+        # do edge filtering
+        prob_filtered              = prob_total.copy()
+        # for m in range(level_num):
+        #     prob_filtered[:,:,m,:]  = self.anisotropic_filter_with_edges(prob_total[:,:,m,:], img_left_ref, num_iter = 8)
+
+        if debug_on:
+            img_list                 = [prob_filtered[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+            ttl_list                 = [f'Level {m} Probability Filtered (row {debug_row})' for m in range(level_num )]
+            self.show_subset(img_list, ttl_list, col_num=2)            
+
+
+        # collaps
+        #prob_total_final         = np.sum(prob_filtered, axis=2).squeeze()/2  # weight by confidence, shape (N, M, D)   
+        prob_total_final         = prob_filtered[:,:,0,:] 
+        for m in range(1,level_num):
+            prob_total_final      = prob_total_final + (1-prob_total_final) * prob_filtered[:,:,m,:]
+        # prob_total_final         = prob_total_final + (1-prob_total_final) * prob_filtered[:,:,2,:]
+        # prob_total_final         = prob_total_final + (1-prob_total_final) * prob_filtered[:,:,3,:]
+        # prob_total_final         = np.clip(prob_total_final.squeeze(), 0, 1)
+        #prob_total_final         = np.sum(prob_total / (np.sum(prob_total, axis=2, keepdims=True) + 0.01), axis=2).squeeze()
+        #prob_total_filter        = self.probability_bilateral_filtering(img_left_ref, prob_total_final, spatial_sigma=3.0, range_sigma=5.1, radius=3, iter_num=1) 
+        
+        #prob_total_filter        = self.joint_bilateral_filtering(img_left_ref, prob_total_final, spatial_sigma=3.0, range_sigma=5.1, radius=5, iter_num=4) 
+        #prob_total_filter        = self.anisotropic_filter_with_edges(prob_total_final, img_left_ref, num_iter = 8)
+        prob_total_filter         = prob_total_final
+
+        # compute edges
+        #img_edges                = self.compute_edges(img_left_ref)
+
+        # do some filtering on the final probability volume to smooth out noise and improve the disparity estimation. This can be done using a Gaussian filter, a median filter, or an anisotropic diffusion filter, depending on the characteristics of the data and the desired level of smoothing. The goal is to reduce spurious peaks in the probability distribution while preserving important features such as edges and texture.
+        #prob_total_filter         = self.adaptive_filter_3d_fast(prob_total_final, kernel_size = 15, kappa = 0.1)  # shape (N, M, D)
+        #prob_total_filter         = self.anisotropic_filter_avergaing(prob_total_final, img_left_ref)  # shape (N, M, D)
+        #prob_total_filter        = self.joint_bilateral_upsampling(prob_total_final, img_left_ref, spatial_sigma=3.0, range_sigma=7.1, radius=4)
+        # prob_total_filter        = prob_total_final.copy()
+        # for i in range(8):
+        #     prob_total_filter    = self.joint_bilateral_filtering(img_left_ref, prob_total_filter, spatial_sigma=3.0, range_sigma=5.1, radius=3)
+        #prob_total_filter        = self.joint_bilateral_filtering(img_left_ref, prob_total_final, spatial_sigma=3.0, range_sigma=5.1, radius=3, iter_num=8) 
+
+        if debug_on:
+            img_list                 = [prob_total_final[debug_row,:,:].squeeze().T , prob_total_filter[debug_row,:,:].squeeze().T]
+            ttl_list                 = [f'Final Probability Volume (row {debug_row})', f'Filtered Final Probability Volume (row {debug_row})']
+            self.show_subset(img_list, ttl_list, col_num=1)        
+
+        disp_index               = self.estimate_disparity_from_prob(prob_total_filter, estim_type = 4) # ensure values are within the valid range
+        disp_confidence          = np.max(prob_total_filter, axis=2)  # shape (N, M)
+        disp_index[disp_confidence < 0.1]   = 0  # mask out low confidence areas
+
+        # disp_confidence_filter    = disp_confidence.copy()
+        # for i in range(8):
+        #     disp_confidence_filter    = self.joint_bilateral_filtering(img_left_ref, disp_confidence_filter, spatial_sigma=3.0, range_sigma=5.1, radius=2)
+        # disp_confidence_filter   = self.joint_bilateral_filtering(img_left_ref, disp_confidence, spatial_sigma=3.0, range_sigma=5.1, radius=2, iter_num=4)
+
+        # img_list                 = [img_left_ref, disp_index , disp_confidence, disp_confidence_filter]
+        # ttl_list                 = ['Left Image', 'Estimated Disparity Map', 'Estimated Disparity Confidence Map','Filtered Confidence Map']
+        # self.show_subset(img_list, ttl_list, col_num=2) 
+
+        if debug_on:
+            img_list                 = [img_left_ref, disp_index , disp_confidence]
+            ttl_list                 = ['Left Image', 'Estimated Disparity Map', 'Estimated Confidence Map']
+            self.show_subset(img_list, ttl_list, col_num=1)         
+
+        # if debug and row_index is not None:
+        #     self.debug_gabor_image_disparity_multiscale(debug_levels, prob_total, row_index=row_index)
+
+        #plt.show(block=False)
+        return disp_index    
+
+    def multiscale_disparity_pixel_features(self, img_left, img_right, debug_row=None):
+        "compute row-wise left/right pixel features disparity"
+        row_index               = debug_row if debug_row is not None else 400
+        debug                   = debug_row is not None
+
+        feature_types           = ['center','left','right','up','down','center_big']
+        level_num               = len(feature_types)
+        max_disparity           = 64
+        row_num,col_num        = img_left.shape[:2]
+
+
+        img_left, img_right     = img_left.astype(np.float32), img_right.astype(np.float32)
+        img_left_ref            = img_left.copy()
+
+        distance_total           = np.zeros((row_num, col_num ,level_num, max_disparity), dtype=np.float32)
+
+
+        for level in range(0, level_num):
+
+            # scale factor
+            feature_type             = feature_types[level]
+        
+            # calculate simple features
+            feature_left            = self.pixel_features(img_left, feat_type=feature_type)  # shape (N, M, C)
+            feature_right           = self.pixel_features(img_right, feat_type=feature_type) # shape (N, M, C)
+
+            # normalize the responses across channels for each pixel to have zero mean but not variance. 
+            feature_left             = self.gabor_normalize_responses(feature_left)
+            feature_right            = self.gabor_normalize_responses(feature_right)        
+
+            # 3d volume distance between left and right gabor responses across channels for each pixel and disparity. This can be used as a cost volume for stereo matching, where lower values indicate more similar responses and thus more likely matches.
+            distance_left            = self.gabor_dispartity(feature_left, feature_right, max_disparity=max_disparity) # shape (N, M, D)   
+
+            # filter
+            #distance_left            = self.anisotropic_filter_with_edges(distance_left, img_left_ref, num_iter=8)
+            #distance_left            = self.joint_bilateral_filtering(img_left_ref, distance_left, spatial_sigma=3.0, range_sigma=4.1, radius=3, iter_num=3) 
+
+            # interpolate to original   
+            distance_total[:,:,level,:]   = distance_left
+
+
+        # show the difference data
+        img_list                 = [distance_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+        ttl_list                 = [f'Level {m} Distance Volume (row {debug_row})' for m in range(level_num)]
+        self.show_subset(img_list, ttl_list, col_num=2)
+
+        # convert to probability using soft max over the disparity dimension, which can help normalize the scores and make them more interpretable as probabilities. The temperature parameter T can be tuned to control the sharpness of the distribution, with lower values leading to a more peaked distribution and higher values leading to a softer distribution.
+        prob_total               = self.softmax_with_threshold(-distance_total, dim=3, T=0.1, x_thr=-1) #T_weights[k])  # shape (N, M, D), higher is more similar
+        
+        #img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(3)]
+        img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+        ttl_list                 = [f'Level {m} Probability Volume (row {debug_row})' for m in range(level_num )]
+        self.show_subset(img_list, ttl_list, col_num=2)
+
+        # do edge filtering
+        prob_filtered              = prob_total.copy()
+        for m in range(level_num):
+            prob_filtered[:,:,m,:]  = self.anisotropic_filter_with_edges(prob_total[:,:,m,:], img_left_ref, num_iter = 4)
+
+        img_list                 = [prob_filtered[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+        ttl_list                 = [f'Level {m} Probability Filtered (row {debug_row})' for m in range(level_num )]
+        self.show_subset(img_list, ttl_list, col_num=2)            
+
+
+        # collaps
+        prob_total_final         = np.mean(prob_filtered, axis=2).squeeze()  # weight by confidence, shape (N, M, D)   
+        # prob_total_final         = prob_filtered[:,:,0,:] 
+        # prob_total_final         = prob_total_final + (1-prob_total_final) * prob_filtered[:,:,1,:]
+        # prob_total_final         = prob_total_final + (1-prob_total_final) * prob_filtered[:,:,2,:]
+        # prob_total_final         = prob_total_final + (1-prob_total_final) * prob_filtered[:,:,3,:]
+        # prob_total_final         = np.clip(prob_total_final.squeeze(), 0, 1)
+        #prob_total_final         = np.sum(prob_total / (np.sum(prob_total, axis=2, keepdims=True) + 0.01), axis=2).squeeze()
+        #prob_total_filter        = self.probability_bilateral_filtering(img_left_ref, prob_total_final, spatial_sigma=3.0, range_sigma=5.1, radius=3, iter_num=1) 
+        #prob_total_filter        = self.joint_bilateral_filtering(img_left_ref, prob_total_final, spatial_sigma=3.0, range_sigma=5.1, radius=2, iter_num=8) 
+        prob_total_filter        = prob_total_final #self.anisotropic_filter_with_edges(prob_total_final, img_left_ref, num_iter = 8)
+
+        # compute edges
+        #img_edges                = self.compute_edges(img_left_ref)
+
+        # do some filtering on the final probability volume to smooth out noise and improve the disparity estimation. This can be done using a Gaussian filter, a median filter, or an anisotropic diffusion filter, depending on the characteristics of the data and the desired level of smoothing. The goal is to reduce spurious peaks in the probability distribution while preserving important features such as edges and texture.
+        #prob_total_filter         = self.adaptive_filter_3d_fast(prob_total_final, kernel_size = 15, kappa = 0.1)  # shape (N, M, D)
+        #prob_total_filter         = self.anisotropic_filter_avergaing(prob_total_final, img_left_ref)  # shape (N, M, D)
+        #prob_total_filter        = self.joint_bilateral_upsampling(prob_total_final, img_left_ref, spatial_sigma=3.0, range_sigma=7.1, radius=4)
+        # prob_total_filter        = prob_total_final.copy()
+        # for i in range(8):
+        #     prob_total_filter    = self.joint_bilateral_filtering(img_left_ref, prob_total_filter, spatial_sigma=3.0, range_sigma=5.1, radius=3)
+        #prob_total_filter        = self.joint_bilateral_filtering(img_left_ref, prob_total_final, spatial_sigma=3.0, range_sigma=5.1, radius=3, iter_num=8) 
 
         img_list                 = [prob_total_final[debug_row,:,:].squeeze().T , prob_total_filter[debug_row,:,:].squeeze().T]
         ttl_list                 = [f'Final Probability Volume (row {debug_row})', f'Filtered Final Probability Volume (row {debug_row})']
         self.show_subset(img_list, ttl_list, col_num=1)        
 
-        disp_index               = self.estimate_disparity_from_prob(prob_total_filter, estim_type = 1) # ensure values are within the valid range
-        disp_confidence           = np.max(prob_total_filter, axis=2)  # shape (N, M) 
-        disp_index[disp_confidence < 0.1]   = 0  # mask out low confidence areas      
+        disp_index               = self.estimate_disparity_from_prob(prob_total_filter, estim_type = 2) # ensure values are within the valid range
+        disp_confidence          = np.max(prob_total_filter, axis=2)  # shape (N, M)
+        disp_index[disp_confidence < 0.1]   = 0  # mask out low confidence areas
 
+        # disp_confidence_filter    = disp_confidence.copy()
+        # for i in range(8):
+        #     disp_confidence_filter    = self.joint_bilateral_filtering(img_left_ref, disp_confidence_filter, spatial_sigma=3.0, range_sigma=5.1, radius=2)
+        #disp_confidence_filter   = self.joint_bilateral_filtering(img_left_ref, disp_confidence, spatial_sigma=3.0, range_sigma=5.1, radius=2, iter_num=4)
 
-        plt.figure(figsize=(12, 6)) 
-        plt.imshow(disp_index, cmap='viridis')
-        plt.colorbar(label='Disparity Index')
-        plt.title('Estimated Disparity Map (argmax of probability volume)')
-        plt.xlabel('Column')
-        plt.ylabel('Row')
-        plt.show(block=False)
-
-        plt.figure(figsize=(12, 6)) 
-        plt.imshow(disp_confidence, cmap='viridis')
-        plt.colorbar(label='Disparity Confidence')
-        plt.title('Estimated Disparity Confidence Map (max of probability volume)')
-        plt.xlabel('Column')
-        plt.ylabel('Row')
-        plt.show(block=False)        
+        img_list                 = [img_left_ref, disp_index , disp_confidence, disp_confidence]
+        ttl_list                 = ['Left Image', 'Estimated Disparity Map', 'Estimated Disparity Confidence Map','Filtered Confidence Map']
+        self.show_subset(img_list, ttl_list, col_num=2) 
 
         # if debug and row_index is not None:
         #     self.debug_gabor_image_disparity_multiscale(debug_levels, prob_total, row_index=row_index)
 
         plt.show()
-        return disp_index    
+        return prob_total    
 
+    def multiscale_disparity_with_energy(self, img_left, img_right, debug_row=None):
+        "compute row-wise left/right gabor channel inner products and show MxM matrix"
 
+        from scipy.ndimage import correlate1d
+        #kernel                  = np.array([0.1, 0.2, 0.4, 0.2, 0.1])  # must sum to 1 for smoothing
+        kernel                  = np.array([0.2, 0.6, 0.2]) 
+
+        row_index               = debug_row if debug_row is not None else 400
+        debug                   = debug_row is not None
+
+        level_num               = 4
+        max_disparity           = 128
+        
+        row_num,col_num        = img_left.shape[:2]
+        T_weights               = [0.05, 0.1, 0.2]  # example weights for each level, should sum to 1
+
+        img_left, img_right     = img_left.astype(np.float32), img_right.astype(np.float32)
+        img_left_ref            = img_left.copy()
+
+        # Gabor bank parameters.
+        rot_left, rot_right     = np.pi/16*0, np.pi/10*0  # rotate left image Gabors slightly counterclockwise and right image Gabors slightly clockwise to better match floor pattern    
+        #rot_left, rot_right   = 0, 0 
+        thetas                  = [0.0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
+        lambdas                 = [8.0, 16.0, 32.0];  psis = [0.0, np.pi / 2];  ksize = 7; sigma  = 3.0;  gamma = 0.5
+        thetas_left             = [t + rot_left for t in thetas]  # rotate left image Gabors slightly counterclockwise
+        thetas_right            = [t - rot_right for t in thetas]
+        bank_left, p_left        = self.gabor_bank_init(ksize=ksize, sigma=sigma, lambdas=lambdas, gamma=gamma, psis=psis, thetas=thetas_left)
+        bank_right, p_right      = self.gabor_bank_init(ksize=ksize, sigma=sigma, lambdas=lambdas, gamma=gamma, psis=psis, thetas=thetas_right)         
+
+        distance_total           = np.zeros((row_num, col_num ,level_num, max_disparity), dtype=np.float32)
+        energy_total             = np.zeros((row_num, col_num ,level_num), dtype=np.float32)
+
+        # # calculate simple features
+        # feature_left            = self.pixel_features(img_left)  # shape (N, M, C)
+        # feature_right           = self.pixel_features(img_right) # shape (N, M, C)
+
+        # # normalize the responses across channels for each pixel to have zero mean but not variance. 
+        # feature_left,  energy_left            = self.gabor_normalize_responses_with_energy(feature_left)
+        # feature_right, energy_right           = self.gabor_normalize_responses_with_energy(feature_right)         
+
+        # # only pixels in the valid range are considered for disparity estimation, 
+        # distance_left                = self.gabor_dispartity(feature_left, feature_right, max_disparity=max_disparity) # shape (N, M, D) 
+        # distance_total[:,:,0,:]      = distance_left
+        # energy_total[:,:,0]          = energy_left
+
+        # # upscale images
+        # img_left                = zoom(img_left,  zoom=2, order=1)
+        # img_right               = zoom(img_right, zoom=2, order=1) 
+
+        for level in range(0, level_num):
+
+            # scale factor
+            scale_factor             = 2**(level-0)
+        
+            # processing one by one
+            gabor_left               = self.gabor_bank_filter(img_left, bank=bank_left)
+            gabor_right              = self.gabor_bank_filter(img_right, bank=bank_right) 
+
+            # normalize the responses across channels for each pixel to have zero mean but not variance. 
+            gabor_left,  energy_left    = self.gabor_normalize_responses_with_energy(gabor_left)
+            gabor_right, energy_right   = self.gabor_normalize_responses_with_energy(gabor_right)        
+
+            # 3d volume distance between left and right gabor responses across channels for each pixel and disparity. This can be used as a cost volume for stereo matching, where lower values indicate more similar responses and thus more likely matches.
+            distance_left            = self.gabor_dispartity(gabor_left, gabor_right, max_disparity=max_disparity//scale_factor) # shape (N, M, D)   
+
+            # filter
+            #distance_left           = self.anisotropic_filter_with_edges(distance_left, img_left, num_iter=8)
+            #distance_left           = self.inverse_filter_with_edges(distance_left, img_left)
+            #distance_left_interpolated   = self.joint_bilateral_upsampling(distance_left, img_left_ref, spatial_sigma=3.0, range_sigma=0.1, radius=7)
+            #distance_left_interpolated   = zoom(distance_left_interpolated,zoom=(1,1,scale_factor))
+
+            # interpolate to original 
+            #cv2.resize(low_res_feat, (img_left_ref.shape[1], img_left_ref.shape[0]), interpolation=cv2.INTER_NEAREST)
+            distance_total[:,:,level,:]   = zoom(distance_left,  zoom=(scale_factor, scale_factor, scale_factor), order=1)  
+            energy_total[:,:,level]       = zoom(energy_left,    zoom=(scale_factor, scale_factor), order=1) 
+            #energy_total[:,:,level]       = cv.resize(energy_left, (img_left_ref.shape[1], img_left_ref.shape[0]), interpolation=cv.INTER_LINEAR)             
+
+            # compensate
+            distance_total[:,:,level,:]   = np.roll(distance_total[:,:,level,:],axis=2,shift=-level)
+
+            # # smoooth
+            # for s in range(level):
+            #     distance_total[:,:,level,:]   = correlate1d(distance_total[:,:,level,:], kernel, axis=2, mode='nearest')
+
+            #distance_total[:,:,level,:]   = self.upscale_img_array(distance_left, img_left_ref, upscale_type = 2)
+            #energy_total[:,:,level]       = self.upscale_img_array(energy_left, img_left_ref, upscale_type = 2)
+            # filter
+            #distance_total[:,:,level,:]   = self.anisotropic_filter_with_edges(distance_total[:,:,level,:], img_left_ref, num_iter=8)
+            #distance_total[:,:,level,:]    = cv.ximgproc.guidedFilter( guide=img_left_ref, src=distance_total[:,:,level,:],  radius=8,  eps=1e-3 )  
+
+            # # Edge-preserving sharpening
+            # bilateral                   = cv.bilateralFilter(img, d=9, sigmaColor=75, sigmaSpace=75)
+            # edge_mask                   = cv.subtract(img, bilateral)
+            # sharpened_robust            = cv.add(img, cv.multiply(edge_mask, 1.5))        
+
+            # downscale images
+            img_left                = zoom(img_left,  zoom=0.5, order=1)
+            img_right               = zoom(img_right, zoom=0.5, order=1) 
+
+    
+        # show the difference data
+        img_list                 = [distance_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+        ttl_list                 = [f'Level {m} Distance Volume (row {debug_row})' for m in range(level_num)]
+        self.show_subset(img_list, ttl_list, col_num=2)
+
+        # show the energy data
+        img_list                 = [energy_total[:,:,m] for m in range(level_num)]
+        ttl_list                 = [f'Level {m} Energy Features (row {debug_row})' for m in range(level_num)]
+        self.show_subset(img_list, ttl_list, col_num=2)        
+
+        # convert to probability using soft max over the disparity dimension, which can help normalize the scores and make them more interpretable as probabilities. The temperature parameter T can be tuned to control the sharpness of the distribution, with lower values leading to a more peaked distribution and higher values leading to a softer distribution.
+        prob_total               = self.softmax_with_threshold(-distance_total, dim=3, T=0.1, x_thr=-3) #T_weights[k])  # shape (N, M, D), higher is more similar
+        
+        #img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(3)]
+        img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+        ttl_list                 = [f'Level {m} Probability Volume (row {debug_row})' for m in range(level_num )]
+        self.show_subset(img_list, ttl_list, col_num=2)
+
+        # debug_row               += 1
+        # img_list                 = [prob_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+        # ttl_list                 = [f'Level {m} Probability Volume (row {debug_row})' for m in range(level_num )]
+        # self.show_subset(img_list, ttl_list, col_num=2)      
+
+        prob_energy              = energy_total[:,:,:]
+        prob_energy              = prob_energy/(np.sum(prob_energy, axis=2, keepdims=True) + 1e-1)
+
+        img_list                 = [prob_energy[:,:,m] for m in range(level_num)]
+        ttl_list                 = [f'Level {m} Probability Energy (row {debug_row})' for m in range(level_num )]
+        self.show_subset(img_list, ttl_list, col_num=2)         
+
+        # do edge filtering
+        prob_filtered              = prob_total.copy()#*prob_energy[:,:,:,np.newaxis]
+        # for m in range(level_num):
+        #     prob_filtered[:,:,m,:]  = self.anisotropic_filter_with_edges(prob_total[:,:,m,:], img_left_ref, num_iter = 8)
+
+        img_list                 = [prob_filtered[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+        ttl_list                 = [f'Level {m} Probability Filtered (row {debug_row})' for m in range(level_num )]
+        self.show_subset(img_list, ttl_list, col_num=2)            
+
+  
+
+        # collaps
+        #prob_total_final         = np.sum(prob_filtered, axis=2).squeeze()/2  # weight by confidence, shape (N, M, D)   
+        prob_total_final         = prob_filtered[:,:,0,:] 
+        for m in range(1,level_num):
+            #prob_total_final      = prob_total_final + (1-prob_total_final) * prob_filtered[:,:,m,:]
+            prob_max              = np.max(prob_total_final,axis=2)[:,:,np.newaxis]
+            prob_total_final      = prob_total_final + (1-prob_max) * prob_filtered[:,:,m,:]
+
+        # prob_total_final         = np.clip(prob_total_final.squeeze(), 0, 1)
+        #prob_total_final         = np.sum(prob_total / (np.sum(prob_total, axis=2, keepdims=True) + 0.01), axis=2).squeeze()
+        #prob_total_filter        = self.probability_bilateral_filtering(img_left_ref, prob_total_final, spatial_sigma=3.0, range_sigma=5.1, radius=3, iter_num=1) 
+        
+        #prob_total_filter        = self.joint_bilateral_filtering(img_left_ref, prob_total_final, spatial_sigma=3.0, range_sigma=5.1, radius=5, iter_num=4) 
+        #prob_total_filter        = self.anisotropic_filter_with_edges(prob_total_final, img_left_ref, num_iter = 8)
+        prob_total_filter         = prob_total_final
+        #prob_total_filter         = self.softmax_local_maxima(prob_total_final, kernel_size=7, T=0.1, x_thr=-1) #T_weights[k])  # shape (N, M, D), higher is more similar
+   
+
+        # compute edges
+        #img_edges                = self.compute_edges(img_left_ref)
+
+        # do some filtering on the final probability volume to smooth out noise and improve the disparity estimation. This can be done using a Gaussian filter, a median filter, or an anisotropic diffusion filter, depending on the characteristics of the data and the desired level of smoothing. The goal is to reduce spurious peaks in the probability distribution while preserving important features such as edges and texture.
+        #prob_total_filter         = self.adaptive_filter_3d_fast(prob_total_final, kernel_size = 15, kappa = 0.1)  # shape (N, M, D)
+        #prob_total_filter         = self.anisotropic_filter_avergaing(prob_total_final, img_left_ref)  # shape (N, M, D)
+        #prob_total_filter        = self.joint_bilateral_upsampling(prob_total_final, img_left_ref, spatial_sigma=3.0, range_sigma=7.1, radius=4)
+        # prob_total_filter        = prob_total_final.copy()
+        # for i in range(8):
+        #     prob_total_filter    = self.joint_bilateral_filtering(img_left_ref, prob_total_filter, spatial_sigma=3.0, range_sigma=5.1, radius=3)
+        #prob_total_filter        = self.joint_bilateral_filtering(img_left_ref, prob_total_final, spatial_sigma=3.0, range_sigma=5.1, radius=3, iter_num=8) 
+
+        img_list                 = [prob_total_final[debug_row,:,:].squeeze().T , prob_total_filter[debug_row,:,:].squeeze().T]
+        ttl_list                 = [f'Final Probability Volume (row {debug_row})', f'Filtered Final Probability Volume (row {debug_row})']
+        self.show_subset(img_list, ttl_list, col_num=1)        
+
+        disp_index               = self.estimate_disparity_from_prob(prob_total_filter, estim_type = 4) # ensure values are within the valid range
+        disp_confidence          = np.max(prob_total_filter, axis=2)  # shape (N, M)
+        disp_index[disp_confidence < 0.1]   = 0  # mask out low confidence areas
+
+        # disp_confidence_filter    = disp_confidence.copy()
+        # for i in range(8):
+        #     disp_confidence_filter    = self.joint_bilateral_filtering(img_left_ref, disp_confidence_filter, spatial_sigma=3.0, range_sigma=5.1, radius=2)
+        # disp_confidence_filter   = self.joint_bilateral_filtering(img_left_ref, disp_confidence, spatial_sigma=3.0, range_sigma=5.1, radius=2, iter_num=4)
+        #disp_confidence_filter    = self.softmax_local_maxima(disp_confidence, kernel_size=7, T=0.1, x_thr=-1) #T_weigh
+
+        # img_list                 = [img_left_ref, disp_index , disp_confidence, disp_confidence_filter]
+        # ttl_list                 = ['Left Image', 'Estimated Disparity Map', 'Estimated Disparity Confidence Map','Filtered Confidence Map']
+        # self.show_subset(img_list, ttl_list, col_num=2) 
+
+        img_list                 = [img_left_ref, disp_index , disp_confidence]
+        ttl_list                 = ['Left Image', 'Estimated Disparity Map', 'Estimated Confidence Map']
+        self.show_subset(img_list, ttl_list, col_num=1)         
+
+        # if debug and row_index is not None:
+        #     self.debug_gabor_image_disparity_multiscale(debug_levels, prob_total, row_index=row_index)
+
+        plt.show()
+        return disp_index
+
+    def multiscale_disparity_edge_aware(self, img_left, img_right, debug_row=None):
+        """
+        Edge-aware variant of multiscale_disparity_with_energy, aimed at removing the
+        disparity smearing that shows up around well-defined, high-contrast image edges.
+
+        The smearing has three separate causes in the original pipeline, each addressed here:
+          1. Pyramid fusion upsamples each coarse level with a bilinear `zoom`, which turns any
+             sharp step at that level into a multi-pixel ramp once it reaches full resolution.
+             Fix: upsample the spatial axes with nearest-neighbor (order=0) instead of linear
+             interpolation - it never averages across a step.
+          2. The raw per-pixel Gabor cost has no spatial regularization, so noisy/ambiguous
+             pixels are not distinguished from pixels that are genuinely near a depth edge.
+             Fix: guided-filter the whole probability volume (all disparity channels in one
+             call) using the left image as guide - this aggregates cost within regions of
+             similar color and stops at color edges, instead of blending across them.
+          3. estimate_disparity_from_prob(estim_type=2-4) takes a probability-weighted average
+             over the *entire* disparity axis. At a depth edge the distribution is genuinely
+             bimodal (a foreground peak and a background peak), so averaging them produces an
+             intermediate disparity that does not exist in the scene.
+             Fix: estim_type=5 - hard argmax with a local 3-tap parabola refinement, which
+             gives sub-pixel precision without ever blending in a distant mode.
+        Ambiguous pixels (low confidence, or a strong runner-up peak - the signature of a pixel
+        straddling an edge) are then cleaned up with a targeted joint-bilateral pass guided by
+        the left image, instead of a global filter that would blur confident regions too.
+
+        Not implemented here (out of scope for a drop-in post-processing variant):
+          - Adaptive-support-weight matching / narrower cost-aggregation windows, which would
+            require reworking gabor_dispartity itself.
+          - True left-right consistency checking (would need a second, mirrored matching pass);
+            the peak-ambiguity ratio below is used as a practical proxy instead.
+        """
+        row_index               = debug_row if debug_row is not None else 400
+        debug                   = debug_row is not None
+
+        level_num               = 3
+        max_disparity           = 128
+
+        row_num, col_num        = img_left.shape[:2]
+
+        img_left, img_right     = img_left.astype(np.float32), img_right.astype(np.float32)
+        img_left_ref            = img_left.copy()
+
+        # Gabor bank parameters - same bank as multiscale_disparity_with_energy.
+        thetas                  = [0.0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
+        lambdas                 = [8.0, 16.0, 32.0];  psis = [0.0, np.pi / 2];  ksize = 7; sigma = 3.0;  gamma = 0.5
+        bank_left, _            = self.gabor_bank_init(ksize=ksize, sigma=sigma, lambdas=lambdas, gamma=gamma, psis=psis, thetas=thetas)
+        bank_right, _           = self.gabor_bank_init(ksize=ksize, sigma=sigma, lambdas=lambdas, gamma=gamma, psis=psis, thetas=thetas)
+
+        distance_total          = np.zeros((row_num, col_num, level_num, max_disparity), dtype=np.float32)
+        energy_total            = np.zeros((row_num, col_num, level_num), dtype=np.float32)
+
+        for level in range(level_num):
+
+            scale_factor            = 2 ** level
+
+            gabor_left              = self.gabor_bank_filter(img_left, bank=bank_left)
+            gabor_right             = self.gabor_bank_filter(img_right, bank=bank_right)
+
+            gabor_left,  energy_left    = self.gabor_normalize_responses_with_energy(gabor_left)
+            gabor_right, energy_right   = self.gabor_normalize_responses_with_energy(gabor_right)
+
+            distance_left            = self.gabor_dispartity(gabor_left, gabor_right, max_disparity=max_disparity // scale_factor)  # (row_lvl, col_lvl, D_lvl)
+
+            if scale_factor == 1:
+                distance_full            = distance_left
+                energy_full              = energy_left
+            else:
+                # 1) disparity axis: a simple re-indexing to full-resolution disparity units,
+                #    not a spatial resize - linear interpolation here is fine.
+                distance_full            = zoom(distance_left, zoom=(1, 1, scale_factor), order=1)
+                # 2) spatial axes: nearest-neighbor, so a sharp step at this coarse level stays
+                #    a step instead of turning into a multi-pixel ramp at full resolution.
+                distance_full            = zoom(distance_full, zoom=(scale_factor, scale_factor, 1), order=0)
+                energy_full              = zoom(energy_left, zoom=(scale_factor, scale_factor), order=0)
+
+            distance_total[:, :, level, :]  = distance_full
+            energy_total[:, :, level]       = energy_full
+
+            # compensate for the level shift, same as multiscale_disparity_with_energy
+            distance_total[:, :, level, :]  = np.roll(distance_total[:, :, level, :], axis=2, shift=-level)
+
+            img_left                = zoom(img_left,  zoom=0.5, order=1)
+            img_right               = zoom(img_right, zoom=0.5, order=1)
+
+        prob_total               = self.softmax_with_threshold(-distance_total, dim=3, T=0.1, x_thr=-3).astype(np.float32)  # shape (N, M, level, D); softmax_with_threshold upcasts to float64, but guidedFilter only accepts CV_32F/CV_8U
+
+        # Edge-aware cost aggregation: guided-filter every disparity channel of each level's
+        # probability volume in one call, guided by the full-resolution left image. This is the
+        # direct replacement for the commented-out anisotropic_filter_with_edges stub in
+        # multiscale_disparity_with_energy.
+        prob_filtered            = np.empty_like(prob_total)
+        for level in range(level_num):
+            prob_filtered[:, :, level, :] = cv.ximgproc.guidedFilter(
+                guide=img_left_ref, src=prob_total[:, :, level, :], radius=5, eps=50.0
+            )
+
+        if debug:
+            img_list = [prob_total[debug_row, :, m, :].squeeze().T for m in range(level_num)]
+            ttl_list = [f'Level {m} Probability Volume (row {debug_row})' for m in range(level_num)]
+            self.show_subset(img_list, ttl_list, col_num=2)
+
+            img_list = [prob_filtered[debug_row, :, m, :].squeeze().T for m in range(level_num)]
+            ttl_list = [f'Level {m} Edge-Filtered Probability (row {debug_row})' for m in range(level_num)]
+            self.show_subset(img_list, ttl_list, col_num=2)
+
+        # combine levels
+        prob_total_final          = prob_filtered[:, :, 0, :]
+        for m in range(1, level_num):
+            prob_max                 = np.max(prob_total_final, axis=2)[:, :, np.newaxis]
+            prob_total_final         = prob_total_final + (1 - prob_max) * prob_filtered[:, :, m, :]
+
+        # hard argmax + local parabola sub-pixel refinement - never blends two separated modes
+        disp_index                = self.estimate_disparity_from_prob(prob_total_final, estim_type=5)
+
+        # flag pixels whose match is ambiguous (low confidence, or a strong runner-up peak -
+        # the signature of a pixel straddling a depth edge) and clean up only those, guided by
+        # the left image, so confident regions are left untouched.
+        ratio, disp_confidence     = self.disparity_peak_ambiguity(prob_total_final)
+        ambiguous                  = (ratio > 0.6) | (disp_confidence < 0.1)
+
+        disp_index_clean           = self.joint_bilateral_filtering(
+            img_left_ref, disp_index, spatial_sigma=3.0, range_sigma=5.0, radius=3, iter_num=2
+        )
+        disp_index_final           = disp_index.copy()
+        disp_index_final[ambiguous]            = disp_index_clean[ambiguous]
+        disp_index_final[disp_confidence < 0.05] = 0  # mask out very low confidence areas
+
+        if debug:
+            img_list = [img_left_ref, disp_index, ambiguous.astype(np.float32), disp_index_final]
+            ttl_list = ['Left Image', 'Disparity (pre-cleanup)', 'Ambiguous / Edge Pixels', 'Disparity (edge-aware)']
+            self.show_subset(img_list, ttl_list, col_num=2)
+            plt.show()
+
+        return disp_index_final
 
     #%% -----------------------------------------
     # Functional blocks
@@ -1792,6 +2984,26 @@ class ShazamDepthEstimator:
         #ret                 = self.compute_roi_mean_std(img_depth, img_depth_new)
 
         return img_depth_new
+
+    def convert_depth_from_left_and_right(self, img_left, img_right, img_depth):
+        "function to compute depth from images"
+        # convert depth image to 3d volume by stacking shifted versions of the image along a new dimension, where each shift corresponds to a different disparity level. This can be useful for stereo matching algorithms that operate on 3D cost volumes, where the cost for each pixel is computed across a range of disparities. By converting the depth image into a 3D volume, we can more easily compare it to the cost volume and compute metrics such as mean squared error or cross-entropy loss for training or evaluation purposes.
+        max_disparity       = 64
+
+
+        # recover disparity         
+        img_disparity       = self.convert_depth_to_disparity(img_depth, 500) 
+
+        # reproduce volume from matching features
+        img_disparity_new   = self.multiscale_disparity(img_left, img_right)
+
+        # return back
+        img_depth_new       = self.convert_disparity_to_depth(img_disparity_new, 500)
+
+        # measure inside the roi - only for vertical walls
+        #ret                 = self.compute_roi_mean_std(img_depth, img_depth_new)
+
+        return img_depth_new    
 
     #%% -----------------------------------------
 
@@ -2150,6 +3362,9 @@ class ShazamDepthEstimator:
 
     def show_subset(self, img_list, ttl_list, vmin=None, vmax=None, save_path='', fig_name='', col_num=3):
         "show some images"
+        if not self.debug_show: 
+            return
+
         img_num  = len(img_list)
         row_num  = int(img_num/col_num) 
         col_num  = int(np.ceil(img_num/row_num))
@@ -3407,11 +4622,11 @@ class TestShazamDepthEstimator():
         ""
         
         d               = DataSource()
-        ret             = d.init_image(11) # 4-ok,7-ok,11-nok,26-ok, 54-chair,55-office far,56-office-chess-ok, ,62,66-nok, 71-home, 601-ok, 621,622-mbox
+        ret             = d.init_image(624) # 4-ok,7-ok,11-nok,21-sim,26-ok, 54-chair,55-office far,56-office-chess-ok, ,62,66-nok, 71-home, 601-ok, 620,621,622-mbox
         d.show_images_left_right()
         img_left, img_right = d.imgL, d.imgR
 
-        debug_row       = 130   # set to None to disable per-row debug plots
+        debug_row       = 125 #140   # set to None to disable per-row debug plots
 
         p               = ShazamDepthEstimator()
         #prob            = p.gabor_image_disparity_down_up(img_left, img_right, debug_row=debug_row)
@@ -3696,8 +4911,8 @@ class TestShazamDepthEstimator():
 
         # 1) Build low-resolution source (proxy for coarse disparity)
         #img_low         = cv.pyrDown(cv.pyrDown(img_left)).astype(np.float32)
-        #img_low         = cv.pyrDown(img_left).astype(np.float32)
-        img_low         = img_left.astype(np.float32)
+        img_low         = cv.pyrDown(img_left).astype(np.float32)
+        #img_low         = img_left.astype(np.float32)
         # add some noise to make it more realistic and to test the edge-preserving capabilities of the filters. This simulates the imperfections that might be present in a real coarse disparity map, 
         # making the test more robust and relevant to practical applications.  
         # 1. Generate random Gaussian noise with the same shape as the image
@@ -3787,7 +5002,8 @@ class TestShazamDepthEstimator():
 
 
         #context_diff = anisotropic_diffusion(src_u8, num_iter=10, kappa=5, delta=0.3)
-        context_diff = p.anisotropic_filter_avergaing(baseline, img_left)
+        #context_diff = p.anisotropic_filter_avergaing(baseline, img_left)
+        context_diff = p.anisotropic_filter(baseline, img_left)
         img_list.append(context_diff)
         ttl_list.append('Edge-Preserving (Anisotropic Diffusion)')        
 
@@ -3942,20 +5158,316 @@ class TestShazamDepthEstimator():
         plt.tight_layout()
         plt.show()        
 
-    #%% ---------------------------------------------------
+    def test_fast_guided_filter(self):
+        "test fast guided filter for upsampling / edge-preserving smoothing"
+        import cv2
+
+        def fast_guided_filter(p, I, r, eps, s):
+            """
+            Fast Guided Filter for upsampling / edge-preserving smoothing.
+            
+            Parameters:
+            -----------
+            p : np.ndarray
+                The low-resolution input image to be guided/upsampled. 
+                Shape: (H_lr, W_lr, C) or (H_lr, W_lr).
+            I : np.ndarray
+                The high-resolution guidance image containing sharp structural details.
+                Shape: (H_hr, W_hr, C_guide) or (H_hr, W_hr). Must match C or be 1-channel.
+            r : int
+                Window radius on the original high-resolution scale.
+            eps : float
+                Regularization parameter (analogue to range variance).
+                A small eps preserves subtle edges; large eps causes more smoothing.
+            s : int or float
+                Subsampling scale factor (e.g., 2, 4, 8). 
+                This is the ratio: (HR size) / (LR size).
+                
+            Returns:
+            --------
+            q : np.ndarray
+                The final upsampled, edge-preserved high-resolution output.
+            """
+            # Ensure inputs are float32
+            p = p.astype(np.float32)
+            I = I.astype(np.float32)
+            
+            H_hr, W_hr = I.shape[:2]
+            
+            # Calculate radius for downsampled scale
+            r_sub = int(round(r / s))
+            ksize_sub = (2 * r_sub + 1, 2 * r_sub + 1)
+            
+            # 1. Subsample the HR Guide and LR Input to the working scale
+            # (If p is already low-resolution, we just resize it to match the subsampled I)
+            h_sub, w_sub = int(round(H_hr / s)), int(round(W_hr / s))
+            
+            I_sub = cv2.resize(I, (w_sub, h_sub), interpolation=cv2.INTER_LINEAR)
+            p_sub = cv2.resize(p, (w_sub, h_sub), interpolation=cv2.INTER_LINEAR)
+            
+            # 2. Compute local means using box filter on the subsampled scale
+            mean_I = cv2.boxFilter(I_sub, -1, ksize_sub)
+            mean_p = cv2.boxFilter(p_sub, -1, ksize_sub)
+            
+            mean_II = cv2.boxFilter(I_sub * I_sub, -1, ksize_sub)
+            mean_Ip = cv2.boxFilter(I_sub * p_sub, -1, ksize_sub)
+            
+            # 3. Compute covariance and variance on downsampled scale
+            # var(I) = E[I^2] - (E[I])^2
+            var_I = mean_II - mean_I * mean_I
+            # cov(I, p) = E[Ip] - E[I]*E[p]
+            cov_Ip = mean_Ip - mean_I * mean_p
+            
+            # 4. Compute linear coefficients a and b on downsampled scale
+            # a = cov(I,p) / (var(I) + eps)
+            # b = mean_p - a * mean_I
+            a = cov_Ip / (var_I + eps)
+            b = mean_p - a * mean_I
+            
+            # 5. Compute mean of a and b on downsampled scale
+            mean_a = cv2.boxFilter(a, -1, ksize_sub)
+            mean_b = cv2.boxFilter(b, -1, ksize_sub)
+            
+            # 6. Upsample the smoothed a and b back to the high-resolution scale
+            mean_a_hr = cv2.resize(mean_a, (W_hr, H_hr), interpolation=cv2.INTER_LINEAR)
+            mean_b_hr = cv2.resize(mean_b, (W_hr, H_hr), interpolation=cv2.INTER_LINEAR)
+            
+            # 7. Apply the linear model with the high-resolution guide I
+            q = mean_a_hr * I + mean_b_hr
+            
+            return q
 
 
+        # ==========================================================
+        # 1. Generate Simulated High-Res & Low-Res Image Pair
+        # ==========================================================
 
+        # Create an elegant high-resolution Guide (512x512)
+        # We will draw a clean geometric circle pattern to act as the sharp HR structure
+        hr_guide = np.ones((512, 512), dtype=np.uint8) * 40
+        cv2.circle(hr_guide, (256, 256), 140, 220, -1)
+        cv2.putText(hr_guide, "SHARP GUIDE", (100, 270), cv2.FONT_HERSHEY_SIMPLEX, 1.2, 40, 4, cv2.LINE_AA)
+
+        # Generate a degraded Low-Resolution Target (128x128)
+        # We downsample it, add severe blur, and inject Gaussian noise
+        lr_clean = cv2.resize(hr_guide, (128, 128), interpolation=cv2.INTER_AREA)
+        lr_blurred = cv2.GaussianBlur(lr_clean, (11, 11), 0)
+        noise = np.random.normal(0, 15, lr_blurred.shape).astype(np.float32)
+        lr_target = np.clip(lr_blurred.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+        # ==========================================================
+        # 2. Run the Fast Guided Filter
+        # ==========================================================
+        # radius = 16 pixels relative to the HR image
+        # eps = regularization factor. Since image range is [0-255], we scale eps by 255^2
+        eps = 0.02 * (255 ** 2)
+        s = 4  # Scale factor (512 / 128)
+
+        upsampled_output = fast_guided_filter(p=lr_target, I=hr_guide, r=16, eps=eps, s=s)
+        upsampled_output = np.clip(upsampled_output, 0, 255).astype(np.uint8)
+
+        # For baseline comparison, let's also do a standard Bilinear upsampling of the LR image
+        bilinear_baseline = cv2.resize(lr_target, (512, 512), interpolation=cv2.INTER_LINEAR)
+
+        # ==========================================================
+        # 3. Display Everything Side-by-Side using Matplotlib
+        # ==========================================================
+        fig, axes = plt.subplots(1, 4, figsize=(20, 5), dpi=100)
+
+        # 1. Low-Resolution Target
+        axes[0].imshow(lr_target, cmap='gray')
+        axes[0].set_title(f"1. Low-Res Target\n({lr_target.shape[1]}x{lr_target.shape[0]} + Noise/Blur)")
+        axes[0].axis('off')
+
+        # 2. High-Resolution Guide
+        axes[1].imshow(hr_guide, cmap='gray')
+        axes[1].set_title(f"2. High-Res Guide\n({hr_guide.shape[1]}x{hr_guide.shape[0]})")
+        axes[1].axis('off')
+
+        # 3. Standard Bilinear Baseline (Control Group)
+        axes[2].imshow(bilinear_baseline, cmap='gray')
+        axes[2].set_title("3. Naive Bilinear Upsample\n(Edge is blurry & noisy)")
+        axes[2].axis('off')
+
+        # 4. Joint Guided Upsampled Output
+        axes[3].imshow(upsampled_output, cmap='gray')
+        axes[3].set_title("4. Guided Filter Output\n(Sharp edges, smooth surface)")
+        axes[3].axis('off')
+
+        plt.tight_layout()
+        plt.show()
+    
+    def test_joint_bilateral_upsampling(self):
+        "validation test for joint bilateral upsampling"
+        import cv2
+
+        p = ShazamDepthEstimator()
+
+        # =====================================================================
+        # 1. High-Performance NumPy JBU Implementation
+        # =====================================================================
+        def joint_bilateral_upsampling(lr_img, hr_guide, spatial_sigma=3.0, range_sigma=0.1, radius=4):
+            if lr_img.ndim == 2:
+                lr_img = lr_img[..., np.newaxis]
+            if hr_guide.ndim == 2:
+                hr_guide = hr_guide[..., np.newaxis]
+                
+            H_lr, W_lr, C_lr = lr_img.shape
+            H_hr, W_hr, C_g = hr_guide.shape
+            
+            scale_y = H_hr / H_lr
+            scale_x = W_hr / W_lr
+            
+            # Precompute spatial Gaussian weights
+            y_coords, x_coords = np.mgrid[-radius:radius+1, -radius:radius+1]
+            spatial_dist_sq = y_coords**2 + x_coords**2
+            spatial_weights = np.exp(-spatial_dist_sq / (2 * spatial_sigma**2))
+            
+            upsampled = np.zeros_like(hr_guide, dtype=np.float32) if C_lr == C_g else np.zeros((H_hr, W_hr, C_lr), dtype=np.float32)
+            norm_factor = np.zeros((H_hr, W_hr, 1), dtype=np.float32)
+            
+            # Neighborhood search loop
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    s_w = spatial_weights[dy + radius, dx + radius]
+                    if s_w < 1e-4:
+                        continue
+                        
+                    hr_y, hr_x = np.meshgrid(np.arange(H_hr), np.arange(W_hr), indexing='ij')
+                    
+                    lr_y_idx = np.clip(np.round(hr_y / scale_y).astype(np.int32) + dy, 0, H_lr - 1)
+                    lr_x_idx = np.clip(np.round(hr_x / scale_x).astype(np.int32) + dx, 0, W_lr - 1)
+                    
+                    lr_val = lr_img[lr_y_idx, lr_x_idx]
+                    
+                    hr_y_from_lr = np.clip(np.round(lr_y_idx * scale_y).astype(np.int32), 0, H_hr - 1)
+                    hr_x_from_lr = np.clip(np.round(lr_x_idx * scale_x).astype(np.int32), 0, W_hr - 1)
+                    
+                    guide_diff = hr_guide - hr_guide[hr_y_from_lr, hr_x_from_lr]
+                    range_dist_sq = np.sum(guide_diff**2, axis=-1, keepdims=True)
+                    range_weights = np.exp(-range_dist_sq / (2 * range_sigma**2))
+                    
+                    weight = s_w * range_weights
+                    upsampled += lr_val * weight
+                    norm_factor += weight
+                    
+            upsampled /= (norm_factor + 1e-8)
+            return np.squeeze(upsampled)
+
+
+        # =====================================================================
+        # 2. Setup Synthetic Scenario (Simulating a Depth Map Upsampling task)
+        # =====================================================================
+
+        # Step A: High-Resolution Guide (512x512) - A sharp diagonal boundary
+        hr_guide = np.zeros((512, 512), dtype=np.float32)
+        for i in range(512):
+            hr_guide[i, :512-i] = 100.0  # Diagonal boundary transition
+        hr_guide[200:300, 200:300] = 200.0  # Add a bright square in the bottom-right quadrant
+
+        # Step B: Low-Resolution Target (64x64) representing downscaled noisy depth
+        lr_clean = cv2.resize(hr_guide, (64, 64), interpolation=cv2.INTER_AREA)
+        # Add massive Gaussian Blur & Salt-and-Pepper style noise to simulate a cheap depth camera
+        lr_blurred = cv2.GaussianBlur(lr_clean, (7, 7), 0)
+        noise = np.random.normal(0, 8.15, lr_blurred.shape).astype(np.float32)
+        lr_target = np.clip(lr_blurred + noise, 0, 255)
+
+        # Step C: Run JBU 
+        hr_guide = hr_guide/100
+        # Use a narrow range_sigma to enforce alignment to the high-res guide's sharp edges
+        jbu_output = p.joint_bilateral_upsampling(
+            lr_img=lr_target, 
+            hr_guide=hr_guide, 
+            spatial_sigma=4.0, 
+            range_sigma=0.1,
+            radius=4
+        )
+
+        # Step D: Standard Bilinear Baseline (for contrast)
+        bilinear_output = cv2.resize(lr_target, (512, 512), interpolation=cv2.INTER_LINEAR)
+
+
+        # =====================================================================
+        # 3. Matplotlib Comparative Layout
+        # =====================================================================
+        fig, axes = plt.subplots(1, 4, figsize=(20, 5.5))
+
+        # Plot 1: Low-Res Target Inputs
+        axes[0].imshow(lr_target, cmap='inferno', extent=[0, 512, 512, 0])
+        axes[0].set_title("1. Low-Res Target\n(64x64 + Severe Noise & Blur)", fontsize=12)
+        axes[0].axis('off')
+
+        # Plot 2: High-Res Guide
+        axes[1].imshow(hr_guide, cmap='gray')
+        axes[1].set_title("2. High-Res Guide\n(512x512 Structural Boundaries)", fontsize=12)
+        axes[1].axis('off')
+
+        # Plot 3: Naive Bilinear Upsampling
+        axes[2].imshow(bilinear_output, cmap='inferno')
+        axes[2].set_title("3. Naive Bilinear Upsample\n(Jagged, blurry, and noisy)", fontsize=12)
+        axes[2].axis('off')
+
+        # Plot 4: JBU Output
+        axes[3].imshow(jbu_output, cmap='inferno')
+        axes[3].set_title("4. Joint Bilateral Upsample\n(Crisp edges & denoised flat areas)", fontsize=12)
+        axes[3].axis('off')
+
+        plt.tight_layout()
+        plt.show()
+
+    def test_pixel_image_disparity(self):
+        "compute row-wise left/right gabor channel correlation at multiple levels and extract disparity information to get a disparity map. shows the correlation MxM matrix. integrates information from coars to fine levels"
+        ""
+        
+        d               = DataSource()
+        ret             = d.init_image(21) # 4-ok,7-ok,11-nok,26-ok, 54-chair,55-office far,56-office-chess-ok, ,62,66-nok, 71-home, 601-ok, 621,622-mbox
+        d.show_images_left_right()
+        img_left, img_right = d.imgL, d.imgR
+
+        debug_row       = 120 #140   # set to None to disable per-row debug plots
+
+        p               = ShazamDepthEstimator()
+        prob            = p.pixel_image_disparity(img_left, img_right)
+
+        #img_list        = [prob[:,:,debug_row+m] for m in [0, 5, 10]]
+        img_list        = [prob[:,debug_row+m,:].squeeze().T for m in [0, 5, 10]]
+        ttl_list        = [f'Level {m} Probability Volume (row {debug_row+m})' for m in [0, 5, 10]]
+        p.show_subset(img_list, ttl_list, col_num=1)          
+        
+        return True  
+
+    def test_multiscale_disparity(self):
+        "compute row-wise left/right gabor channel correlation at multiple levels and extract disparity information to get a disparity map. shows the correlation MxM matrix. integrates information from coars to fine levels"
+        ""
+        
+        d               = DataSource()
+        ret             = d.init_image(21) # 4-ok,7-ok,11-nok,21-sim,26-ok, 54-chair, 55-office far,56-office-chess-ok, ,62,66-nok, 71-home, 601-ok, 621,622,623-mbox
+        d.show_images_left_right()
+        d.show_images_depth()
+        img_left, img_right = d.imgL, d.imgR
+
+        debug_row       = 125 #140   # set to None to disable per-row debug plots
+
+        p               = ShazamDepthEstimator()
+        #prob            = p.gabor_image_disparity_down_up(img_left, img_right, debug_row=debug_row)
+        #prob            = p.gabor_image_disparity_down_up_on_volume(img_left, img_right, debug_row=debug_row)
+        prob            = p.multiscale_disparity(img_left, img_right, debug_row=debug_row)
+        #prob            = p.multiscale_disparity_pixel_features(img_left, img_right, debug_row=debug_row)
+        #prob            = p.multiscale_disparity_with_energy(img_left, img_right, debug_row=debug_row)
+        #prob            = p.multiscale_disparity_edge_aware(img_left, img_right, debug_row=debug_row)
+        
+        
+        return True
 # ---------------------------------------------------
 #%% App
 class RunApp:
 
-    def __init__(self, video_src = 'd16'):
+    def __init__(self, video_src = 'd16', frame_size = (1280,720)):
 
         #self.cap = video.create_capture(video_src)
-        self.cap            = RealSense(video_src, frame_size = (1280,720))
+        self.cap            = RealSense(video_src, frame_size = frame_size)
         self.cap.set_display_mode('d16')  # l,r and d
-        self.cap.set_exposure(2000)
+        self.cap.set_exposure(16000)
         #self.cap.switch_disparity()
 
         _, self.frame       = self.cap.read()
@@ -4010,6 +5522,7 @@ class RunApp:
         estim_ind           = len(self.trackers) + 1
         tracker             = ShazamDepthEstimator(noise_type = self.estim_type) #estimator_type=self.estim_type, estimator_id=estim_ind)
         tracker.rect        = rect
+        tracker.debug_show  = False
         tracker.camera_bf   = self.camera_bf
         self.trackers.append(tracker)
 
@@ -4068,7 +5581,7 @@ class RunApp:
             self.display_mode = value_in
 
         elif self.control_mode == 'exposure':
-            self.cap.set_exposure(value_in*1000)
+            self.cap.set_exposure(value_in*1000*2)
 
         elif self.control_mode == 'estimator':
             self.switch_estimator(value_in)    
@@ -4166,7 +5679,7 @@ class RunApp:
             img_disp_rs, img_disp_fft = None, None
 
             for tracker in self.trackers:
-                img_depth_new               = tracker.convert_depth_to_volume_and_back(img_left, img_right, img_depth) 
+                img_depth_new               = tracker.convert_depth_from_left_and_right(img_left, img_right, img_depth) 
 
             # compute noise
             #isOk                        = self.compute_noise(img_depth, img_depth_new)
@@ -4181,7 +5694,7 @@ class RunApp:
             vis                         = self.show_controls(vis)  # draw controls
 
             cv.imshow(self.imshow_name, vis)
-            ch = cv.waitKey(30)
+            ch = cv.waitKey(3)
             if ch == 27 or ch == ord('q'):
                 break  
             elif ch == ord(' '):
@@ -4229,7 +5742,8 @@ def RunTest():
     #tst.test_gabor_line_correlation_updown()
 
     #tst.test_gabor_image_disparity_multiscale()
-    tst.test_gabor_image_disparity_down_up()
+    #tst.test_gabor_image_disparity_down_up()
+    tst.test_multiscale_disparity()
 
     #tst.test_context_upsampling()
     #tst.test_context_upsampling_using_ai()
@@ -4240,11 +5754,15 @@ def RunTest():
     #tst.test_kalman_filtering()
     #tst.test_kalman_filtering_two_images()
     #tst.test_grid_interpolation()
+    #tst.test_fast_guided_filter()
+    #tst.test_joint_bilateral_upsampling()
+
+    #tst.test_pixel_image_disparity()
 
 
 if __name__ == '__main__':
     #print(__doc__)
 
     RunTest()
-    #RunApp()      
+    #RunApp(frame_size = (640,360))      
 

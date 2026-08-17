@@ -1,19 +1,18 @@
-"""Benchmark stereo models + RealSense hardware depth + Shazam estimator against Pickle CAD GT.
+"""Benchmark the Shazam estimator + RealSense hardware depth against Pickle CAD GT.
 
-Extends ``benchmark_pickle_trained_isaac.py`` by adding the CPU-only Shazam
-Gabor-bank stereo depth estimator (``scripts/shazam_depth_estimator.py``) as an
-additional evaluation method, alongside the original / fine-tuned / ISAAC-tuned
-Fast-FoundationStereo models, the RealSense hardware depth, and the Pickle CAD
-ground truth (projected via ``DataSource.get_item_projected``).
+Stripped-down variant of ``benchmark_pickle_shazam.py`` that drops the
+Fast-FoundationStereo neural models entirely. Only three methods are
+evaluated: the CPU-only Shazam Gabor-bank stereo depth estimator
+(``scripts/shazam_depth_estimator.py``), the RealSense hardware depth, and
+the Pickle CAD ground truth (projected via ``DataSource.get_item_projected``).
 
 Metric descriptions match ``benchmark_pickle_trained_isaac.py``. All depth
 values are in millimetres (mm) throughout this script.
 
 Usage:
   cd /path/to/Fast-FoundationStereo
-  python scripts/benchmark_pickle_shazam.py [--out_dir reports/benchmark_pickle_shazam]
-                                            [--shazam_scale 0.5]
-                                            [--shazam_max_disp 64]
+  python scripts/benchmark_pickle_shazam_only.py [--out_dir reports/benchmark_pickle_shazam_only]
+                                                  [--shazam_scale 0.5]
 """
 
 import argparse
@@ -29,28 +28,12 @@ code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../')
 sys.path.append(code_dir)
 
-# Driver 580 / CUDA 13.0 does not enumerate devices without CUDA_VISIBLE_DEVICES set.
-if 'CUDA_VISIBLE_DEVICES' not in os.environ:
-    import subprocess
-    try:
-        out = subprocess.check_output(
-            ['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'],
-            text=True
-        )
-        indices = ','.join(line.strip() for line in out.splitlines() if line.strip())
-        if indices:
-            os.environ['CUDA_VISIBLE_DEVICES'] = indices
-    except Exception:
-        os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2 as cv
-import torch
 
-from core.utils.utils import InputPadder
 import Utils as U
 from scripts.data_manager_pickle import DataSource
 from metrics import (
@@ -108,16 +91,8 @@ PICKLE_EXCEL = (
     r"\\svm.realsenseai.com\RealSense_Validation\VIDB\Public\Stavush\Pickle\Data\data for model training 25_6_26"
     r"\data_25_06.xlsx"
 )
-# PICKLE_EXCEL = (
-#     r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0\2026_06"
-#     r"\yg_pickle\\2026-06-25--15-00-20\Pickle_Scene_Capture_Exp1500_LP150_LightsON_336222073841"
-#     r"\data path.xlsx"
-# )
 
-ORIGINAL_PATH   = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
-FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_epoch_020.pth'
-ISAACTUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_epoch_037.pth'
-DEFAULT_OUT     = f'{code_dir}/../reports/benchmark_pickle_shazam'
+DEFAULT_OUT = f'{code_dir}/../reports/benchmark_pickle_shazam_only'
 
 # Projection method used to render CAD-based ground-truth depth.
 PROJECTION_METHOD = "splat"
@@ -127,12 +102,8 @@ PROJECTION_METHOD = "splat"
 # so the full-resolution cost volume is ~ (H · W · 3 · 128 · 4 bytes). To keep memory
 # and latency in check on CPU we optionally pre-downsample the IR pair and rescale
 # the returned disparity back to native resolution.
-SHAZAM_SCALE        = 1.0   # pre-downscale factor applied to IR pair before Gabor matching
+SHAZAM_SCALE = 1.0   # pre-downscale factor applied to IR pair before Gabor matching
 
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {DEVICE}")
-
-ITERS = 8           # GRU update iterations for FFS models
 N_VIZ = 12          # frames saved for visual comparison in the report
 
 # Depth threshold for the "close-range" coverage metric — in mm
@@ -152,9 +123,6 @@ BIN_LABELS_MM  = ["0–100 mm", "100–200 mm", "200–300 mm", "300–400 mm", 
 BIN_CENTERS_MM = [50.0, 150.0, 250.0, 350.0, 450.0, 550.0, 650.0]
 
 METHODS: Dict[str, Dict[str, str]] = {
-    "original":   {"label": "FFS Original",                  "color": "#2980b9"},
-    "finetuned":  {"label": "FFS Fine-tuned (Pickle)",       "color": "#e74c3c"},
-    "isaactuned": {"label": "FFS Fine-tuned (ISAAC)",        "color": "#8e44ad"},
     "shazam":     {"label": "Shazam (CPU Only)",             "color": "#16a085"},
     "depth_rs":   {"label": "RealSense Hardware Depth",      "color": "#f39c12"},
     "pickle_gt":  {"label": "Pickle CAD GT (projected)",     "color": "#27ae60"},
@@ -214,9 +182,9 @@ class ShazamRunner:
 
         Hs = left_s.shape[0]
         try:
-            disp_s = self.estimator.gabor_image_disparity_down_up_full_volume(
-                left_s, right_s, debug_row=None,
-            ).astype(np.float32)
+                
+            #disp_s = self.estimator.gabor_image_disparity_down_up_full_volume( left_s, right_s, debug_row=None).astype(np.float32)
+            disp_s = self.estimator.multiscale_disparity( left_s, right_s, debug_row=None)
         finally:
             # Release figures created by the estimator before returning.
             plt.close('all')
@@ -225,9 +193,9 @@ class ShazamRunner:
         # pixels, so it must also be multiplied by the inverse spatial scale.
         if self.scale != 1.0:
             disp = cv.resize(disp_s, (W, H), interpolation=cv.INTER_LINEAR)
-            disp = disp / self.scale
+            disp = disp.astype(np.float32) / self.scale
         else:
-            disp = disp_s
+            disp = disp_s.astype(np.float32)
 
         depth_mm = np.zeros_like(disp, dtype=np.float32)
         valid = disp > 0.5  # subpixel floor avoids divide-by-zero/overflow
@@ -242,51 +210,12 @@ def compute_bin_mae_mm(pred_mm: np.ndarray, gt_mm: np.ndarray) -> List[float]:
     result = []
     for lo, hi in DIST_BINS_MM:
         mask = (gt_mm >= lo) & (gt_mm < hi) & (gt_mm > 0) & (pred_mm > 0)
+        mask = mask & (np.abs(pred_mm - gt_mm) < 50.0)  # ignore extreme outliers
         if mask.sum() == 0:
             result.append(float("nan"))
         else:
-            mask = mask & (np.abs(pred_mm - gt_mm) < 20.0)  # ignore extreme outliers
             result.append(float(np.abs(pred_mm[mask] - gt_mm[mask]).mean()))
     return result
-
-
-# ── inference helpers (FFS models) ────────────────────────────────────────────
-
-def _preprocess_ir(left: np.ndarray, right: np.ndarray):
-    """Convert uint8/uint16 IR images to CUDA float tensors (3-channel pseudo-RGB)."""
-    left  = np.clip(left.astype(np.float32),  0, 255)
-    right = np.clip(right.astype(np.float32), 0, 255)
-    left  = np.stack([left,  left,  left],  axis=-1)
-    right = np.stack([right, right, right], axis=-1)
-    left_t  = torch.as_tensor(left).float()[None].permute(0, 3, 1, 2).to(DEVICE)
-    right_t = torch.as_tensor(right).float()[None].permute(0, 3, 1, 2).to(DEVICE)
-    return left_t, right_t
-
-
-@torch.no_grad()
-def infer_depth_mm(model, left: np.ndarray, right: np.ndarray, bf: float) -> np.ndarray:
-    """Run stereo inference on an IR pair; return depth map in mm (H×W float32)."""
-    left_t, right_t = _preprocess_ir(left, right)
-    padder = InputPadder(left_t.shape, divis_by=32, force_square=False)
-    left_t, right_t = padder.pad(left_t, right_t)
-
-    with torch.amp.autocast('cuda', enabled=True, dtype=U.AMP_DTYPE):
-        disp = model.forward(left_t, right_t, iters=ITERS, test_mode=True)
-
-    disp = padder.unpad(disp.float())
-    disp_np = disp.cpu().numpy().reshape(left.shape[:2]).clip(0, None)
-
-    depth_mm = np.zeros_like(disp_np)
-    valid = disp_np > 0
-    depth_mm[valid] = bf / disp_np[valid]
-    return depth_mm
-
-
-def load_model(path: str):
-    logging.info(f"Loading model from {path}")
-    model = torch.load(path, map_location='cpu', weights_only=False)
-    model.cuda().eval()
-    return model
 
 
 # ── mm-aware report generator ─────────────────────────────────────────────────
@@ -549,12 +478,6 @@ def main():
     parser.add_argument('--pickle_excel',  default=PICKLE_EXCEL,
                         help='Path to the Pickle manifest Excel (data path.xlsx). '
                              'Windows UNC paths are auto-translated to the local mount.')
-    parser.add_argument('--original',      default=ORIGINAL_PATH,
-                        help='Path to original model weights')
-    parser.add_argument('--finetuned',     default=FINETUNED_PATH,
-                        help='Path to Pickle fine-tuned model weights')
-    parser.add_argument('--isaactuned',    default=ISAACTUNED_PATH,
-                        help='Path to ISAAC fine-tuned model weights')
     parser.add_argument('--shazam_scale',  type=float, default=SHAZAM_SCALE,
                         help='Pre-downscale factor applied to the IR pair before Shazam matching '
                              '(smaller = faster + less memory, less accurate).')
@@ -569,32 +492,12 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── load FFS models ───────────────────────────────────────────────────────
-    models = {}
-    if Path(args.finetuned).exists():
-        models["finetuned"] = load_model(args.finetuned)
-    else:
-        raise FileNotFoundError(
-            f"Fine-tuned model not found at {args.finetuned}. "
-            f"Pass --finetuned <path> or set FINETUNED_PATH to an existing checkpoint."
-        )
-
-    if Path(args.isaactuned).exists():
-        models["isaactuned"] = load_model(args.isaactuned)
-    else:
-        raise FileNotFoundError(
-            f"ISAAC fine-tuned model not found at {args.isaactuned}. "
-            f"Pass --isaactuned <path> or set ISAACTUNED_PATH to an existing checkpoint."
-        )
-
-    models["original"] = load_model(args.original)
-
     # ── init Shazam estimator (CPU, no weights) ───────────────────────────────
     logging.info(f"Initialising Shazam estimator (scale={args.shazam_scale})")
     shazam = ShazamRunner(scale=args.shazam_scale)
 
-    # active_methods includes GT, RS hardware, Shazam, and all NN models
-    active_methods = [GT_NAME, RS_NAME, SHAZAM_NAME] + list(models.keys())
+    # active_methods includes GT, RS hardware, and Shazam only
+    active_methods = [GT_NAME, RS_NAME, SHAZAM_NAME]
 
     # ── dataset ───────────────────────────────────────────────────────────────
     source = DataSource(train_mode=False)
@@ -610,8 +513,8 @@ def main():
     valid_acc         = {}
     dist_bin_mae      = {m: [] for m in active_methods}
     close_range_valid = {m: [] for m in active_methods}
-    # NN models AND shazam track per-frame latency
-    timing_ms_raw     = {m: [] for m in list(models.keys()) + [SHAZAM_NAME]}
+    # Shazam tracks per-frame latency
+    timing_ms_raw     = {SHAZAM_NAME: []}
     H = W = None
 
     for idx in range(n):
@@ -634,12 +537,6 @@ def main():
                 valid_acc[m] = np.zeros((H, W), np.float32)
 
         frame_depths = {GT_NAME: gt_mm, RS_NAME: rs_mm}
-
-        # FFS models (GPU)
-        for mname, model in models.items():
-            t0 = time.monotonic()
-            frame_depths[mname] = infer_depth_mm(model, left, right, bf)
-            timing_ms_raw[mname].append((time.monotonic() - t0) * 1000.0)
 
         # Shazam (CPU)
         t0 = time.monotonic()
@@ -693,9 +590,6 @@ def main():
 
     # ── build BenchmarkResults ────────────────────────────────────────────────
     method_configs = {
-        "original":  {"model_path": args.original},
-        "finetuned": {"model_path": args.finetuned},
-        "isaactuned": {"model_path": args.isaactuned},
         SHAZAM_NAME: {
             "estimator":  "ShazamDepthEstimator.gabor_image_disparity_down_up_full_volume (CPU)",
             "scale":      str(args.shazam_scale),
