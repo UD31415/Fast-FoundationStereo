@@ -2617,7 +2617,7 @@ class ShazamDepthEstimator:
         kernel                  = np.array([0.2, 0.6, 0.2]) 
 
         row_index               = debug_row if debug_row is not None else 400
-        debug_on                = False #debug_row is not None
+        debug_on                = debug_row is not None
 
         level_num               = 4
         max_disparity           = 128
@@ -2845,7 +2845,7 @@ class ShazamDepthEstimator:
         row_index               = debug_row if debug_row is not None else 400
         debug                   = debug_row is not None
 
-        level_num               = 3
+        level_num               = 4
         max_disparity           = 128
 
         row_num, col_num        = img_left.shape[:2]
@@ -2855,7 +2855,7 @@ class ShazamDepthEstimator:
 
         # Gabor bank parameters - same bank as multiscale_disparity_with_energy.
         thetas                  = [0.0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
-        lambdas                 = [8.0, 16.0, 32.0];  psis = [0.0, np.pi / 2];  ksize = 7; sigma = 3.0;  gamma = 0.5
+        lambdas                 = [8.0, 16.0, 32.0];  psis = [0.0, np.pi / 2];  ksize = 11; sigma = 3.0;  gamma = 0.5
         bank_left, _            = self.gabor_bank_init(ksize=ksize, sigma=sigma, lambdas=lambdas, gamma=gamma, psis=psis, thetas=thetas)
         bank_right, _           = self.gabor_bank_init(ksize=ksize, sigma=sigma, lambdas=lambdas, gamma=gamma, psis=psis, thetas=thetas)
 
@@ -2895,17 +2895,29 @@ class ShazamDepthEstimator:
             img_left                = zoom(img_left,  zoom=0.5, order=1)
             img_right               = zoom(img_right, zoom=0.5, order=1)
 
-        prob_total               = self.softmax_with_threshold(-distance_total, dim=3, T=0.1, x_thr=-3).astype(np.float32)  # shape (N, M, level, D); softmax_with_threshold upcasts to float64, but guidedFilter only accepts CV_32F/CV_8U
+        # show the difference data
+        if debug:
+            img_list                 = [distance_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+            ttl_list                 = [f'Level {m} Distance Volume (row {debug_row})' for m in range(level_num)]
+            self.show_subset(img_list, ttl_list, col_num=2)
+
+            # show the energy data
+            img_list                 = [energy_total[:,:,m] for m in range(level_num)]
+            ttl_list                 = [f'Level {m} Energy Features (row {debug_row})' for m in range(level_num)]
+            self.show_subset(img_list, ttl_list, col_num=2)              
+
+        prob_total               = self.softmax_with_threshold(-distance_total, dim=3, T=0.1, x_thr=-2).astype(np.float32)  # shape (N, M, level, D); softmax_with_threshold upcasts to float64, but guidedFilter only accepts CV_32F/CV_8U
 
         # Edge-aware cost aggregation: guided-filter every disparity channel of each level's
         # probability volume in one call, guided by the full-resolution left image. This is the
         # direct replacement for the commented-out anisotropic_filter_with_edges stub in
         # multiscale_disparity_with_energy.
-        prob_filtered            = np.empty_like(prob_total)
-        for level in range(level_num):
-            prob_filtered[:, :, level, :] = cv.ximgproc.guidedFilter(
-                guide=img_left_ref, src=prob_total[:, :, level, :], radius=5, eps=50.0
-            )
+        prob_filtered            = prob_total.copy()
+        # prob_filtered            = np.empty_like(prob_total)
+        # for level in range(level_num):
+        #     prob_filtered[:, :, level, :] = cv.ximgproc.guidedFilter(
+        #         guide=img_left_ref, src=prob_total[:, :, level, :], radius=5, eps=50.0
+        #     )
 
         if debug:
             img_list = [prob_total[debug_row, :, m, :].squeeze().T for m in range(level_num)]
@@ -2934,8 +2946,8 @@ class ShazamDepthEstimator:
         disp_index_clean           = self.joint_bilateral_filtering(
             img_left_ref, disp_index, spatial_sigma=3.0, range_sigma=5.0, radius=3, iter_num=2
         )
-        disp_index_final           = disp_index.copy()
-        disp_index_final[ambiguous]            = disp_index_clean[ambiguous]
+        disp_index_final             = disp_index.copy()
+        disp_index_final[ambiguous]  = disp_index_clean[ambiguous]
         disp_index_final[disp_confidence < 0.05] = 0  # mask out very low confidence areas
 
         if debug:
@@ -5444,20 +5456,22 @@ class TestShazamDepthEstimator():
         ""
         
         d               = DataSource()
-        ret             = d.init_image(21) # 4-ok,7-ok,11-nok,21-sim,26-ok, 54-chair, 55-office far,56-office-chess-ok, ,62,66-nok, 71-home, 601-ok, 621,622,623-mbox
+        # 4-ok,7-ok,11-nok,21-sim,26-ok, 54-chair, 55-office far,56-office-chess-ok, ,62,66-nok, 71-home, 601-ok, 621,622,623-mbox
+        # 181,182,183,184-pickle
+        ret             = d.init_image(184) 
         d.show_images_left_right()
         d.show_images_depth()
         img_left, img_right = d.imgL, d.imgR
 
-        debug_row       = 125 #140   # set to None to disable per-row debug plots
+        debug_row       = 400 #140   # set to None to disable per-row debug plots
 
         p               = ShazamDepthEstimator()
         #prob            = p.gabor_image_disparity_down_up(img_left, img_right, debug_row=debug_row)
         #prob            = p.gabor_image_disparity_down_up_on_volume(img_left, img_right, debug_row=debug_row)
-        prob            = p.multiscale_disparity(img_left, img_right, debug_row=debug_row)
+        #prob            = p.multiscale_disparity(img_left, img_right, debug_row=debug_row)
         #prob            = p.multiscale_disparity_pixel_features(img_left, img_right, debug_row=debug_row)
         #prob            = p.multiscale_disparity_with_energy(img_left, img_right, debug_row=debug_row)
-        #prob            = p.multiscale_disparity_edge_aware(img_left, img_right, debug_row=debug_row)
+        prob            = p.multiscale_disparity_edge_aware(img_left, img_right, debug_row=debug_row)
         
         
         return True

@@ -185,7 +185,8 @@ class ShazamRunner:
                 
             #disp_s = self.estimator.gabor_image_disparity_down_up_full_volume( left_s, right_s, debug_row=None).astype(np.float32)
             #disp_s = self.estimator.multiscale_disparity( left_s, right_s, debug_row=None)
-            disp_s = self.estimator.multiscale_disparity_with_energy( left_s, right_s, debug_row=None)
+            #disp_s = self.estimator.multiscale_disparity_with_energy( left_s, right_s, debug_row=None)
+            disp_s = self.estimator.multiscale_disparity_edge_aware( left_s, right_s, debug_row=None)
         finally:
             # Release figures created by the estimator before returning.
             plt.close('all')
