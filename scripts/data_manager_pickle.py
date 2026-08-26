@@ -720,11 +720,11 @@ class DataSource:
         # Per-session metadata, keyed by JSON path.
         self.sessions: dict[str, dict[str, Any]] = {}
         # Cached CAD point clouds keyed by cad_path.
-        self._cad_cache: dict[str, o3d.geometry.PointCloud] = {}
+        self.cad_cache: dict[str, o3d.geometry.PointCloud] = {}
         # Cached CAD triangle meshes (in metres) keyed by cad_path.
-        self._cad_mesh_cache: dict[str, o3d.geometry.TriangleMesh] = {}
+        self.cad_mesh_cache: dict[str, o3d.geometry.TriangleMesh] = {}
 
-        self._background_mesh_cache: dict[str, o3d.geometry.TriangleMesh] = {}  # background mesh - plate
+        self.cad_background_mesh_cache: dict[str, o3d.geometry.TriangleMesh] = {}  # background mesh - plate
 
         # Flat per-capture index. Each entry has at least:
         #   ``json_path``, ``capture_idx``, plus eager copies of useful fields.
@@ -763,9 +763,9 @@ class DataSource:
         """
         self.items.clear()
         self.sessions.clear()
-        self._cad_cache.clear()
-        self._cad_mesh_cache.clear()
-        self._background_mesh_cache.clear()
+        self.cad_cache.clear()
+        self.cad_mesh_cache.clear()
+        self.cad_background_mesh_cache.clear()
 
         if json_paths is not None:
             session_jsons: list[str] = [translate_path(p) for p in json_paths]
@@ -834,9 +834,9 @@ class DataSource:
         """
         self.items.clear()
         self.sessions.clear()
-        self._cad_cache.clear()
-        self._cad_mesh_cache.clear()
-        self._background_mesh_cache.clear()
+        self.cad_cache.clear()
+        self.cad_mesh_cache.clear()
+        self.cad_background_mesh_cache.clear()
 
         root_path = Path(translate_path(root))
         if not root_path.is_dir():
@@ -1002,6 +1002,171 @@ class DataSource:
         return out
 
     # ------------------------------------------------------------------
+    # Self-contained ``scene.json`` layout (IQLab0 ``Pickle_test_*`` folders)
+    # ------------------------------------------------------------------
+
+    def index_scene_json(self, scene_json_path: str | os.PathLike[str]) -> None:
+        """Load one self-contained ``scene.json`` and append its captures.
+
+        This is the layout produced under e.g. ``IQLab0/2026_08/master/<ts>/
+        Pickle_test_<serial>/scene.json`` — no Excel manifest, and every
+        calibration value (``t_camera_to_tooltip``, ``t_cad_to_user``,
+        ``t_user_to_base``, intrinsics/baseline) lives inside the file
+        itself rather than in module-level constants.
+
+        Captures are grouped as ``entries[]`` (one per robot pose), each
+        holding a ``robot_position`` and a nested ``captures[]`` list of
+        repeated frames (each with an ``images[]`` group in the same
+        ``{image_type, path}`` shape used by :meth:`index_session`).
+        """
+        path = Path(translate_path(scene_json_path))
+        if not path.exists():
+            log.warning(f"scene.json missing, skipping: {path}")
+            return
+
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                scene = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"Failed to read scene.json {path}: {exc}")
+            return
+
+        entries = list(scene.get("entries", []))
+        if not entries:
+            log.warning(f"scene.json has no entries: {path}")
+            return
+
+        cad_name            = scene.get("cad_name", "")
+        cad_path            = translate_path(scene.get("cad_path", ""))
+        t_camera_tooltip    = np.array(scene.get("t_camera_to_tooltip", np.eye(4)), dtype=np.float64)
+        t_cad_to_user        = np.array(scene.get("t_cad_to_user", T_CAD_TO_USER), dtype=np.float64)
+        t_user_to_base       = np.array(scene.get("t_user_to_base", T_USER_TO_BASE), dtype=np.float64)
+        device_info          = scene.get("device_info", {}) or {}
+        intrinsics           = device_info.get("intrinsics", {}) or {}
+        baseline_mm          = device_info.get("baseline", 0.05) * 1000.0
+        bf                   = baseline_mm * intrinsics.get("fx", 660.0)
+
+        background_cad_name = scene.get("plate_cad_name", "thorlab matrix")
+        background_cad_path = translate_path(
+            scene.get("plate_cad_path", r"..\assets\thorlab matrix.STL")
+        )
+
+        self.sessions[str(path)] = {
+            "scene"                 : scene,
+            "cad_path"              : cad_path,
+            "cad_name"              : cad_name,
+            "background_cad_path"   : background_cad_path,
+            "background_cad_name"   : background_cad_name,
+            "t_camera_tooltip"      : t_camera_tooltip,
+            "t_cad_to_user"         : t_cad_to_user,
+            "t_user_to_base"        : t_user_to_base,
+            "intrinsics"            : intrinsics,
+            "bf"                    : bf,
+            "baseline_mm"           : baseline_mm,
+        }
+
+        capture_idx = 0
+        for entry_idx, entry in enumerate(entries):
+            robot_position = entry.get("robot_position", {}) or {}
+            frames = entry.get("captures", []) or []
+            for frame_idx, frame in enumerate(frames):
+                paths = self._extract_capture_paths(frame)
+                self.items.append(
+                    {
+                        "json_path"         : str(path),  # session address
+                        "capture_idx"       : capture_idx,
+                        "entry_idx"         : entry_idx,
+                        "frame_idx"         : frame_idx,
+                        **paths,
+                        "t_robot_position"  : robot_position,
+                    }
+                )
+                capture_idx += 1
+
+        return capture_idx
+
+    def init_multi_scene_json(
+        self,
+        root: str | os.PathLike[str],
+        scene_glob: str = "**/scene.json",
+        session_pattern: Optional[re.Pattern[str] | str] = None,
+        keywords: Optional[Sequence[str]] = None,
+    ) -> int:
+        """Index every self-contained ``scene.json`` found under ``root``.
+
+        Unlike :meth:`init_multi_directory` (which expects a ``data
+        path.xlsx`` manifest per session folder), this walks ``root`` for
+        every ``scene.json`` matching ``scene_glob`` and indexes each with
+        :meth:`index_scene_json`. Useful for roots like
+        ``IQLab0/2026_08/master`` where every timestamped session folder may
+        contain one *or several* ``Pickle_test*_<serial>`` capture folders,
+        each with its own ``scene.json``.
+
+        Parameters
+        ----------
+        root : root directory to search. May be a UNC path; translated via
+            :func:`translate_path`.
+        scene_glob : glob (relative to ``root``) used to locate ``scene.json``
+            files. Defaults to ``"**/scene.json"`` so any nesting depth is
+            matched.
+        session_pattern : optional regex (string or compiled) applied to the
+            full ``scene.json`` path; only matches are indexed.
+        keywords : optional list of case-insensitive substrings; if given,
+            only ``scene.json`` paths containing at least one keyword are
+            included (e.g. ``["Pickle_test1"]`` to select one capture folder
+            out of several taken in the same session).
+
+        Returns
+        -------
+        int : the total number of indexed capture items.
+        """
+        self.items.clear()
+        self.sessions.clear()
+        self.cad_cache.clear()
+        self.cad_mesh_cache.clear()
+        self.cad_background_mesh_cache.clear()
+        self.excel_path = None
+        self.manifest_df = None
+
+        root_path = Path(translate_path(root))
+        if not root_path.is_dir():
+            log.error(f"Multi scene.json root not found or unreadable: {root_path}")
+            return 0
+
+        scene_paths = sorted(root_path.glob(scene_glob))
+
+        if session_pattern is not None:
+            session_re = (
+                re.compile(session_pattern)
+                if isinstance(session_pattern, str) else session_pattern
+            )
+            scene_paths = [p for p in scene_paths if session_re.search(str(p))]
+
+        if keywords:
+            keywords_upper = [k.upper() for k in keywords]
+            scene_paths = [
+                p for p in scene_paths
+                if any(kw in str(p).upper() for kw in keywords_upper)
+            ]
+
+        if not scene_paths:
+            log.warning(
+                f"No scene.json files matched under {root_path} "
+                f"(glob={scene_glob!r}, keywords={keywords})"
+            )
+            return 0
+
+        for scene_path in scene_paths:
+            self.index_scene_json(scene_path)
+
+        log.info(
+            f"DataSource: indexed {len(self.items)} captures across "
+            f"{len(self.sessions)} sessions from {len(scene_paths)} scene.json "
+            f"files under {root_path}"
+        )
+        return len(self.items)
+
+    # ------------------------------------------------------------------
     # CAD / intrinsics helpers
     # ------------------------------------------------------------------
     def render_points_from_mesh(self, mesh_t: o3d.t.geometry.TriangleMesh) -> o3d.geometry.PointCloud:
@@ -1049,7 +1214,7 @@ class DataSource:
 
         Caches in two tiers:
 
-        1. In-memory ``self._cad_cache`` keyed by ``cad_path`` (per-process).
+        1. In-memory ``self.cad_cache`` keyed by ``cad_path`` (per-process).
         2. On-disk cache under ``$FAST_FS_PICKLE_CACHE`` (default:
            ``~/.cache/fast_fs_pickle/cad_pcd``). The slow step here is
            ``sample_points_poisson_disk(150_000)`` (~10 s per unique CAD).
@@ -1058,8 +1223,8 @@ class DataSource:
         """
         if not cad_path:
             return None
-        if cad_path in self._cad_cache:
-            return self._cad_cache[cad_path]
+        if cad_path in self.cad_cache:
+            return self.cad_cache[cad_path]
 
         if not os.path.exists(cad_path):
             log.warning(f"CAD path missing: {cad_path}")
@@ -1074,7 +1239,7 @@ class DataSource:
                     log.debug(
                         f"CAD PCD cache hit ({disk_cache_path.name}) for {cad_path}"
                     )
-                    self._cad_cache[cad_path] = cad_pcd
+                    self.cad_cache[cad_path] = cad_pcd
                     return cad_pcd
             except Exception as exc:  # noqa: BLE001
                 log.warning(
@@ -1097,9 +1262,9 @@ class DataSource:
             use_triangle_normal=True,
         )
 
-        self._cad_cache[cad_path]      = cad_pcd
+        self.cad_cache[cad_path]      = cad_pcd
         # Also cache the metres-scaled mesh for raycast rendering.
-        self._cad_mesh_cache[cad_path] = mesh
+        self.cad_mesh_cache[cad_path] = mesh
 
         # Persist to disk so future runs / forked workers skip the resample.
         if disk_cache_path is not None:
@@ -1138,8 +1303,8 @@ class DataSource:
         """Load and cache the CAD mesh, scaled to metres."""
         if not cad_path:
             return None
-        if cad_path in self._cad_mesh_cache:
-            return self._cad_mesh_cache[cad_path]
+        if cad_path in self.cad_mesh_cache:
+            return self.cad_mesh_cache[cad_path]
 
         if not os.path.exists(cad_path):
             log.warning(f"CAD path missing: {cad_path}")
@@ -1153,7 +1318,7 @@ class DataSource:
         mesh.scale(0.001, center=(0.0, 0.0, 0.0))  # mm -> m
         if not mesh.has_vertex_normals():
             mesh.compute_vertex_normals()
-        self._cad_mesh_cache[cad_path] = mesh
+        self.cad_mesh_cache[cad_path] = mesh
         return mesh
     
     def load_background_mesh_flat(self,
@@ -1188,9 +1353,9 @@ class DataSource:
         ``(H, W)`` ``float32`` depth image. Pixels are guaranteed to be
         populated as long as the background plane covers the field of view.
         """
-        #if self._background_mesh_cache is not None:
-        if len(self._background_mesh_cache) > 0:
-            return self._background_mesh_cache
+        #if self.cad_background_mesh_cache is not None:
+        if len(self.cad_background_mesh_cache) > 0:
+            return self.cad_background_mesh_cache
 
         # Determine where to place the background plane.
         if background_z_m is None:
@@ -1231,7 +1396,7 @@ class DataSource:
             vertices=o3d.utility.Vector3dVector(bg_vertices),
             triangles=o3d.utility.Vector3iVector(bg_triangles),
         )
-        self._background_mesh_cache = bg_mesh
+        self.cad_background_mesh_cache = bg_mesh
         return bg_mesh
     
     def load_background_mesh(self, background_cad_path: str) -> Optional[o3d.geometry.TriangleMesh]:
@@ -1239,8 +1404,8 @@ class DataSource:
         if len(background_cad_path) < 2:
             background_cad_path = r".\assets\thorlab matrix.STL"  # Default path to the background CAD mesh
 
-        if self._background_mesh_cache:
-            return self._background_mesh_cache
+        if self.cad_background_mesh_cache:
+            return self.cad_background_mesh_cache
         
         # resolve for linus machine
         if not os.path.exists(background_cad_path):
@@ -1272,7 +1437,7 @@ class DataSource:
         mesh.rotate(R, center=(0, 0, 0))
         #pcd.transform(T_camera_cad)
 
-        self._background_mesh_cache = mesh
+        self.cad_background_mesh_cache = mesh
         return mesh
 
     def get_intrinsics_matrix(self, item) -> tuple[np.ndarray, np.ndarray]:
@@ -1381,10 +1546,19 @@ class DataSource:
                 log.warning(f"Failed to load vertices {vertices_path}: {exc}")
 
         # Pose composition: camera <- CAD using Uri_26_06_17.py's convention.
+        # Sessions loaded from a self-contained ``scene.json`` (see
+        # :meth:`index_scene_json`) carry their own ``t_cad_to_user`` /
+        # ``t_user_to_base``; older Excel-manifest sessions fall back to the
+        # module-level constants.
         t_camera_tooltip    = session["t_camera_tooltip"]
+        t_cad_to_user       = session.get("t_cad_to_user", T_CAD_TO_USER)
+        t_user_to_base      = session.get("t_user_to_base", T_USER_TO_BASE)
         t_robot_position    = meta["t_robot_position"]
         t_tool_to_base      = build_t_tool_to_base(t_robot_position)
-        t_camera_cad        = compose_t_camera_cad(t_camera_tooltip, t_robot_position)
+        t_camera_cad        = compose_t_camera_cad(
+            t_camera_tooltip, t_robot_position,
+            t_cad_to_user=t_cad_to_user, t_user_to_base=t_user_to_base,
+        )
 
         cad_pcd             = self.load_cad_pcd(session["cad_path"])
         cad_pcd_aligned: Optional[o3d.geometry.PointCloud] = None
@@ -1425,8 +1599,8 @@ class DataSource:
             # transforms / metadata
             "t_camera_tooltip"      : t_camera_tooltip,
             "t_tool_to_base"        : t_tool_to_base,
-            "t_user_to_base"        : T_USER_TO_BASE,
-            "t_cad_to_user"         : T_CAD_TO_USER,
+            "t_user_to_base"        : t_user_to_base,
+            "t_cad_to_user"         : t_cad_to_user,
             "t_camera_cad"          : t_camera_cad,
             "t_camera_cad_icp"      : t_camera_cad_icp,
             "t_robot_position"      : t_robot_position,
@@ -1684,7 +1858,7 @@ class DataSource:
                 f"Item {index}: depth_img is missing; cannot derive frame size."
             )
         h, w        = depth_img.shape[:2]
-        cam_matrix, cam_dist_coeffs = self.get_intrinsics_matrix(item["json_path"])
+        cam_matrix, cam_dist_coeffs = self.get_intrinsics_matrix(item)
 
         if method == "splat":
 
@@ -1953,9 +2127,11 @@ class DataSource:
         #edge_mask = cv2.morphologyEx(raw_edges, cv2.MORPH_CLOSE, kernel)
 
         
-        valid_erode  = cv2.morphologyEx(valid_u8, cv2.MORPH_ERODE, kernel)
         valid_dilate = cv2.morphologyEx(valid_u8, cv2.MORPH_DILATE, kernel)
-        edge_mask    = cv2.bitwise_and(255 - valid_erode, valid_dilate)
+        valid_erode  = cv2.morphologyEx(valid_dilate, cv2.MORPH_ERODE, kernel)
+        
+        edge_mask    = cv2.bitwise_and(255 - valid_erode, valid_dilate)      # edge only
+        edge_mask    = cv2.morphologyEx(edge_mask, cv2.MORPH_DILATE, kernel) # make it thicker
 
         item["edge_mask"] = edge_mask
 
@@ -2131,7 +2307,7 @@ class DataSource:
     def show_item(self, item: dict[str, Any]) -> None:
         """Show IR-left, IR-right, depth and RGB for a loaded item."""
         suptitle = (
-            f"{Path(item['json_path']).parent.name} / capture {item['capture_idx']:04d}"
+            f"{Path(item['ir_left_path']).name} / capture {item['capture_idx']:04d}"
         )
         self.show_subset( [ item.get("ir_left_img"),  item.get("ir_right_img"),    item.get("depth_img"),  item.get("rgb_img"),  ],
             ["IR left", "IR right", "Depth [mm]", "RGB"],
@@ -2934,7 +3110,197 @@ class TestDataSource(unittest.TestCase):
 
         p = DataSource()
         p.show_subset(fdata,fnames)
-        plt.show()            
+        plt.show()
+
+    def test_index_scene_json(self):
+        """Read one self-contained ``scene.json`` (no Excel manifest)."""
+        scene_json = (
+            r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0"
+            r"\2026_08\master\2026-08-23--17-09-01\Pickle_test_336222073841"
+            r"\scene.json"
+        )
+        source = DataSource()
+        source.index_scene_json(scene_json)
+        self.assertGreater(len(source.items), 0)
+        self.assertEqual(len(source.sessions), 1)
+
+        first = source.items[0]
+        self.assertIn("entry_idx", first)
+        self.assertIn("frame_idx", first)
+        self.assertTrue(first["vertices_path"])
+        self.assertTrue(os.path.exists(first["vertices_path"]))
+
+        out = source.get_item(0, debug=False)
+        self.assertEqual(out["t_camera_cad"].shape, (4, 4))
+        self.assertTrue(out["depth_pcd_raw"] is not None and len(out["depth_pcd_raw"].points) > 0)
+
+    def test_init_multi_scene_json(self):
+        """Read every ``scene.json`` under a ``master`` root in one shot."""
+        root = (
+            r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0"
+            r"\2026_08\master"
+        )
+        source = DataSource()
+        count = source.init_multi_scene_json(root)
+        log.info(f"init_multi_scene_json indexed {count} captures across {len(source.sessions)} sessions")
+        self.assertGreater(count, 0)
+        self.assertGreater(len(source.sessions), 1)
+
+        out = source.get_item(0, debug=True)
+        self.assertEqual(out["t_camera_cad"].shape, (4, 4))
+
+    def test_get_item_sequence(self):
+        """Pick a random ``scene.json`` entry and show every frame in its
+        repeat-capture sequence (IR left/right, depth, RGB per frame)."""
+        scene_json = (
+            r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0"
+            r"\2026_08\master\2026-08-23--17-09-01\Pickle_test_336222073841"
+            r"\scene.json"
+        )
+        source = DataSource()
+        source.index_scene_json(scene_json)
+        self.assertGreater(len(source.items), 0)
+
+        random_item = source.items[int(np.random.randint(0, len(source.items)))]
+        json_path   = random_item["json_path"]
+        entry_idx   = random_item["entry_idx"]
+
+        sequence_indices = [
+            i for i, meta in enumerate(source.items)
+            if meta["json_path"] == json_path and meta["entry_idx"] == entry_idx
+        ]
+        self.assertGreater(len(sequence_indices), 0)
+        log.info(
+            f"test_get_item_sequence: entry {entry_idx} has "
+            f"{len(sequence_indices)} frames in its sequence"
+        )
+
+        for idx in sequence_indices:
+            item = source.get_item(idx, debug=False)
+            self.assertIsNotNone(item.get("ir_left_img"))
+            source.show_item(item)
+        plt.show()
+
+    def test_measure_depth_noise(self):
+        """Stack every depth frame from one random repeat-capture sequence
+        and measure the per-pixel temporal noise (std over the stack)."""
+        scene_json = (
+            r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0"
+            r"\2026_08\master\2026-08-23--17-09-01\Pickle_test_336222073841"
+            r"\scene.json"
+        )
+        source = DataSource()
+        source.index_scene_json(scene_json)
+        self.assertGreater(len(source.items), 0)
+
+        random_item = source.items[int(np.random.randint(0, len(source.items)))]
+        json_path   = random_item["json_path"]
+        entry_idx   = random_item["entry_idx"]
+
+        sequence_indices = [
+            i for i, meta in enumerate(source.items)
+            if meta["json_path"] == json_path and meta["entry_idx"] == entry_idx
+        ]
+        self.assertGreater(len(sequence_indices), 1, "need >=2 frames to measure noise")
+        log.info(
+            f"test_measure_depth_noise: entry {entry_idx} has "
+            f"{len(sequence_indices)} frames in its sequence"
+        )
+
+        depth_stack = np.stack(
+            [
+                source.get_item(idx, debug=False)["depth_img"].astype(np.float32)
+                for idx in sequence_indices
+            ],
+            axis=2,
+        )  # (H, W, num_frames)
+
+        valid_mask = np.all(depth_stack > 0, axis=2)
+        noise_std  = np.std(depth_stack, axis=2)
+        mean_std   = float(noise_std[valid_mask].mean()) if valid_mask.any() else float("nan")
+
+        log.info(
+            f"test_measure_depth_noise: depth noise std over {depth_stack.shape[2]} frames "
+            f"= {mean_std:.3f} mm (mean over {int(valid_mask.sum())} valid pixels)"
+        )
+        self.assertFalse(np.isnan(mean_std))
+
+        plt.figure()
+        plt.imshow(np.where(valid_mask, noise_std, np.nan), cmap="viridis")
+        plt.colorbar(label="depth noise std (mm)")
+        plt.title(f"Depth noise std over {depth_stack.shape[2]} frames (mean={mean_std:.2f} mm)")
+        plt.show()
+
+    def test_measure_depth_noise_on_mask(self):
+        """Stack every depth frame from one random repeat-capture sequence
+        and measure the per-pixel temporal noise (std over the stack)
+        restricted to the object's interior, excluding its silhouette
+        edges (which are derived from the CAD-projected depth)."""
+        scene_json = (
+            r"\\svm.realsenseai.com\RealSense_Validation\VIDB\IQ_AUTO\IQLab0"
+            r"\2026_08\master\2026-08-23--17-09-01\Pickle_test_336222073841"
+            r"\scene.json"
+        )
+        source = DataSource()
+        source.index_scene_json(scene_json)
+        self.assertGreater(len(source.items), 0)
+
+        random_item = source.items[int(np.random.randint(0, len(source.items)))]
+        json_path   = random_item["json_path"]
+        entry_idx   = random_item["entry_idx"]
+
+        sequence_indices = [
+            i for i, meta in enumerate(source.items)
+            if meta["json_path"] == json_path and meta["entry_idx"] == entry_idx
+        ]
+        self.assertGreater(len(sequence_indices), 1, "need >=2 frames to measure noise")
+        log.info(
+            f"test_measure_depth_noise_on_mask: entry {entry_idx} has "
+            f"{len(sequence_indices)} frames in its sequence"
+        )
+
+        # Object silhouette + edge mask, derived once from the CAD projection
+        # of the sequence's first frame (the object doesn't move within a
+        # repeat-capture sequence).
+        proj_item   = source.get_item_projected(sequence_indices[0], debug=False)
+        object_mask = proj_item["depth_cad_projected"] > 0
+        self.assertGreater(int(np.count_nonzero(object_mask)), 0, "empty object mask")
+
+        proj_item   = source.create_edge_mask(proj_item, closing_radius=3, debug=True)
+        edge_mask   = proj_item["edge_mask"] > 0
+        #core_mask   = object_mask & ~edge_mask
+
+        depth_stack = np.stack(
+            [
+                source.get_item(idx, debug=False)["depth_img"].astype(np.float32)
+                for idx in sequence_indices
+            ],
+            axis=2,
+        )  # (H, W, num_frames)
+
+        valid_mask   = np.all(depth_stack > 0, axis=2)
+        noise_std    = np.std(depth_stack, axis=2)
+        masked_valid = edge_mask & valid_mask
+
+        mean_std = float(noise_std[masked_valid].mean()) if masked_valid.any() else float("nan")
+        log.info(
+            f"test_measure_depth_noise_on_mask: depth noise std over {depth_stack.shape[2]} frames "
+            f"= {mean_std:.3f} mm (mean over {int(masked_valid.sum())} valid object-interior pixels; "
+            f"object={int(object_mask.sum())} px, edge={int(edge_mask.sum())} px)"
+        )
+        self.assertFalse(np.isnan(mean_std))
+
+        fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+        axes[0].imshow(object_mask, cmap="gray")
+        axes[0].set_title("object mask")
+        axes[1].imshow(edge_mask, cmap="gray")
+        axes[1].set_title("edge mask")
+        im = axes[2].imshow(np.where(masked_valid, noise_std, np.nan), cmap="viridis")
+        axes[2].set_title(f"noise std under edge mask (mean={mean_std:.2f} mm)")
+        fig.colorbar(im, ax=axes[2], label="depth noise std (mm)")
+        fig.suptitle("test_measure_depth_noise_on_mask")
+        plt.tight_layout()
+        plt.show()
 
 
 def RunTest() -> None:
@@ -2950,7 +3316,7 @@ def RunTest() -> None:
     #tst.test_get_item_and_scene_projected()
     #tst.test_create_edge_mask()
     #tst.test_get_item_and_compute_icp_metric()
-    tst.test_get_item_and_compute_chamfer_distance()
+    #tst.test_get_item_and_compute_chamfer_distance()
 
     #tst.test_project_on_camera()
     #tst.test_show_icp_alignment()  # no file csv
@@ -2958,7 +3324,13 @@ def RunTest() -> None:
     #tst.test_get_grid_coordinates()
     # tst.test_match_grid_to_cad()
     #tst.test_load_and_show_png()
-    
+
+    # new data with multiple sequences per position
+    #tst.test_index_scene_json()
+    #tst.test_get_item_sequence()
+    #tst.test_init_multi_scene_json()
+    #tst.test_measure_depth_noise()
+    tst.test_measure_depth_noise_on_mask()
 
 if __name__ == "__main__":
     RunTest()

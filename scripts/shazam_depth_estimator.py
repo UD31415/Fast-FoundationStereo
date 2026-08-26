@@ -620,6 +620,10 @@ class ShazamDepthEstimator:
             img_left = img_left[..., np.newaxis]
         if img_volume.ndim == 2:
             img_volume = img_volume[..., np.newaxis]
+        if img_left.dtype == np.uint8:
+            img_left = img_left.astype(np.float32)
+        if img_volume.dtype == np.uint8:
+            img_volume = img_volume.astype(np.float32)            
             
         H_lr, W_lr, C_lr    = img_left.shape
         H_hr, W_hr, C_hr    = img_volume.shape
@@ -642,7 +646,7 @@ class ShazamDepthEstimator:
             norm_factor             = np.zeros_like(img_left, dtype=np.float32)
             for dy in range(-radius, radius + 1):
                 for dx in range(-radius, radius + 1):
-                    s_w             = spatial_weights[dy + radius, dx + radius]
+                    s_w             = 1 #spatial_weights[dy + radius, dx + radius]
 
                     #lr_val         = img_volume[y_index, x_index,:] - img_volume[y_index + dy, x_index + dx,:]
                     lr_val          = img_volume[y_index + dy, x_index + dx,:]
@@ -764,13 +768,16 @@ class ShazamDepthEstimator:
         """
         # Convert image to grayscale if it is not already
         img_h, img_w    = img.shape[:2]
-        if img_h < 32 or img_w < 32:
-            raise ValueError("Image must be at least 32x32 pixels in size.")
+        if img_h < 8 or img_w < 8:
+            raise ValueError("Image must be at least 8x8 pixels in size.")
         
-        
-        # Apply box filter
+        # params
         #filtered_img    = self.apply_box_filter(img)
         filtered_img    = img.copy().astype(np.float32)
+        num_offsets     = 4
+        # Initialize the hash values
+        img_feat        = np.zeros((img_h, img_w, num_offsets), dtype=np.float32)        
+
 
         # Create compares the central pixel with the rest according to the offset
         if feat_type == 'center':
@@ -793,17 +800,66 @@ class ShazamDepthEstimator:
         max_offset      = np.max(np.abs(pixel_offsets))+1
         num_offsets    = pixel_offsets.shape[0]
 
-        # Initialize the hash values
-        img_feat        = np.zeros((img_h, img_w, num_offsets), dtype=np.float32)
-        bit_index       = 0
         center_img      = filtered_img[max_offset:-max_offset,max_offset:-max_offset]
         for k in range(num_offsets):
             offset      = pixel_offsets[k]
             # image difference
             offset_img  = filtered_img[max_offset + offset[1]:-max_offset + offset[1], max_offset + offset[0]:-max_offset + offset[0]]
-            diff_img    = offset_img #- center_img
+            diff_img    = offset_img - center_img
             #sign_img    = np.sign(diff_img)  # Get the sign of the difference
             img_feat[max_offset:-max_offset,max_offset:-max_offset,k] = diff_img
+
+        #print(f"Created complex hash with {bit_index} bits.")
+        return img_feat 
+
+    def pixel_features_multiple(self, img, feat_types = ['center']):
+        """
+        Converts the image to a hashable feature. Each image offset is compared to each other
+        """
+        # Convert image to grayscale if it is not already
+        img_h, img_w    = img.shape[:2]
+        if img_h < 32 or img_w < 32:
+            raise ValueError("Image must be at least 32x32 pixels in size.")
+        
+        # params
+        #filtered_img    = self.apply_box_filter(img)
+        filtered_img    = img.copy().astype(np.float32)
+        feat_num        = len(feat_types)
+        num_offsets     = 4
+        # Initialize the hash values
+        img_feat        = np.zeros((img_h, img_w, num_offsets, feat_num), dtype=np.float32)        
+
+        for m,feat_type in enumerate(feat_types):
+
+            # Create compares the central pixel with the rest according to the offset
+            if feat_type == 'center':
+                pixel_offsets   = np.array([(1, 0), (0, 1), (-1, 0), (0, -1)])
+            elif feat_type == 'right':
+                pixel_offsets   = np.array([(2, 0), (1, 0), (2, 1), (2, -1)]) # bias right
+            elif feat_type == 'left':
+                pixel_offsets   = np.array([(-2, 0), (-1, 0), (-2, 1), (-2, -1)]) # bias left
+            elif feat_type == 'up':
+                pixel_offsets   = np.array([(-1, 2), (0, 2), (1, 2), (0, 1)]) # bias up     
+            elif feat_type == 'down':
+                pixel_offsets   = np.array([(-1, -2), (0, -2), (1, -2), (0, -1)]) # bias down  
+            elif feat_type == 'center_big':
+                pixel_offsets   = np.array([(3, 0), (0, 3), (-3, 0), (0, -3)])                               
+            else:
+                pixel_offsets   = np.array([(1, 0), (0, 1), (-1, 0), (0, -1)])
+            #pixel_offsets   = np.array([(2, 0), (1, 0), (2, 1), (2, -1)]) # bias right
+            #pixel_offsets   = np.array([(1, 0), (0, 1), (-1, 0), (0, -1), (3, 0), (0, 2), (-3, 0), (0, -2)])*3
+            #pixel_offsets   = np.array([(1, 0), (-1, 0), (3, 0), (-3, 0), (7, 0), (-7, 0)])*2
+            max_offset      = np.max(np.abs(pixel_offsets))+1
+            num_offsets    = pixel_offsets.shape[0]
+
+            center_img      = filtered_img[max_offset:-max_offset,max_offset:-max_offset]
+            for k in range(num_offsets):
+                offset      = pixel_offsets[k]
+                # image difference
+                offset_img  = filtered_img[max_offset + offset[1]:-max_offset + offset[1], max_offset + offset[0]:-max_offset + offset[0]]
+                diff_img    = offset_img #- center_img
+                #sign_img    = np.sign(diff_img)  # Get the sign of the difference
+                img_feat[max_offset:-max_offset,max_offset:-max_offset,k,m] = diff_img
 
         #print(f"Created complex hash with {bit_index} bits.")
         return img_feat 
@@ -2847,6 +2903,7 @@ class ShazamDepthEstimator:
 
         level_num               = 4
         max_disparity           = 128
+        T_weights               = [0.1, 0.2, 0.4, 0.8]
 
         row_num, col_num        = img_left.shape[:2]
 
@@ -2855,7 +2912,7 @@ class ShazamDepthEstimator:
 
         # Gabor bank parameters - same bank as multiscale_disparity_with_energy.
         thetas                  = [0.0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
-        lambdas                 = [8.0, 16.0, 32.0];  psis = [0.0, np.pi / 2];  ksize = 11; sigma = 3.0;  gamma = 0.5
+        lambdas                 = [8.0, 16.0, 32.0];  psis = [0.0, np.pi / 2];  ksize = 9; sigma = 3.0;  gamma = 0.5
         bank_left, _            = self.gabor_bank_init(ksize=ksize, sigma=sigma, lambdas=lambdas, gamma=gamma, psis=psis, thetas=thetas)
         bank_right, _           = self.gabor_bank_init(ksize=ksize, sigma=sigma, lambdas=lambdas, gamma=gamma, psis=psis, thetas=thetas)
 
@@ -2906,7 +2963,7 @@ class ShazamDepthEstimator:
             ttl_list                 = [f'Level {m} Energy Features (row {debug_row})' for m in range(level_num)]
             self.show_subset(img_list, ttl_list, col_num=2)              
 
-        prob_total               = self.softmax_with_threshold(-distance_total, dim=3, T=0.1, x_thr=-2).astype(np.float32)  # shape (N, M, level, D); softmax_with_threshold upcasts to float64, but guidedFilter only accepts CV_32F/CV_8U
+        prob_total               = self.softmax_with_threshold(-distance_total, dim=3, T=T_weights[level], x_thr=-2).astype(np.float32)  # shape (N, M, level, D); softmax_with_threshold upcasts to float64, but guidedFilter only accepts CV_32F/CV_8U
 
         # Edge-aware cost aggregation: guided-filter every disparity channel of each level's
         # probability volume in one call, guided by the full-resolution left image. This is the
@@ -2914,10 +2971,10 @@ class ShazamDepthEstimator:
         # multiscale_disparity_with_energy.
         prob_filtered            = prob_total.copy()
         # prob_filtered            = np.empty_like(prob_total)
-        # for level in range(level_num):
-        #     prob_filtered[:, :, level, :] = cv.ximgproc.guidedFilter(
-        #         guide=img_left_ref, src=prob_total[:, :, level, :], radius=5, eps=50.0
-        #     )
+        for level in range(level_num):
+            prob_filtered[:, :, level, :] = cv.ximgproc.guidedFilter(
+                guide=img_left_ref, src=prob_total[:, :, level, :], radius=7, eps=50.0
+            )
 
         if debug:
             img_list = [prob_total[debug_row, :, m, :].squeeze().T for m in range(level_num)]
@@ -2943,9 +3000,11 @@ class ShazamDepthEstimator:
         ratio, disp_confidence     = self.disparity_peak_ambiguity(prob_total_final)
         ambiguous                  = (ratio > 0.6) | (disp_confidence < 0.1)
 
-        disp_index_clean           = self.joint_bilateral_filtering(
-            img_left_ref, disp_index, spatial_sigma=3.0, range_sigma=5.0, radius=3, iter_num=2
-        )
+        # disp_index_clean           = self.joint_bilateral_filtering(
+        #     img_left_ref, disp_index, spatial_sigma=3.0, range_sigma=5.0, radius=3, iter_num=2
+        # )
+        disp_index_clean             = disp_index
+
         disp_index_final             = disp_index.copy()
         disp_index_final[ambiguous]  = disp_index_clean[ambiguous]
         disp_index_final[disp_confidence < 0.05] = 0  # mask out very low confidence areas
@@ -2953,6 +3012,135 @@ class ShazamDepthEstimator:
         if debug:
             img_list = [img_left_ref, disp_index, ambiguous.astype(np.float32), disp_index_final]
             ttl_list = ['Left Image', 'Disparity (pre-cleanup)', 'Ambiguous / Edge Pixels', 'Disparity (edge-aware)']
+            self.show_subset(img_list, ttl_list, col_num=2)
+            plt.show()
+
+        return disp_index_final
+
+    def multiscale_disparity_edge_aware_features(self, img_left, img_right, debug_row=None):
+        """
+        Edge-aware variant of multiscale_disparity_with_small feature support.
+
+        """
+        row_index               = debug_row if debug_row is not None else 400
+        debug                   = debug_row is not None
+
+        feature_types           = ['center','left','right','up','down','center_big']
+        level_num               = 4
+        max_disparity           = 128
+        T_weights               = [0.1, 0.2, 0.4, 0.8]
+
+        row_num, col_num        = img_left.shape[:2]
+
+        img_left, img_right     = img_left.astype(np.float32), img_right.astype(np.float32)
+        img_left_ref            = img_left.copy()
+
+        distance_total          = np.zeros((row_num, col_num, level_num, max_disparity), dtype=np.float32)
+        energy_total            = np.zeros((row_num, col_num, level_num), dtype=np.float32)
+
+        for level in range(level_num):
+
+            scale_factor            = 2 ** level
+
+            # scale factor
+            feature_type             = 'center_big' #feature_types[level]
+        
+            # calculate simple features
+            gabor_left                  = self.pixel_features(img_left,  feat_type=feature_type)  # shape (N, M, C)
+            gabor_right                 = self.pixel_features(img_right, feat_type=feature_type) # shape (N, M, C)
+
+            gabor_left,  energy_left    = self.gabor_normalize_responses_with_energy(gabor_left)
+            gabor_right, energy_right   = self.gabor_normalize_responses_with_energy(gabor_right)
+
+            distance_left               = self.gabor_dispartity(gabor_left, gabor_right, max_disparity=max_disparity // scale_factor)  # (row_lvl, col_lvl, D_lvl)
+
+            if scale_factor == 1:
+                distance_full            = distance_left
+                energy_full              = energy_left
+            else:
+                # 1) disparity axis: a simple re-indexing to full-resolution disparity units,
+                #    not a spatial resize - linear interpolation here is fine.
+                distance_full            = zoom(distance_left, zoom=(1, 1, scale_factor), order=1)
+                # 2) spatial axes: nearest-neighbor, so a sharp step at this coarse level stays
+                #    a step instead of turning into a multi-pixel ramp at full resolution.
+                distance_full            = zoom(distance_full, zoom=(scale_factor, scale_factor, 1), order=0)
+                energy_full              = zoom(energy_left, zoom=(scale_factor, scale_factor), order=0)
+
+            # filter
+            #distance_left               = self.anisotropic_filter_with_edges(distance_left, img_left_ref, num_iter=8)
+            #distance_full                  = self.joint_bilateral_filtering(img_left_ref, distance_full, spatial_sigma=3.0, range_sigma=5.1, radius=2, iter_num=3) 
+            #energy_full                  = self.joint_bilateral_filtering(img_left_ref, energy_full, spatial_sigma=3.0, range_sigma=5.1, radius=2, iter_num=3) 
+
+
+            distance_total[:, :, level, :]  = distance_full
+            energy_total[:, :, level]       = energy_full
+
+            # compensate for the level shift, same as multiscale_disparity_with_energy
+            distance_total[:, :, level, :]  = np.roll(distance_total[:, :, level, :], axis=2, shift=-level)
+
+            img_left                = zoom(img_left,  zoom=0.5, order=1)
+            img_right               = zoom(img_right, zoom=0.5, order=1)
+
+        # show the difference data
+        if debug:
+            img_list                 = [distance_total[debug_row,:,m,:].squeeze().T for m in range(level_num)]
+            ttl_list                 = [f'Level {m} Distance Volume (row {debug_row})' for m in range(level_num)]
+            self.show_subset(img_list, ttl_list, col_num=2)
+
+            # show the energy data
+            img_list                 = [energy_total[:,:,m] for m in range(level_num)]
+            ttl_list                 = [f'Level {m} Energy Features (row {debug_row})' for m in range(level_num)]
+            self.show_subset(img_list, ttl_list, col_num=2)              
+
+        prob_total               = self.softmax_with_threshold(-distance_total, dim=3, T=T_weights[level], x_thr=-2).astype(np.float32)  # shape (N, M, level, D); softmax_with_threshold upcasts to float64, but guidedFilter only accepts CV_32F/CV_8U
+
+        # Edge-aware cost aggregation: guided-filter every disparity channel of each level's
+        # probability volume in one call, guided by the full-resolution left image. This is the
+        # direct replacement for the commented-out anisotropic_filter_with_edges stub in
+        # multiscale_disparity_with_energy.
+        prob_filtered            = prob_total.copy()
+        # prob_filtered            = np.empty_like(prob_total)
+        #for level in range(level_num):
+        #    prob_filtered[:, :, level, :] = cv.ximgproc.guidedFilter(guide=img_left_ref, src=prob_total[:, :, level, :], radius=7, eps=50.0)
+
+        if debug:
+            img_list = [prob_total[debug_row, :, m, :].squeeze().T for m in range(level_num)]
+            ttl_list = [f'Level {m} Probability Volume (row {debug_row})' for m in range(level_num)]
+            self.show_subset(img_list, ttl_list, col_num=2)
+
+            img_list = [prob_filtered[debug_row, :, m, :].squeeze().T for m in range(level_num)]
+            ttl_list = [f'Level {m} Edge-Filtered Probability (row {debug_row})' for m in range(level_num)]
+            self.show_subset(img_list, ttl_list, col_num=2)
+
+        # combine levels
+        prob_total_final          = prob_filtered[:, :, 0, :]
+        for m in range(1, level_num):
+            prob_max                 = np.max(prob_total_final, axis=2)[:, :, np.newaxis]
+            prob_total_final         = prob_total_final + (1 - prob_max) * prob_filtered[:, :, m, :]
+
+        # hard argmax + local parabola sub-pixel refinement - never blends two separated modes
+        disp_index                = self.estimate_disparity_from_prob(prob_total_final, estim_type=5)
+
+        # flag pixels whose match is ambiguous (low confidence, or a strong runner-up peak -
+        # the signature of a pixel straddling a depth edge) and clean up only those, guided by
+        # the left image, so confident regions are left untouched.
+        ratio, disp_confidence     = self.disparity_peak_ambiguity(prob_total_final)
+        ambiguous                  = (ratio > 0.6) | (disp_confidence < 0.1)
+
+        # disp_index_clean           = self.joint_bilateral_filtering(
+        #      img_left_ref, disp_index, spatial_sigma=3.0, range_sigma=5.0, radius=3, iter_num=2
+        # )
+        disp_index_clean             = disp_index
+
+        #disp_index_final             = disp_index.copy()
+        disp_index_final             = disp_index_clean.copy()
+        disp_index_final[ambiguous]  = disp_index_clean[ambiguous]
+        disp_index_final[disp_confidence < 0.05] = 0  # mask out very low confidence areas
+        disp_index_final[:,:max_disparity] = 0 # non valid part
+
+        if debug:
+            img_list = [img_left_ref, disp_index, disp_confidence.astype(np.float32), disp_index_final]
+            ttl_list = ['Left Image', 'Disparity (pre-cleanup)', 'Confidence / Edge Pixels', 'Disparity (edge-aware)']
             self.show_subset(img_list, ttl_list, col_num=2)
             plt.show()
 
@@ -3003,15 +3191,16 @@ class ShazamDepthEstimator:
     def convert_depth_from_left_and_right(self, img_left, img_right, img_depth):
         "function to compute depth from images"
         # convert depth image to 3d volume by stacking shifted versions of the image along a new dimension, where each shift corresponds to a different disparity level. This can be useful for stereo matching algorithms that operate on 3D cost volumes, where the cost for each pixel is computed across a range of disparities. By converting the depth image into a 3D volume, we can more easily compare it to the cost volume and compute metrics such as mean squared error or cross-entropy loss for training or evaluation purposes.
-        max_disparity       = 64
+        #max_disparity       = 64
 
 
         # recover disparity         
         img_disparity       = self.convert_depth_to_disparity(img_depth, 500) 
 
         # reproduce volume from matching features
-        img_disparity_new   = self.multiscale_disparity(img_left, img_right)
-
+        #img_disparity_new   = self.multiscale_disparity(img_left, img_right)
+        img_disparity_new   = self.multiscale_disparity_edge_aware_features(img_left, img_right)
+        
         # return back
         img_depth_new       = self.convert_disparity_to_depth(img_disparity_new, 500)
 
@@ -4796,7 +4985,7 @@ class TestShazamDepthEstimator():
         "validation test for context-aware upsampling, similar to test_context_upsampling but with explicit checks"
 
         d               = DataSource()
-        ret             = d.init_image(56)
+        ret             = d.init_image(21)
         self.assertTrue(ret)
         #d.show_images_left_right()
         img_left, _     = d.imgL, d.imgR
@@ -4811,11 +5000,13 @@ class TestShazamDepthEstimator():
 
         # 3) Context-aware refinement
         if baseline.dtype != np.uint8:
-            guide_u8 = cv.normalize(img_left, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
-            src_u8 = cv.normalize(baseline, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+            # guide_u8 = cv.normalize(img_left, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+            # src_u8   = cv.normalize(baseline, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)            
+            guide_u8 = img_left.astype(np.uint8)
+            src_u8   = baseline.astype(np.uint8)
         else:
             guide_u8 = img_left
-            src_u8 = baseline.astype(np.uint8)
+            src_u8   = baseline.astype(np.uint8)
 
         context_guided = cv.ximgproc.guidedFilter(
             guide=guide_u8,
@@ -4827,22 +5018,25 @@ class TestShazamDepthEstimator():
             joint=guide_u8,
             src=src_u8,
             d=7,
-            sigmaColor=18.0,
+            sigmaColor=7.0,
             sigmaSpace=4.0
             )
 
         # fallback if opencv-contrib is unavailable
         context_bilateral = cv.bilateralFilter(src_u8, d=7, sigmaColor=18.0, sigmaSpace=4.0)
 
+        # built in
+        context_manual = p.joint_bilateral_filtering(guide_u8, src_u8, range_sigma=7, iter_num=3)
+
 
         # 5) Visual check
 
-        img_list = [img_left, baseline, context_guided, context_join, context_bilateral]
+        img_list = [img_left, baseline, context_guided, context_join, context_bilateral, context_manual]
         ttl_list = [ 'Guidance Image',  'Upsampled Baseline (Cubic)', 'Context-Aware Upsampled (Guided)',
-            'Context-Aware Upsampled (Joint Bilateral)', 'Context-Aware Upsampled (Bilateral)'
+            'Context-Aware Upsampled (Joint Bilateral)', 'Context-Aware Upsampled (Bilateral)', 'Context Manual'
         ]
-        p.show_subset(img_list, ttl_list)
-
+        p.show_subset(img_list, ttl_list, col_num= 3, vmin = 0, vmax = 120)
+        plt.show()
         return True
 
     def test_down_upsampling_consistency(self):
@@ -5456,14 +5650,16 @@ class TestShazamDepthEstimator():
         ""
         
         d               = DataSource()
-        # 4-ok,7-ok,11-nok,21-sim,26-ok, 54-chair, 55-office far,56-office-chess-ok, ,62,66-nok, 71-home, 601-ok, 621,622,623-mbox
-        # 181,182,183,184-pickle
-        ret             = d.init_image(184) 
+        # 4-ok,7-ok,11-nok,21-sim,26-ok, 54-chair, 55-office far,56-office-chess-ok,57-floor cube
+        # 62,66-nok, 71-home, 601-ok, 621,622,623-mbox
+        # 181,182,183,184,185,186-pickle
+        # inbolt: 601, 602, 603
+        ret             = d.init_image(603) 
         d.show_images_left_right()
-        d.show_images_depth()
+        d.show_images_disparity()
         img_left, img_right = d.imgL, d.imgR
 
-        debug_row       = 400 #140   # set to None to disable per-row debug plots
+        debug_row       = 125 #140   # set to None to disable per-row debug plots
 
         p               = ShazamDepthEstimator()
         #prob            = p.gabor_image_disparity_down_up(img_left, img_right, debug_row=debug_row)
@@ -5471,7 +5667,8 @@ class TestShazamDepthEstimator():
         #prob            = p.multiscale_disparity(img_left, img_right, debug_row=debug_row)
         #prob            = p.multiscale_disparity_pixel_features(img_left, img_right, debug_row=debug_row)
         #prob            = p.multiscale_disparity_with_energy(img_left, img_right, debug_row=debug_row)
-        prob            = p.multiscale_disparity_edge_aware(img_left, img_right, debug_row=debug_row)
+        #prob            = p.multiscale_disparity_edge_aware(img_left, img_right, debug_row=debug_row)
+        prob            = p.multiscale_disparity_edge_aware_features(img_left, img_right, debug_row=debug_row)
         
         
         return True
@@ -5479,7 +5676,7 @@ class TestShazamDepthEstimator():
 #%% App
 class RunApp:
 
-    def __init__(self, video_src = 'd16', frame_size = (1280,720)):
+    def __init__(self, video_src = 'd16', frame_size = (640,360)):
 
         #self.cap = video.create_capture(video_src)
         self.cap            = RealSense(video_src, frame_size = frame_size)
