@@ -3329,8 +3329,8 @@ def RunTest() -> None:
     #tst.test_index_scene_json()
     #tst.test_get_item_sequence()
     #tst.test_init_multi_scene_json()
-    #tst.test_measure_depth_noise()
-    tst.test_measure_depth_noise_on_mask()
+    tst.test_measure_depth_noise()
+    #tst.test_measure_depth_noise_on_mask()
 
 if __name__ == "__main__":
     RunTest()
