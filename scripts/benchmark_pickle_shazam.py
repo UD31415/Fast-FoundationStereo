@@ -140,16 +140,18 @@ CLOSE_RANGE_THRESHOLD_MM = 20.0
 
 # Distance bins used for the per-bin MAE curve — all in mm
 DIST_BINS_MM: List[Tuple[float, float]] = [
-    (0.0,    100.0),
-    (100.0,  200.0),
+    (0.0,    200.0),
     (200.0,  300.0),
     (300.0,  400.0),
     (400.0,  500.0),
     (500.0,  600.0),
     (600.0,  700.0),
+    (700.0,  800.0),    
+    (800.0,  900.0),    
+    (900.0, 1000.0),  
 ]
-BIN_LABELS_MM  = ["0–100 mm", "100–200 mm", "200–300 mm", "300–400 mm", "400–500 mm", "500–600 mm", "600–700 mm"]
-BIN_CENTERS_MM = [50.0, 150.0, 250.0, 350.0, 450.0, 550.0, 650.0]
+BIN_LABELS_MM  = ["0–200 mm", "200–300 mm", "300–400 mm", "400–500 mm", "500–600 mm", "600–700 mm", "700–800 mm", "800–900 mm", "900–1000 mm"]
+BIN_CENTERS_MM = [100.0, 250.0, 350.0, 450.0, 550.0, 650.0, 750.0, 850.0, 950.0]
 
 METHODS: Dict[str, Dict[str, str]] = {
     "original":   {"label": "FFS Original",                  "color": "#2980b9"},
@@ -214,9 +216,7 @@ class ShazamRunner:
 
         Hs = left_s.shape[0]
         try:
-            disp_s = self.estimator.gabor_image_disparity_down_up_full_volume(
-                left_s, right_s, debug_row=None,
-            ).astype(np.float32)
+            disp_s = self.estimator.multiscale_disparity_edge_aware_features( left_s, right_s, debug_row=None)
         finally:
             # Release figures created by the estimator before returning.
             plt.close('all')
@@ -242,6 +242,7 @@ def compute_bin_mae_mm(pred_mm: np.ndarray, gt_mm: np.ndarray) -> List[float]:
     result = []
     for lo, hi in DIST_BINS_MM:
         mask = (gt_mm >= lo) & (gt_mm < hi) & (gt_mm > 0) & (pred_mm > 0)
+        mask = mask & (np.abs(pred_mm - gt_mm) < 50.0)  # ignore extreme outliers
         if mask.sum() == 0:
             result.append(float("nan"))
         else:
@@ -412,7 +413,7 @@ class ReportGeneratorMM(ReportGenerator):
         ax.set_xlabel("Distance range", fontsize=10)
         ax.set_ylabel("Mean Absolute Error (mm)", fontsize=10)
         ax.set_title("Depth Error vs Distance", fontsize=12)
-        ax.set_ylim(0, 10)
+        ax.set_ylim(0, 30)
         ax.legend(fontsize=9)
         ax.grid(alpha=0.3)
         fig.tight_layout()
