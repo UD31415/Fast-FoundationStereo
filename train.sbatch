@@ -19,5 +19,6 @@ conda activate ffs
 #srun python3 scripts/benchmark_isaac_fs_rs.py
 #srun python3 scripts/benchmark_inbolt_trained_isaac.py
 #srun python3 scripts/finetune_pickle.py
-srun python3 scripts/benchmark_pickle_shazam_only.py
+#srun python3 scripts/benchmark_pickle_shazam_only.py
+srun python3 scripts/benchmark_pickle_shazam.py
 

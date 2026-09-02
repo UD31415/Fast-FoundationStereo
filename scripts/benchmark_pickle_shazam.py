@@ -115,7 +115,7 @@ PICKLE_EXCEL = (
 # )
 
 ORIGINAL_PATH   = f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth'
-FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_epoch_020.pth'
+FINETUNED_PATH  = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_260625_epoch_021.pth'
 ISAACTUNED_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_isaac_epoch_037.pth'
 DEFAULT_OUT     = f'{code_dir}/../reports/benchmark_pickle_shazam'
 
@@ -237,11 +237,12 @@ class ShazamRunner:
 
 # ── mm-based metric helpers ───────────────────────────────────────────────────
 
-def compute_bin_mae_mm(pred_mm: np.ndarray, gt_mm: np.ndarray) -> List[float]:
+def compute_bin_mae_mm(pred_mm: np.ndarray, gt_mm: np.ndarray, edge_mask: np.ndarray | None = None) -> List[float]:
     """MAE (mm) per distance bin; returns NaN for bins with no valid GT pixels."""
+    edge_mask = np.asarray(edge_mask, dtype=bool) if edge_mask is not None else np.ones_like(gt_mm, dtype=bool)
     result = []
     for lo, hi in DIST_BINS_MM:
-        mask = (gt_mm >= lo) & (gt_mm < hi) & (gt_mm > 0) & (pred_mm > 0)
+        mask = (gt_mm >= lo) & (gt_mm < hi) & (gt_mm > 0) & (pred_mm > 0) & edge_mask
         mask = mask & (np.abs(pred_mm - gt_mm) < 50.0)  # ignore extreme outliers
         if mask.sum() == 0:
             result.append(float("nan"))
@@ -271,7 +272,11 @@ def infer_depth_mm(model, left: np.ndarray, right: np.ndarray, bf: float) -> np.
     padder = InputPadder(left_t.shape, divis_by=32, force_square=False)
     left_t, right_t = padder.pad(left_t, right_t)
 
-    with torch.amp.autocast('cuda', enabled=True, dtype=U.AMP_DTYPE):
+    if DEVICE.type == 'cuda':
+        autocast_ctx = torch.amp.autocast('cuda', enabled=True, dtype=U.AMP_DTYPE)
+    else:
+        autocast_ctx = torch.autocast('cpu', enabled=False, dtype=torch.float32)
+    with autocast_ctx:
         disp = model.forward(left_t, right_t, iters=ITERS, test_mode=True)
 
     disp = padder.unpad(disp.float())
@@ -286,7 +291,7 @@ def infer_depth_mm(model, left: np.ndarray, right: np.ndarray, bf: float) -> np.
 def load_model(path: str):
     logging.info(f"Loading model from {path}")
     model = torch.load(path, map_location='cpu', weights_only=False)
-    model.cuda().eval()
+    model.to(DEVICE).eval()
     return model
 
 
@@ -298,9 +303,10 @@ class ReportGeneratorMM(ReportGenerator):
     _bin_labels  = BIN_LABELS_MM
     _bin_centers = BIN_CENTERS_MM
 
-    def __init__(self, results, stats, output_dir) -> None:
+    def __init__(self, results, stats, output_dir, edge_dist_bin_mae: Dict[str, List[List[float]]] | None = None) -> None:
         super().__init__(results, stats, output_dir)
         self._selected_viz_indices: List[int] = []
+        self._edge_dist_bin_mae: Dict[str, List[List[float]]] = edge_dist_bin_mae or {}
 
     def _get_selected_viz_indices(self, n_pick: int = 4) -> List[int]:
         if self._selected_viz_indices:
@@ -394,27 +400,44 @@ class ReportGeneratorMM(ReportGenerator):
     def _fig_distance_error_curve(self) -> str:
         if not self._non_gt:
             return self._empty_fig("distance_error_curve.png", "No comparison methods")
-        fig, ax = plt.subplots(figsize=(8, 5))
-        for name in self._non_gt:
-            bin_data = self._r.dist_bin_mae.get(name, [])
+
+        def _mean_per_bin(bin_data: List[List[float]]) -> np.ndarray | None:
             if not bin_data:
-                continue
-            arr = np.array(bin_data)
-            mean_per_bin = np.array([
+                return None
+            arr = np.array(bin_data, dtype=float)
+            if arr.ndim != 2:
+                return None
+            return np.array([
                 np.nanmean(arr[:, i]) if np.any(~np.isnan(arr[:, i])) else 0.0
                 for i in range(arr.shape[1])
             ])
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        any_edge = False
+        for name in self._non_gt:
             color = self._r.method_colors.get(name, "#888")
             label = self._r.method_labels.get(name, name)
-            ax.plot(self._bin_centers, mean_per_bin, marker="o", color=color,
-                    label=label, linewidth=2, markersize=7)
+
+            depth_mean = _mean_per_bin(self._r.dist_bin_mae.get(name, []))
+            if depth_mean is not None:
+                ax.plot(self._bin_centers, depth_mean, marker="o", color=color,
+                        label=f"{label} — depth", linewidth=2, markersize=7)
+
+            edge_mean = _mean_per_bin(self._edge_dist_bin_mae.get(name, []))
+            if edge_mean is not None:
+                ax.plot(self._bin_centers, edge_mean, marker="s", color=color,
+                        label=f"{label} — edge", linewidth=2, markersize=7,
+                        linestyle="--")
+                any_edge = True
+
         ax.set_xticks(self._bin_centers)
         ax.set_xticklabels(self._bin_labels, fontsize=9)
         ax.set_xlabel("Distance range", fontsize=10)
         ax.set_ylabel("Mean Absolute Error (mm)", fontsize=10)
-        ax.set_title("Depth Error vs Distance", fontsize=12)
+        title = "Depth and Edge Error vs Distance" if any_edge else "Depth Error vs Distance"
+        ax.set_title(title, fontsize=12)
         ax.set_ylim(0, 30)
-        ax.legend(fontsize=9)
+        ax.legend(fontsize=8, ncol=2 if any_edge else 1)
         ax.grid(alpha=0.3)
         fig.tight_layout()
         return self._save(fig, "distance_error_curve.png")
@@ -606,15 +629,16 @@ def main():
         return
 
     # ── accumulators ──────────────────────────────────────────────────────────
-    all_metrics       = []
-    viz_frames        = []
-    valid_acc         = {}
-    dist_bin_mae      = {m: [] for m in active_methods}
-    close_range_valid = {m: [] for m in active_methods}
+    all_metrics         = []
+    viz_frames          = []
+    valid_acc           = {}
+    dist_bin_mae        = {m: [] for m in active_methods}
+    edge_dist_bin_mae   = {m: [] for m in active_methods}
+    close_range_valid   = {m: [] for m in active_methods}
     # NN models AND shazam track per-frame latency
-    timing_ms_raw     = {m: [] for m in list(models.keys()) + [SHAZAM_NAME]}
+    timing_ms_raw       = {m: [] for m in list(models.keys()) + [SHAZAM_NAME]}
     H = W = None
-
+    n = 100
     for idx in range(n):
         data  = source.get_item_and_scene_projected(idx)
         left  = data['ir_left_img']
@@ -622,6 +646,7 @@ def main():
         gt_mm = data['depth_cad_projected'].astype(np.float32)
         rs_mm = data['depth_img'].astype(np.float32)
         bf    = data['bf']
+        edge_mask = data.get('edge_mask', np.ones_like(gt_mm, dtype=bool)).astype(bool)
 
         if gt_mm.shape != rs_mm.shape:
             logging.warning(
@@ -667,7 +692,8 @@ def main():
                 fm = compute_metrics(pred, gt_mm, timing_ms_raw[mname][-1], mname)
 
             all_metrics.append(fm)
-            dist_bin_mae[mname].append(compute_bin_mae_mm(pred, gt_mm))
+            dist_bin_mae[mname].append(compute_bin_mae_mm(pred, gt_mm, ~edge_mask))
+            edge_dist_bin_mae[mname].append(compute_bin_mae_mm(pred, gt_mm, edge_mask))
 
             close_cov = (
                 float((pred[gt_close_mask] > 0).mean()) * 100.0
@@ -737,7 +763,7 @@ def main():
         stats[RS_NAME].fps_mean = 30.0
 
     # ── generate report ───────────────────────────────────────────────────────
-    reporter = ReportGeneratorMM(results, stats, out_dir)
+    reporter = ReportGeneratorMM(results, stats, out_dir, edge_dist_bin_mae=edge_dist_bin_mae)
     reporter.generate()
 
 
