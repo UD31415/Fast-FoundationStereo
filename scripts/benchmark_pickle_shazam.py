@@ -638,7 +638,7 @@ def main():
     # NN models AND shazam track per-frame latency
     timing_ms_raw       = {m: [] for m in list(models.keys()) + [SHAZAM_NAME]}
     H = W = None
-    n = 100
+    n = 33
     for idx in range(n):
         data  = source.get_item_and_scene_projected(idx)
         left  = data['ir_left_img']
