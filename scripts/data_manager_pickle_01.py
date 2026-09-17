@@ -1270,9 +1270,9 @@ def RunTest():
     #tst.test_draw_scene() # ok
     #tst.test_get_item_projected()
     #tst.test_show_icp_alignment()
-    #tst.test_get_item_icp_projected()
+    tst.test_get_item_icp_projected()
     #tst.test_get_grid_coordinates()
-    tst.test_match_grid_to_cad()
+    #tst.test_match_grid_to_cad()
 
 if __name__ == '__main__':
     RunTest()

@@ -70,6 +70,11 @@ DEFAULT_EXCEL = (
     r"\\svm.realsenseai.com\RealSense_Validation\VIDB\Public\Stavush\Pickle\Data"
     r"\Data for model training\data_14_6_26.xlsx"
 )
+
+DEFAULT_EXCEL = (
+    r"\\svm.realsenseai.com\RealSense_Validation\VIDB\Public\Stavush\Pickle\Data"
+    r"\Data for model training 25_6_26\data_25_06.xlsx"
+)
 DEFAULT_STL_NAME = "cube_100x100x100"
 
 LABEL_RAW = "raw data (json file)"
@@ -1249,8 +1254,9 @@ class DataSource:
                     "error RS-CAD (mm)",
                 ],
             )
-            plt.show()
+            
             self.draw_point_clouds(item)
+            plt.show()
 
         return item
 
@@ -1740,8 +1746,9 @@ class TestDataSource(unittest.TestCase):
         source = DataSource()
         count = source.init_directory()
         self.assertTrue(count > 0)
-        item_id = np.random.randint(0, count)
-        out = source.get_item_projected(item_id, debug=True)
+        item_ids = np.random.randint(0, count, size=5)
+        for item_id in item_ids:
+            out = source.get_item_projected(item_id, debug=True)
         self.assertIn("depth_cad_projected", out)
         self.assertEqual(out["depth_cad_projected"].shape, out["depth_img"].shape)
 
