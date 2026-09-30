@@ -2059,6 +2059,89 @@ class DataSource:
 
         return item
 
+    def render_cad_multiview(
+        self,
+        item: dict[str, Any],
+        view_num: int = 7,
+        dist_scale_range: tuple[float, float] = (0.8, 1.2),
+        rot_range_deg: float = 10.0,
+        seed: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Raycast the CAD mesh from the nominal pose plus ``view_num`` perturbed poses.
+
+        Each perturbation of ``item["t_camera_cad"]``:
+
+        * scales the camera -> object distance by a factor in ``dist_scale_range``
+          (the object slides along the viewing ray through its center),
+        * rotates the object about its own center by random angles within
+          ``+/- rot_range_deg`` around the camera X, Y, Z axes.
+
+        Returns a list of ``view_num + 1`` dicts (index 0 is the nominal pose)
+        with keys ``"t_camera_cad"``, ``"depth"`` (``(H, W)`` mm),
+        ``"scale"`` and ``"angles_deg"``.
+        """
+        h, w            = item["depth_img"].shape[:2]
+        cam_matrix, _   = self.get_intrinsics_matrix(item)
+        mesh            = self.load_cad_mesh(item["cad_path"])
+        t_camera_cad    = np.asarray(item["t_camera_cad"], dtype=np.float64)
+        rng             = np.random.default_rng(seed)
+
+        # object center in the camera frame (rotation pivot / viewing ray)
+        center_cad      = np.asarray(mesh.get_center(), dtype=np.float64)
+        center_cam      = t_camera_cad[:3, :3] @ center_cad + t_camera_cad[:3, 3]
+
+        views           = []
+        for k in range(view_num + 1):
+            if k == 0:  # nominal pose
+                scale, angles_deg = 1.0, np.zeros(3)
+            else:
+                scale      = rng.uniform(*dist_scale_range)
+                angles_deg = rng.uniform(-rot_range_deg, rot_range_deg, size=3)
+
+            # rotate about the object center, then move it along the viewing ray
+            R_pert          = o3d.geometry.get_rotation_matrix_from_xyz(np.deg2rad(angles_deg))
+            t_pert          = np.eye(4, dtype=np.float64)
+            t_pert[:3, :3]  = R_pert
+            t_pert[:3, 3]   = scale * center_cam - R_pert @ center_cam
+            t_camera_cad_k  = t_pert @ t_camera_cad
+
+            mesh_cam        = copy.deepcopy(mesh)
+            mesh_cam.transform(t_camera_cad_k)
+            depth_k         = self.render_mesh_depth(mesh_cam, cam_matrix, frame_size=(h, w), output_units="mm")
+
+            views.append({
+                "t_camera_cad"  : t_camera_cad_k,
+                "depth"         : depth_k,
+                "scale"         : float(scale),
+                "angles_deg"    : angles_deg,
+            })
+        return views
+
+    @staticmethod
+    def compute_depth_edges(depth: np.ndarray, depth_jump_mm: float = 10.0) -> np.ndarray:
+        """Thin edge map of a projected depth image.
+
+        Combines the silhouette (valid / invalid boundary) with internal depth
+        discontinuities larger than ``depth_jump_mm`` between 4-neighbours.
+        Returns an ``(H, W)`` ``uint8`` mask (0/255).
+        """
+        depth   = np.asarray(depth, dtype=np.float32)
+        valid   = depth > 0
+        edges   = np.zeros(depth.shape, dtype=bool)
+        for axis in (0, 1):
+            d_next  = np.roll(depth, -1, axis=axis)
+            v_next  = np.roll(valid, -1, axis=axis)
+            sil     = valid != v_next
+            jump    = valid & v_next & (np.abs(depth - d_next) > depth_jump_mm)
+            e       = sil | jump
+            # np.roll wraps around - drop the last row / column
+            if axis == 0:
+                e[-1, :] = False
+            else:
+                e[:, -1] = False
+            edges  |= e
+        return edges.astype(np.uint8) * 255
+
     # ------------------------------------------------------------------
     # Metric : Edge mask & ICP alignment
     # ------------------------------------------------------------------
@@ -2144,6 +2227,44 @@ class DataSource:
             plt.show()
 
         return item
+
+    @staticmethod
+    def depth_alignment_score(
+        depth_cad: np.ndarray,
+        depth_sensor: np.ndarray,
+        inlier_mm: float = 10.0,
+    ) -> dict[str, Any]:
+        """Score how well a projected CAD depth map aligns with the sensor depth.
+
+        Only pixels covered by the CAD projection are evaluated. Of those,
+        pixels with no sensor depth are counted as ``invalid_ratio`` and
+        ignored. On the remaining overlap:
+
+        * ``score``      - fraction of pixels with ``|sensor - cad| < inlier_mm``
+          (0..1, higher is better),
+        * ``median_mm``  - median absolute error,
+        * ``mean_mm``    - mean absolute error of the inliers,
+        * ``err``        - ``(H, W)`` signed error ``sensor - cad`` (mm), 0 elsewhere.
+        """
+        cad     = np.asarray(depth_cad, dtype=np.float32)
+        sensor  = np.asarray(depth_sensor, dtype=np.float32)
+        cad_px  = cad > 0
+        overlap = cad_px & (sensor > 0)
+
+        err             = np.zeros_like(cad, dtype=np.float32)
+        err[overlap]    = sensor[overlap] - cad[overlap]
+        abs_err         = np.abs(err[overlap])
+        inliers         = abs_err < inlier_mm
+
+        cad_num         = int(cad_px.sum())
+        overlap_num     = int(overlap.sum())
+        return {
+            "score"         : float(inliers.mean()) if overlap_num else 0.0,
+            "median_mm"     : float(np.median(abs_err)) if overlap_num else float("nan"),
+            "mean_mm"       : float(abs_err[inliers].mean()) if inliers.any() else float("nan"),
+            "invalid_ratio" : 1.0 - overlap_num / cad_num if cad_num else 1.0,
+            "err"           : err,
+        }
 
     def compute_icp_metric(self, s1, s2):
         # code from Stav
@@ -2863,6 +2984,173 @@ class TestDataSource(unittest.TestCase):
         # Raycast produces a fully dense silhouette: at least one pixel hit.
         self.assertGreater(int(np.count_nonzero(out["depth_cad_projected"])), 0)
 
+    def test_cad_multiview_projections(self):
+        """Render the CAD model from several synthetic camera views.
+
+        Starts from the dataset ``t_camera_cad`` and perturbs it:
+
+        * distance camera -> object scaled by a factor in ``dist_scale_range``
+          (the object slides along the viewing ray through its center),
+        * rotation of the object about its own center by random angles
+          within ``+/- rot_range_deg`` around the camera X, Y, Z axes.
+
+        Each perturbed pose is raycast into a depth image (mm) and shown
+        next to the RealSense depth and the nominal projection.
+        """
+        source          = DataSource()
+        count           = source.init_directory()
+        self.assertTrue(count > 0)
+
+        item_id         = int(np.random.randint(0, count))
+        log.info(f"Testing cad multiview projections for item {item_id}")
+        item            = source.get_item(item_id, debug=False)
+
+        depth_img       = item["depth_img"]
+        self.assertIsNotNone(depth_img)
+        h, w            = depth_img.shape[:2]
+        self.assertIsNotNone(item["t_camera_cad"])
+
+        views           = source.render_cad_multiview(item, view_num=7, dist_scale_range=(0.8, 1.2),
+                                                      rot_range_deg=10.0, seed=item_id)
+
+        img_list        = [depth_img.astype(np.float32)]
+        ttl_list        = ["depth RS (mm)"]
+        for k, v in enumerate(views):
+            depth_k, scale, angles_deg = v["depth"], v["scale"], v["angles_deg"]
+            self.assertEqual(depth_k.shape, (h, w))
+            pix_num         = int(np.count_nonzero(depth_k))
+            log.info(f"view {k}: scale={scale:.3f} rot(deg)={np.round(angles_deg, 1)} pixels={pix_num}")
+            self.assertGreater(pix_num, 0)
+
+            img_list.append(depth_k)
+            ttl_list.append("depth CAD nominal (mm)" if k == 0 else
+                            f"depth v{k} s={scale:.2f} r=({angles_deg[0]:.0f},{angles_deg[1]:.0f},{angles_deg[2]:.0f})")
+
+        # sanity: the object center stays on the viewing ray at the scaled distance
+        mesh            = source.load_cad_mesh(item["cad_path"])
+        center_cad      = np.asarray(mesh.get_center(), dtype=np.float64)
+        t0              = views[0]["t_camera_cad"]
+        center_cam      = t0[:3, :3] @ center_cad + t0[:3, 3]
+        for v in views:
+            t_k = v["t_camera_cad"]
+            c_k = t_k[:3, :3] @ center_cad + t_k[:3, 3]
+            self.assertAlmostEqual(float(np.linalg.norm(np.cross(c_k, center_cam))), 0.0, places=6)
+
+        source.show_subset(img_list, ttl_list, suptitle=f"CAD multiview projections (item {item_id})")
+        plt.show()
+
+    def test_cad_multiview_edges_vs_ir(self):
+        """Compare edges of multiview CAD depth projections to the real left IR image.
+
+        Renders the nominal pose + 7 perturbed poses (see
+        :meth:`DataSource.render_cad_multiview`), extracts the edges of each
+        projected depth map (:meth:`DataSource.compute_depth_edges`) and
+        overlays them (red) on the left IR image, together with the IR Canny
+        edges (green). Each title reports the mean distance (pixels) from
+        the projected edges to the nearest IR edge - lower is a better match.
+        Figure: 9 images - IR left + 8 edge overlays.
+        """
+        source          = DataSource(train_mode=True)
+        count           = source.init_directory()
+        self.assertTrue(count > 0)
+
+        item_id         = int(np.random.randint(0, count))
+        log.info(f"Testing cad multiview edges vs IR for item {item_id}")
+        item            = source.get_item(item_id, debug=False)
+
+        ir_left         = item.get("ir_left_img")
+        self.assertIsNotNone(ir_left)
+        h, w            = ir_left.shape[:2]
+
+        # IR -> uint8 gray for display and Canny
+        ir_gray         = ir_left if ir_left.ndim == 2 else cv2.cvtColor(ir_left, cv2.COLOR_BGR2GRAY)
+        ir_u8           = cv2.normalize(ir_gray.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        ir_edges        = cv2.Canny(cv2.GaussianBlur(ir_u8, (5, 5), 0), 30, 90)
+        # distance (pixels) from every pixel to the nearest IR edge
+        ir_edge_dist    = cv2.distanceTransform(255 - ir_edges, cv2.DIST_L2, 3)
+
+        views           = source.render_cad_multiview(item, view_num=7, dist_scale_range=(0.8, 1.2),
+                                                      rot_range_deg=10.0, seed=item_id)
+
+        img_list        = [ir_left]
+        ttl_list        = ["IR left (RS)"]
+        for k, v in enumerate(views):
+            depth_edges     = source.compute_depth_edges(v["depth"], depth_jump_mm=10.0)
+            self.assertEqual(depth_edges.shape, (h, w))
+            edge_pix        = depth_edges > 0
+            self.assertTrue(edge_pix.any())
+            mean_dist       = float(ir_edge_dist[edge_pix].mean())
+
+            overlay         = cv2.cvtColor(ir_u8, cv2.COLOR_GRAY2BGR)
+            overlay[ir_edges > 0] = (0, 255, 0)   # IR edges    - green (BGR)
+            overlay[edge_pix]     = (0, 0, 255)   # CAD edges   - red   (BGR)
+
+            scale, a        = v["scale"], v["angles_deg"]
+            log.info(f"view {k}: scale={scale:.3f} rot(deg)={np.round(a, 1)} mean edge dist={mean_dist:.2f}px")
+            img_list.append(overlay)
+            ttl_list.append(f"nominal d={mean_dist:.1f}px" if k == 0 else
+                            f"v{k} s={scale:.2f} r=({a[0]:.0f},{a[1]:.0f},{a[2]:.0f}) d={mean_dist:.1f}px")
+
+        self.assertEqual(len(img_list), 9)
+        source.show_subset(img_list, ttl_list, suptitle=f"CAD depth edges (red) vs IR edges (green), item {item_id}")
+        plt.show()
+
+    def test_cad_multiview_with_depth(self):
+        """Compare multiview CAD depth projections to the sensor depth.
+
+        Renders the nominal pose + 7 perturbed poses (see
+        :meth:`DataSource.render_cad_multiview`) and scores each against the
+        RealSense depth with :meth:`DataSource.depth_alignment_score`.
+        Figure: 9 images - sensor depth + 8 signed error maps (sensor - CAD).
+        """
+        source          = DataSource(train_mode=True)
+        count           = source.init_directory()
+        self.assertTrue(count > 0)
+
+        item_id         = int(np.random.randint(0, count))
+        log.info(f"Testing cad multiview with depth for item {item_id}")
+        item            = source.get_item(item_id, debug=False)
+
+        depth_img       = item["depth_img"]
+        self.assertIsNotNone(depth_img)
+        h, w            = depth_img.shape[:2]
+
+        inlier_mm       = 10.0
+        views           = source.render_cad_multiview(item, view_num=7, dist_scale_range=(0.8, 1.2),
+                                                      rot_range_deg=10.0, seed=item_id)
+
+        results         = []
+        for k, v in enumerate(views):
+            self.assertEqual(v["depth"].shape, (h, w))
+            res             = source.depth_alignment_score(v["depth"], depth_img, inlier_mm=inlier_mm)
+            self.assertGreaterEqual(res["score"], 0.0)
+            self.assertLessEqual(res["score"], 1.0)
+            results.append(res)
+            a               = v["angles_deg"]
+            log.info(f"view {k}: scale={v['scale']:.3f} rot(deg)={np.round(a, 1)} "
+                     f"score={res['score']:.3f} median={res['median_mm']:.1f}mm "
+                     f"inlier mean={res['mean_mm']:.1f}mm no-sensor={res['invalid_ratio']:.2f}")
+
+        best            = int(np.argmax([r["score"] for r in results]))
+        log.info(f"best view: {best} (score={results[best]['score']:.3f})")
+
+        # 3x3 figure: sensor depth + signed error maps on a shared symmetric scale
+        err_lim         = 3.0 * inlier_mm
+        fig, axes       = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(15, 10))
+        axes            = axes.ravel()
+        axes[0].imshow(depth_img.astype(np.float32), vmax=1000)
+        axes[0].set_title("depth RS (mm)")
+        for k, (v, res) in enumerate(zip(views, results)):
+            err_disp        = np.ma.masked_where(v["depth"] <= 0, res["err"])
+            im              = axes[k + 1].imshow(err_disp, cmap="coolwarm", vmin=-err_lim, vmax=err_lim)
+            a               = v["angles_deg"]
+            name            = "nominal" if k == 0 else f"v{k} s={v['scale']:.2f} r=({a[0]:.0f},{a[1]:.0f},{a[2]:.0f})"
+            mark            = " *best*" if k == best else ""
+            axes[k + 1].set_title(f"{name}\nscore={res['score']:.2f} med={res['median_mm']:.1f}mm{mark}")
+        fig.colorbar(im, ax=axes.tolist(), label="error RS - CAD (mm)", shrink=0.8)
+        fig.suptitle(f"CAD multiview vs sensor depth (inlier < {inlier_mm:.0f} mm), item {item_id}")
+        plt.show()
+
     def test_create_edge_mask(self):
         """Smoke-test :meth:`DataSource.create_edge_mask`.
 
@@ -3314,9 +3602,13 @@ def RunTest() -> None:
     #tst.test_get_item_projected_open3d()
     #tst.test_get_item_and_scene() # ok
     #tst.test_get_item_and_scene_projected()
+    #tst.test_cad_multiview_projections()
+    #tst.test_cad_multiview_edges_vs_ir()
+    tst.test_cad_multiview_with_depth()
     #tst.test_create_edge_mask()
     #tst.test_get_item_and_compute_icp_metric()
     #tst.test_get_item_and_compute_chamfer_distance()
+    
 
     #tst.test_project_on_camera()
     #tst.test_show_icp_alignment()  # no file csv
@@ -3327,7 +3619,7 @@ def RunTest() -> None:
 
     # new data with multiple sequences per position
     #tst.test_index_scene_json()
-    tst.test_get_item_sequence()
+    #tst.test_get_item_sequence()
     #tst.test_init_multi_scene_json()
     #tst.test_measure_depth_noise()
     #tst.test_measure_depth_noise_on_mask()
