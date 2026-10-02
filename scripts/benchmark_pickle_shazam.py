@@ -216,7 +216,11 @@ class ShazamRunner:
 
         Hs = left_s.shape[0]
         try:
-            disp_s = self.estimator.multiscale_disparity_edge_aware_features( left_s, right_s, debug_row=None)
+
+            #disp_s = self.estimator.multiscale_disparity_edge_aware_features( left_s, right_s, debug_row=None)
+            #disp_s = self.estimator.gabor_image_disparity_down_up_full_volume(
+            disp_s = self.estimator.multiscale_disparity_speed_optimized(left_s, right_s, debug_row=None).astype(np.float32)
+
         finally:
             # Release figures created by the estimator before returning.
             plt.close('all')
@@ -638,7 +642,7 @@ def main():
     # NN models AND shazam track per-frame latency
     timing_ms_raw       = {m: [] for m in list(models.keys()) + [SHAZAM_NAME]}
     H = W = None
-    n = 33
+    n = 10
     for idx in range(n):
         data  = source.get_item_and_scene_projected(idx)
         left  = data['ir_left_img']
