@@ -44,7 +44,7 @@ PICKLE_DIR   = (
     r"\data_25_06.xlsx"
 )
 
-TEACHER_PATH = f'{code_dir}/../weights/23-36-37/model_finetuned_pickle_epoch_020.pth'
+TEACHER_PATH = f'{code_dir}/../weights/23-36-37/model_best_bp2_serialize.pth'
 OUT_PATH     = f'{code_dir}/../weights/mobile_net/shazam_mobile_net.pth'
 CACHE_DIR    = f'{code_dir}/../cache/mobile_net_teacher'
 

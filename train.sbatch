@@ -20,5 +20,7 @@ conda activate ffs
 #srun python3 scripts/benchmark_inbolt_trained_isaac.py
 #srun python3 scripts/finetune_pickle.py
 #srun python3 scripts/benchmark_pickle_shazam_only.py
-srun python3 scripts/benchmark_pickle_shazam.py
+#srun python3 scripts/benchmark_pickle_shazam.py
+#srun python3 scripts/finetune_mobile_net.py
+srun python3 scripts/benchmark_mobile_net.py
 

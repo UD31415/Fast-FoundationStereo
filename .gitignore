@@ -26,3 +26,5 @@ data/mos/*
 data/pickle/*
 *.out
 data/pickle
+train.sbatch
+*.npz

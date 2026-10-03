@@ -28,14 +28,14 @@ from scipy import ndimage
 from scipy.ndimage import minimum_filter
 import sys 
 sys.path.append(r'C:\Work\Projects\Utils\src')
-from opencv_realsense_camera import RealSense, draw_str
-from common import RectSelector
+#from opencv_realsense_camera import RealSense, draw_str
+#from common import RectSelector
 from logger import log
 # from extract_images_from_ros1bag import read_bin_file
 # from image_source import DataSource as DataSourceBin
 # from measure_camera_noise import NoiseEstimator
-sys.path.append(r'C:\Work\Projects\DepthRS\src')
-from depth_data_source import DataSource
+# sys.path.append(r'C:\Work\Projects\DepthRS\src')
+# from depth_data_source import DataSource
 
 # ----------------------
 # Helpers
