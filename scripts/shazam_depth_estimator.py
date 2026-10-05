@@ -4834,14 +4834,14 @@ class ShazamDepthEstimator:
         row_num, col_num        = img_left.shape[:2]
         feature_num             = len(feature_types)
         cost_total              = np.zeros((row_num, col_num, level_num * feature_num, max_disparity), dtype=dtype)
-        energy_total            = np.zeros((row_num, col_num, level_num * feature_num), dtype=np.float32)
+        #energy_total            = np.zeros((row_num, col_num, level_num * feature_num), dtype=np.float32)
 
         for vol in self.feature_cost_volumes(img_left, img_right, feature_types, level_num, max_disparity, aggregate, upsample):
             k                       = vol['level'] * feature_num + vol['feature_id']
             cost_total[:, :, k, :]  = self.normalize_cost(vol['cost'])
-            energy_total[:, :, k]   = vol['energy']
+            #energy_total[:, :, k]   = vol['energy']
 
-        return cost_total, energy_total
+        return cost_total#, energy_total
 
     def load_mobile_net(self, weights_path=None, device='cpu'):
         "load the fusion network once (torch imported lazily - the rest of the estimator does not need it)"
@@ -4851,11 +4851,12 @@ class ShazamDepthEstimator:
         return self.mobile_net
 
     def multiscale_disparity_mobile_net(self, img_left, img_right, debug_row=None, weights_path=None, conf_thr=0.5,
-                                        estim_type=4, device='cpu', volumes=None):
+                                        estim_type=4, device='cpu', cost_volume=None):
         """
         Same feature volumes as multiscale_disparity_features, but the (level, feature) volumes are merged by
         a small MobileNet-like network (shazam_mobile_net.MobileNetVolumeFusion) into one probability volume and a confidence.
-        volumes : optional precomputed (cost, energy) from multiscale_feature_volumes
+        The network uses the cost volumes and the left image only (no energy maps).
+        cost_volume : optional precomputed cost (H,W,K,D) from multiscale_feature_volumes
         returns disparity (H,W) - zero where confidence < conf_thr, confidence (H,W)
         """
         import time
@@ -4867,11 +4868,11 @@ class ShazamDepthEstimator:
         max_disparity           = self.mobile_net.cfg['D']
 
         t0                      = time.time()
-        if volumes is None:
-            volumes             = self.multiscale_feature_volumes(img_left, img_right, max_disparity=max_disparity)
-        cost_total, energy_total = volumes
+        cost_total              = cost_volume
+        if cost_total is None:
+            cost_total          = self.multiscale_feature_volumes(img_left, img_right, max_disparity=max_disparity)
         t1                      = time.time()
-        prob_total_final, disp_confidence = predict_tiled(self.mobile_net, cost_total, energy_total, img_left_ref, device=device)
+        prob_total_final, disp_confidence = predict_tiled(self.mobile_net, cost_total, img_left_ref, device=device)
         t2                      = time.time()
 
         disp_index              = self.estimate_disparity_from_prob(prob_total_final, estim_type=estim_type)

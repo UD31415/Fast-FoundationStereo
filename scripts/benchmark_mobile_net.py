@@ -320,21 +320,21 @@ def main():
 
         # student : feature volumes once (CPU), network on GPU and optionally CPU
         t0              = time.monotonic()
-        volumes         = student.multiscale_feature_volumes(left_g, right_g, max_disparity=max_disparity)
+        cost_volume     = student.multiscale_feature_volumes(left_g, right_g, max_disparity=max_disparity)
         timing['volumes'].append((time.monotonic() - t0) * 1000.0)
 
-        disp_s, conf_s  = student.multiscale_disparity_mobile_net(left_g, right_g, conf_thr=args.conf_thr, device=str(DEVICE), volumes=volumes)
+        disp_s, conf_s  = student.multiscale_disparity_mobile_net(left_g, right_g, conf_thr=args.conf_thr, device=str(DEVICE), cost_volume=cost_volume)
         timing['net_gpu'].append(student.timing['net_ms'])
         method_ms[STUDENT_NAME].append(timing['volumes'][-1] + timing['net_gpu'][-1])
         frame_disps[STUDENT_NAME] = disp_s
         disp_raw        = student.disp_raw
 
         if student_cpu:
-            disp_c, _   = student_cpu.multiscale_disparity_mobile_net(left_g, right_g, conf_thr=args.conf_thr, device='cpu', volumes=volumes)
+            disp_c, _   = student_cpu.multiscale_disparity_mobile_net(left_g, right_g, conf_thr=args.conf_thr, device='cpu', cost_volume=cost_volume)
             timing['net_cpu'].append(student_cpu.timing['net_ms'])
             method_ms[STUDENT_CPU_NAME].append(timing['volumes'][-1] + timing['net_cpu'][-1])
             frame_disps[STUDENT_CPU_NAME] = disp_c
-        del volumes
+        del cost_volume
 
         # sequential Shazam baseline (same result as multiscale_disparity_features, streamed)
         if shazam:

@@ -167,15 +167,15 @@ class DistillDataset(Dataset):
             a, b        = np.random.uniform(0.8, 1.2), np.random.uniform(-15, 15)
             left, right = np.clip(left * a + b, 0, 255), np.clip(right * a + b, 0, 255)
 
-        cost, energy    = self.estimator.multiscale_feature_volumes(left, right, max_disparity=self.max_disparity)
-        cost_t, energy_t, img_t = volumes_to_tensor(cost, energy, left)
+        cost            = self.estimator.multiscale_feature_volumes(left, right, max_disparity=self.max_disparity)
+        cost_t, img_t   = volumes_to_tensor(cost, left)
 
         # the match x - d must lie inside the crop, and d inside the volume
         cols            = np.arange(w, dtype=np.float32)[None, :]
         mask_t          = (t_disp > 0.5) & (t_disp < self.max_disparity - 1) & (cols >= t_disp)
         mask_gt         = (gt_disp > 0.5) & (gt_disp < self.max_disparity - 1) & (cols >= gt_disp)
 
-        return (cost_t.half(), energy_t, img_t,
+        return (cost_t.half(), img_t,
                 torch.from_numpy(t_disp)[None], torch.from_numpy(gt_disp)[None],
                 torch.from_numpy(mask_t)[None], torch.from_numpy(mask_gt)[None])
 
@@ -225,11 +225,11 @@ def evaluate(model, loader):
     model.eval()
     acc             = {'teacher': np.zeros(4), 'gt': np.zeros(4)}
     loss_sum, n     = 0.0, 0
-    for cost, energy, img, t_disp, gt_disp, mask_t, mask_gt in loader:
-        cost, energy, img = cost.cuda().float(), energy.cuda(), img.cuda()
+    for cost, img, t_disp, gt_disp, mask_t, mask_gt in loader:
+        cost, img   = cost.cuda().float(), img.cuda()
         t_disp, gt_disp, mask_t, mask_gt = t_disp.cuda(), gt_disp.cuda(), mask_t.cuda(), mask_gt.cuda()
         with torch.autocast('cuda', dtype=torch.float16):
-            out     = model(cost, energy, img)
+            out     = model(cost, img)
         loss, _     = distillation_loss(out, t_disp, gt_disp, mask_t, mask_gt)
         loss_sum   += loss.item(); n += 1
         acc['teacher'] += disparity_errors(out['disp'], t_disp, mask_t)
@@ -278,14 +278,14 @@ def finetune_mobile_net(npz_files, out_path=OUT_PATH, epochs=EPOCHS, lr=LR):
 
     for epoch in range(epochs):
         epoch_loss, parts, n_batches = 0.0, {}, 0
-        for cost, energy, img, t_disp, gt_disp, mask_t, mask_gt in train_loader:
-            cost, energy, img = cost.cuda(non_blocking=True).float(), energy.cuda(non_blocking=True), img.cuda(non_blocking=True)
+        for cost, img, t_disp, gt_disp, mask_t, mask_gt in train_loader:
+            cost, img   = cost.cuda(non_blocking=True).float(), img.cuda(non_blocking=True)
             t_disp, gt_disp = t_disp.cuda(non_blocking=True), gt_disp.cuda(non_blocking=True)
             mask_t, mask_gt = mask_t.cuda(non_blocking=True), mask_gt.cuda(non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast('cuda', dtype=torch.float16):
-                out     = model(cost, energy, img)
+                out     = model(cost, img)
             loss, comp  = distillation_loss(out, t_disp, gt_disp, mask_t, mask_gt)
 
             scaler.scale(loss).backward()

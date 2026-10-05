@@ -2,10 +2,10 @@
 MobileNet-style fusion network for the Shazam multiscale feature cost volumes.
 
 ShazamDepthEstimator.multiscale_feature_volumes produces K = levels x features guided-filtered
-cost volumes (H, W, K, D) and K texture energy maps (H, W, K). This network merges them into a
+cost volumes (H, W, K, D). This network merges them, guided by the left image, into a
 single disparity probability volume P (D over H, W) plus a per pixel confidence map.
 
-  context branch (2D) : [left image, K energies] -> MobileNetV2 inverted residual blocks -> ctx
+  context branch (2D) : left image -> MobileNetV2 inverted residual blocks -> ctx
   cost branch    (3D) : K costs -> 1x1x1 conv + ctx broadcast over D -> 3D inverted residual blocks
                         (depthwise 3x3x3) -> logit per (d, y, x), plus a learned prior -mean(cost)
   confidence head     : [max P, entropy, ctx] -> 2D inverted residual -> sigmoid
@@ -108,7 +108,7 @@ class InvertedResidual3d(nn.Module):
 
 class MobileNetVolumeFusion(nn.Module):
     """
-    inputs  : cost (B,K,D,H,W) normalized costs, energy (B,K,H,W), img (B,1,H,W) in [0,255]
+    inputs  : cost (B,K,D,H,W) normalized costs, img (B,1,H,W) in [0,255]
     outputs : dict(logits (B,D,H,W), prob (B,D,H,W), disp (B,1,H,W) soft-argmax, conf (B,1,H,W))
     """
     def __init__(self, **cfg):
@@ -119,7 +119,7 @@ class MobileNetVolumeFusion(nn.Module):
         self.use_checkpoint = False     # gradient checkpointing of the 3D blocks (training memory)
 
         # context branch
-        self.ctx_stem       = nn.Sequential(nn.Conv2d(1 + K, ch2, 3, padding=1, bias=False), nn.BatchNorm2d(ch2), nn.ReLU6(inplace=True))
+        self.ctx_stem       = nn.Sequential(nn.Conv2d(1, ch2, 3, padding=1, bias=False), nn.BatchNorm2d(ch2), nn.ReLU6(inplace=True))
         self.ctx_blocks     = nn.Sequential(*[InvertedResidual2d(ch2, ex, dilation=2 ** i) for i in range(c['n_blocks2d'])])
         self.ctx_to_vol     = nn.Conv2d(ch2, ch3, 1)
 
@@ -137,11 +137,10 @@ class MobileNetVolumeFusion(nn.Module):
         nn.init.zeros_(self.cost_head.weight)
         nn.init.zeros_(self.cost_head.bias)
 
-    def forward(self, cost, energy, img):
+    def forward(self, cost, img):
         D                   = cost.shape[2]
         img_n               = img / 127.5 - 1.0
-        energy_n            = torch.log1p(energy)
-        ctx                 = self.ctx_blocks(self.ctx_stem(torch.cat([img_n, energy_n], dim=1)))     # B,ch2,H,W
+        ctx                 = self.ctx_blocks(self.ctx_stem(img_n))                                   # B,ch2,H,W
 
         x                   = self.cost_stem(cost) + self.ctx_to_vol(ctx).unsqueeze(2)                # B,ch3,D,H,W
         for blk in self.cost_blocks:
@@ -168,17 +167,16 @@ def count_parameters(model):
 
 # ── numpy <-> torch helpers ───────────────────────────────────────────────────
 
-def volumes_to_tensor(cost_HWKD, energy_HWK, img_HW, cost_clip=DEFAULT_CFG['cost_clip']):
-    "numpy (H,W,K,D), (H,W,K), (H,W) -> torch (K,D,H,W), (K,H,W), (1,H,W) float32"
+def volumes_to_tensor(cost_HWKD, img_HW, cost_clip=DEFAULT_CFG['cost_clip']):
+    "numpy (H,W,K,D), (H,W) -> torch (K,D,H,W), (1,H,W) float32"
     cost            = np.clip(cost_HWKD.astype(np.float32), 0, cost_clip) / (cost_clip / 2)
     cost_t          = torch.from_numpy(np.ascontiguousarray(cost.transpose(2, 3, 0, 1)))
-    energy_t        = torch.from_numpy(np.ascontiguousarray(energy_HWK.astype(np.float32).transpose(2, 0, 1)))
     img_t           = torch.from_numpy(np.ascontiguousarray(img_HW.astype(np.float32)))[None]
-    return cost_t, energy_t, img_t
+    return cost_t, img_t
 
 
 @torch.no_grad()
-def predict_tiled(model, cost_HWKD, energy_HWK, img_HW, tile_rows=96, overlap=16, device='cpu'):
+def predict_tiled(model, cost_HWKD, img_HW, tile_rows=96, overlap=16, device='cpu'):
     """
     Full frame inference in row bands so only a band of the (H,W,K,D) volume is on the device.
     returns prob (H,W,D) float32, conf (H,W) float32
@@ -193,10 +191,10 @@ def predict_tiled(model, cost_HWKD, energy_HWK, img_HW, tile_rows=96, overlap=16
     for r0 in range(0, H, tile_rows):
         r1          = min(H, r0 + tile_rows)
         a0, a1      = max(0, r0 - overlap), min(H, r1 + overlap)
-        cost_t, energy_t, img_t = volumes_to_tensor(cost_HWKD[a0:a1], energy_HWK[a0:a1], img_HW[a0:a1], cost_clip)
-        cost_t, energy_t, img_t = cost_t[None].to(device), energy_t[None].to(device), img_t[None].to(device)
+        cost_t, img_t = volumes_to_tensor(cost_HWKD[a0:a1], img_HW[a0:a1], cost_clip)
+        cost_t, img_t = cost_t[None].to(device), img_t[None].to(device)
         with torch.autocast('cuda', dtype=torch.float16, enabled=use_amp):
-            out     = model(cost_t, energy_t, img_t)
+            out     = model(cost_t, img_t)
         s0, s1      = r0 - a0, r1 - a0
         prob_out[r0:r1] = out['prob'][0, :, s0:s1].permute(1, 2, 0).float().cpu().numpy()
         conf_out[r0:r1] = out['conf'][0, 0, s0:s1].float().cpu().numpy()
@@ -227,12 +225,11 @@ if __name__ == '__main__':
     m               = MobileNetVolumeFusion()
     print(f'parameters : {count_parameters(m):,}')
     cost            = torch.rand(1, 12, 128, 64, 160)
-    energy          = torch.rand(1, 12, 64, 160)
     img             = torch.rand(1, 1, 64, 160) * 255
-    out             = m.eval()(cost, energy, img)
+    out             = m.eval()(cost, img)
     print({k: tuple(v.shape) for k, v in out.items()})
     assert torch.allclose(out['prob'].sum(1), torch.ones(1, 64, 160), atol=1e-4)
     assert out['conf'].min() >= 0 and out['conf'].max() <= 1
-    prob, conf      = predict_tiled(m, np.random.rand(100, 160, 12, 128).astype(np.float16), np.random.rand(100, 160, 12), np.random.rand(100, 160) * 255, tile_rows=40)
+    prob, conf      = predict_tiled(m, np.random.rand(100, 160, 12, 128).astype(np.float16), np.random.rand(100, 160) * 255, tile_rows=40)
     print(f'tiled : prob {prob.shape}, conf {conf.shape}')
     print('ok')
