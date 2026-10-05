@@ -247,6 +247,8 @@ def main():
     parser.add_argument('--conf_thr',     type=float, default=CONF_THR, help='Student confidence threshold')
     parser.add_argument('--cpu_student',  action='store_true', help='Also time the student network on CPU')
     parser.add_argument('--skip_shazam',  action='store_true', help='Skip the sequential Shazam baseline')
+    parser.add_argument('--shazam_upsample', default='exact', choices=('exact', 'zoom'),
+                        help="Baseline volume upsampling : 'exact' (fast) or 'zoom' (slow, identical to multiscale_disparity_features)")
     parser.add_argument('--max_frames',   type=int,   default=None, help='Limit the number of frames')
     args = parser.parse_args()
 
@@ -336,10 +338,11 @@ def main():
             frame_disps[STUDENT_CPU_NAME] = disp_c
         del cost_volume
 
-        # sequential Shazam baseline (same result as multiscale_disparity_features, streamed)
+        # sequential Shazam baseline : the merge of multiscale_disparity_features, streamed.
+        # upsample 'zoom' reproduces it exactly, 'exact' skips the slow scipy zoom of the volumes
         if shazam:
             t0          = time.monotonic()
-            frame_disps[SHAZAM_NAME] = shazam.multiscale_disparity_fusion(left_g, right_g, fusion='sequential', max_disparity=max_disparity).astype(np.float32)
+            frame_disps[SHAZAM_NAME] = shazam.multiscale_disparity_fusion(left_g, right_g, fusion='sequential', upsample=args.shazam_upsample, max_disparity=max_disparity).astype(np.float32)
             timing['shazam'].append((time.monotonic() - t0) * 1000.0)
             method_ms[SHAZAM_NAME].append(timing['shazam'][-1])
             plt.close('all')
@@ -399,7 +402,7 @@ def main():
     method_configs = {
         TEACHER_NAME:   {"model_path": args.teacher, "valid_iters": "8"},
         STUDENT_NAME:   {"model_path": args.student, "max_disp": str(max_disparity), "engine_resolution": f"{W}x{H}"},
-        SHAZAM_NAME:    {"estimator": "ShazamDepthEstimator.multiscale_disparity_fusion(fusion='sequential')", "max_disp": str(max_disparity)},
+        SHAZAM_NAME:    {"estimator": f"ShazamDepthEstimator.multiscale_disparity_fusion(fusion='sequential', upsample='{args.shazam_upsample}')", "max_disp": str(max_disparity)},
         RS_NAME:        {"source": "RealSense hardware depth (depth_img, ~30 FPS)"},
         GT_NAME:        {"source": "Pickle CAD-rendered ground-truth depth via DataSource.get_item_and_scene_projected"},
     }

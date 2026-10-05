@@ -191,8 +191,11 @@ def predict_tiled(model, cost_HWKD, img_HW, tile_rows=96, overlap=16, device='cp
     for r0 in range(0, H, tile_rows):
         r1          = min(H, r0 + tile_rows)
         a0, a1      = max(0, r0 - overlap), min(H, r1 + overlap)
-        cost_t, img_t = volumes_to_tensor(cost_HWKD[a0:a1], img_HW[a0:a1], cost_clip)
-        cost_t, img_t = cost_t[None].to(device), img_t[None].to(device)
+        # same as volumes_to_tensor, but the band is sent as stored (fp16) and converted on the device -
+        # the numpy fp32 conversion + transpose of the volume was the main CPU cost of inference
+        cost_t      = torch.from_numpy(np.ascontiguousarray(cost_HWKD[a0:a1])).to(device, non_blocking=True)
+        cost_t      = (cost_t.float().clamp_(0, cost_clip) / (cost_clip / 2)).permute(2, 3, 0, 1).unsqueeze(0).contiguous()
+        img_t       = torch.from_numpy(np.ascontiguousarray(img_HW[a0:a1], dtype=np.float32))[None, None].to(device)
         with torch.autocast('cuda', dtype=torch.float16, enabled=use_amp):
             out     = model(cost_t, img_t)
         s0, s1      = r0 - a0, r1 - a0
